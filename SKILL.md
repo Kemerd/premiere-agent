@@ -69,6 +69,50 @@ The skill lives in `video-use-premiere/`. User footage lives wherever they put i
 - **`yt-dlp`, `manim`, Remotion** installed only on first use.
 - This skill vendors `skills/manim-video/`. Read its SKILL.md when building a Manim slot.
 
+## Skill health check (run on EVERY session start)
+
+Before doing anything else in a session, run:
+
+```bash
+python helpers/health.py --json
+```
+
+This is **idempotent and cached** — first call runs the smoke suite (~3s), subsequent calls within 7 days return the cached result instantly (<500ms). Cache auto-invalidates when `python` / `torch` / `transformers` / `opentimelineio` versions change, so a `pip install --upgrade` triggers a fresh check.
+
+Cache lives at `~/.video-use-premiere/health.json` — **outside** the per-session `<videos_dir>/edit/` so it persists across projects. This is the one exception to Hard Rule 12, and it's intentional: skill-environment health is a per-machine property, not a per-session one.
+
+**Reading the JSON:**
+
+```json
+{
+  "status": "ok" | "fail" | "warn",
+  "from_cache": true | false,
+  "passed": 35, "failed": 0, "skipped": 0,
+  "failures": [{"name": "...", "reason": "..."}],
+  "advice":   ["concrete fix step the user can copy-paste"]
+}
+```
+
+**What to do per status:**
+
+| Status | Action |
+|---|---|
+| `ok`   | Silent. Don't bother the user. Proceed to inventory. |
+| `warn` | One-line note: "skipped X check(s), continuing." Proceed. |
+| `fail` | **Stop.** Print the failure list + the `advice` strings verbatim. Ask the user to run the fix and re-invoke. Don't pretend the rest of the skill will work — broken `ffmpeg` or missing `transformers` will silently corrupt every subsequent step. |
+
+**When to force a re-run:**
+- User reports something stopped working
+- User just upgraded Python or PyTorch
+- User asks "is the skill set up correctly?"
+
+```bash
+python helpers/health.py --force --json    # ignore cache, run now
+python helpers/health.py --clear           # wipe cache (next call re-runs)
+```
+
+**Optional heavy-tier verification** (~4.5 GB downloads on first run, exercises real Whisper-large-v3 + Florence-2 + PANNs on a synthetic 2s clip): tell the user to run `python tests.py --heavy` once after install. Cached separately under the same TTL. Don't trigger this autonomously — it's an explicit user action.
+
 ## Helpers
 
 ### Preprocessing (the three lanes)
@@ -91,6 +135,7 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 
 ## The process
 
+0. **Health check.** Run `python helpers/health.py --json` first. Cached for 7 days; usually returns instantly. If `status != "ok"`, surface the `advice` strings to the user verbatim and stop. See the "Skill health check" section above.
 1. **Inventory.** `ffprobe` every source. `preprocess_batch.py <videos_dir>` to run all three lanes (Whisper + PANNs + Florence-2) — cached by mtime, so this is one-time per source. Then `pack_timelines.py --edit-dir <edit>` to produce the three timeline markdowns (and `--merge` if the material is action-heavy and you want all three context streams interleaved).
 2. **Pre-scan for problems.** One pass over `speech_timeline.md` to note verbal slips, mis-speaks, or phrasings to avoid. If the material has heavy non-speech action (workshop / sports / live event), also scan `audio_timeline.md` for the rhythm of events and `visual_timeline.md` for shot variety.
 3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs, **delivery target (flattened mp4 vs FCPXML to NLE)**. Do not use a fixed checklist — the right questions are different every time.
