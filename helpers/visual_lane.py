@@ -45,6 +45,14 @@ import sys
 import time
 from pathlib import Path
 
+# CRITICAL: this import MUST come before anything that could pull in
+# `transformers` (directly OR transitively via timm, einops, etc.). It
+# sets `USE_TF=0` / `USE_FLAX=0` so transformers' module-load probe
+# doesn't eagerly import a possibly-broken TensorFlow install (classic
+# protobuf-version-mismatch crash on Windows). See `_hf_env.py` for
+# the full rationale.
+from _hf_env import HF_ENV_GUARDS_INSTALLED  # noqa: F401  - import for side effect
+
 # Sibling helpers folder is on sys.path when invoked from the orchestrator.
 # extract_audio is NOT used here — visual lane is fully independent of
 # the audio extraction step.

@@ -205,6 +205,12 @@ def _is_known_broken_parallel_combo(device_name: str) -> tuple[bool, str]:
     if not is_blackwell:
         return False, "not Blackwell"
     try:
+        # Apply the HF backend guards before probing the version — this
+        # prevents the version probe itself from triggering the eager
+        # TensorFlow / JAX import path that crashes 4.x installs with
+        # mismatched protobuf. The guards are no-ops if already set
+        # (setdefault) so it's safe to import this anywhere.
+        from _hf_env import HF_ENV_GUARDS_INSTALLED  # noqa: F401
         import transformers as _tf
         major = int(_tf.__version__.split(".", 1)[0])
     except (ImportError, ValueError):

@@ -43,6 +43,14 @@ import time
 import warnings
 from pathlib import Path
 
+# CRITICAL: this import MUST come before anything that could pull in
+# `transformers` (directly OR transitively via extract_audio, progress,
+# etc.). It sets `USE_TF=0` / `USE_FLAX=0` so transformers' module-load
+# probe doesn't eagerly import a possibly-broken TensorFlow install
+# (classic protobuf-version-mismatch crash on Windows). See
+# `_hf_env.py` for the full rationale.
+from _hf_env import HF_ENV_GUARDS_INSTALLED  # noqa: F401  - import for side effect
+
 # Local sibling imports — work whether invoked via -m helpers.whisper_lane
 # or directly as a script (helpers/ is on sys.path either way).
 from extract_audio import SAMPLE_RATE, extract_audio_for
