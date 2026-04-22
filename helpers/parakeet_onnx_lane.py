@@ -1,12 +1,14 @@
 """Speech lane (PRIMARY): NVIDIA Parakeet TDT via ONNX Runtime.
 
-This module is the default speech lane as of 2026-04, replacing the
-HuggingFace `transformers` Whisper pipeline that previously held the
-slot. The output JSON shape is BYTE-FOR-BYTE identical to both
-`whisper_lane.py` and the legacy `parakeet_lane.py` (NeMo torch path),
-so every downstream consumer (`pack_timelines.py`, `render.py`,
-`export_fcpxml.py`) is genuinely lane-agnostic — they don't and
-shouldn't know which acoustic model produced the words.
+This module is THE speech lane. The only sanctioned alternative is
+`parakeet_lane.py` — the NeMo torch fallback for the rare case where
+ONNX Runtime can't load on the host (no compatible CUDA / DirectML /
+CPU EP, ancient OS, etc.). The output JSON shape is BYTE-FOR-BYTE
+identical between both, so every downstream consumer
+(`pack_timelines.py`, `render.py`, `export_fcpxml.py`) is genuinely
+lane-agnostic — they don't and shouldn't know which acoustic model
+backend produced the words.
+
 
 ╔══════════════════════════════════════════════════════════════════╗
 ║  WHY ONNX, WHY A POOL, WHY PARAKEET — the long-form rationale    ║
@@ -127,9 +129,12 @@ from wealthy import (
 # public surface this module exports.
 from _onnx_pool import OnnxSessionPool
 
-# Diarizer is single-source-of-truth in whisper_lane — it operates on
-# the canonical word list, has zero acoustic-model knowledge.
-from whisper_lane import _diarize_and_assign, _load_hf_token
+# Diarizer lives in `helpers/diarize.py` — single source of truth that
+# operates on the canonical word list and has zero acoustic-model
+# knowledge, so this lane (Parakeet ONNX) and the NeMo fallback share
+# it byte-for-byte.
+from diarize import diarize_and_assign as _diarize_and_assign
+from diarize import load_hf_token as _load_hf_token
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +172,10 @@ _V3_LANGS = frozenset({
 })
 
 # Where we drop the per-clip JSON outputs. Identical to the directory
-# whisper_lane and parakeet_lane (NeMo) write to, on purpose: the
+# the NeMo `parakeet_lane.py` fallback writes to, on purpose: the
 # downstream `pack_timelines.py` reads from one canonical location
-# regardless of which lane produced the data, so swapping lanes
-# between sessions is a no-op.
+# regardless of which speech backend produced the data, so swapping
+# between primary and fallback is a no-op.
 TRANSCRIPTS_SUBDIR = "transcripts"
 
 # Env var escape hatch for fully-air-gapped networks: if set, we point
@@ -277,7 +282,8 @@ def _onnx_to_canonical_words(result, *, uses_vad: bool = False) -> list[dict]:
     """Convert an onnx-asr result to the canonical word/spacing list.
 
     Output format matches `parakeet_lane._parakeet_to_canonical_words`
-    AND `whisper_lane._words_from_chunks` exactly:
+    exactly (the canonical schema every speech lane in this project
+    emits):
 
         [
           {"type": "word",    "text": "Hello", "start": 0.12, "end": 0.34,
@@ -365,9 +371,9 @@ def _tokens_to_canonical(tokens: list, timestamps: list) -> list[dict]:
 
     Spacing entries are inserted between word i and word i+1 whenever
     word_i.end < word_(i+1).start (which is always, since end == start
-    of next word before the spacing tweak below). Following the
-    convention in whisper_lane: spacing covers the gap exactly so the
-    timeline has zero overlap and no gaps.
+    of next word before the spacing tweak below). The convention is
+    that spacing covers the gap exactly so the timeline has zero
+    overlap and no gaps.
     """
     out: list[dict] = []
     if not tokens or not timestamps:
@@ -584,9 +590,9 @@ def _process_one(
 ) -> Path:
     """Transcribe one video using a pre-loaded session pool.
 
-    Mirrors `parakeet_lane._process_one` and `whisper_lane._process_one`
-    cache contracts byte-for-byte — that's how we keep the swap between
-    lanes invisible to downstream consumers.
+    Mirrors `parakeet_lane._process_one`'s cache contract byte-for-byte
+    — that's how we keep the swap between primary lane and NeMo
+    fallback invisible to downstream consumers.
 
     Returns the path to the written JSON (cache-hit or fresh).
     """
@@ -647,10 +653,10 @@ def _process_one(
         text = _result_text(result, uses_vad=uses_vad)
 
     # ── Optional diarization ──────────────────────────────────────────
-    # We re-use whisper_lane's diarizer verbatim. It reads the WAV,
-    # runs pyannote/speaker-diarization-3.1, and assigns speaker_id
-    # to each word by majority overlap — completely orthogonal to
-    # which model produced the words.
+    # `helpers/diarize.py` is the single source of truth. It reads the
+    # WAV, runs pyannote/speaker-diarization-3.1, and assigns
+    # speaker_id to each word by majority overlap — completely
+    # orthogonal to which model produced the words.
     if diarize:
         token = _load_hf_token()
         if not token:

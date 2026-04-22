@@ -6,10 +6,10 @@ or CPU fallback) and dispatches each lane via a child python process so
 that:
 
   - GPU memory is fully released between lanes when running sequentially
-    (important on 8 GB cards where Florence + Whisper barely co-fit)
+    (important on 8 GB cards where Florence + Parakeet barely co-fit)
 
   - Output streams from parallel lanes don't garble each other — every
-    line a child emits gets prefixed with [whisper] / [audio] / [visual]
+    line a child emits gets prefixed with [speech] / [audio] / [visual]
     by helpers/progress.install_lane_prefix(), and the orchestrator
     streams stdout/stderr line-by-line into its own log
 
@@ -63,15 +63,14 @@ PYTHON = sys.executable
 # ~100ms window. Each lane's STEADY-STATE footprint may fit comfortably,
 # but the TRANSIENT peak (weights materializing alongside intermediate
 # activations + the CUDA caching allocator's slab reservations) can push
-# the device past its VRAM ceiling and trigger an OOM — especially for
-# Whisper-large-v3, whose KV cache grows during long-form generation
-# right when Florence-2 is still committing its weights.
+# the device past its VRAM ceiling and trigger an OOM — especially when
+# Florence-2 is still committing its weights right as the Parakeet ONNX
+# pool spins up its N sessions in parallel.
 #
 # The fix is cheap: stagger the thread starts so each child has time to
 # settle its initial weight allocation before the next one fires.
 #
 # Why 8 seconds:
-#   - Whisper-large-v3       weight load: ~3-5s on a fast NVMe + cu128 wheel
 #   - Parakeet ONNX pool     weight load: ~2-4s for 4-8 sessions
 #   - Florence-2-base        weight load: ~2-3s
 #   - CLAP ONNX (audio+text) weight load: ~1-2s (small graphs, fast)
@@ -95,7 +94,7 @@ LANE_STAGGER_S = 8.0
 class LaneJob:
     """One lane × N videos. Encapsulates the subprocess to spawn."""
 
-    name: str                      # "whisper" | "audio" | "visual"
+    name: str                      # "speech" | "audio" | "visual"
     script: str                    # filename in helpers/
     videos: list[Path]
     edit_dir: Path
@@ -142,26 +141,24 @@ def _run_lane(job: LaneJob) -> int:
     # Build the shim. Keep it short enough to fit comfortably in argv.
     # Newlines are kept for readability; subprocess passes the whole
     # string to python as one -c argument.
-    if job.name == "whisper":
+    if job.name == "speech":
         # ── Speech lane backend selection ─────────────────────────────
-        # The lane is named "whisper" for historical reasons (progress
-        # bars, cache contracts, log prefixes all key off this string).
-        # Behind that name we dispatch to one of three implementations:
+        # Two implementations, both Parakeet TDT, byte-identical JSON
+        # output:
         #
-        #   onnx    (default) - parakeet_onnx_lane (multi-session ORT
-        #                       pool, ~10x faster than legacy whisper,
-        #                       no transformers / DTW dependency)
-        #   nemo              - parakeet_lane (NeMo torch-mode Parakeet,
-        #                       fallback when ORT can't import e.g. on
-        #                       exotic CPUs / corporate proxies)
-        #   whisper           - whisper_lane (legacy HF transformers
-        #                       pipeline; multilingual escape hatch when
-        #                       Parakeet TDT v3 doesn't speak the user's
-        #                       language)
+        #   onnx (default)  - parakeet_onnx_lane (multi-session ORT
+        #                     pool, default everywhere — ~10x the
+        #                     throughput of the encoder-decoder ASR
+        #                     stacks we used to run, no transformers
+        #                     dependency, no DTW alignment).
+        #   nemo            - parakeet_lane (NeMo torch-mode Parakeet,
+        #                     fallback when ORT can't import e.g. on
+        #                     exotic CPUs / corporate proxies that
+        #                     block the ONNX repo entirely).
         #
-        # The output JSON shape is byte-identical across all three so
-        # downstream consumers (pack_timelines, render, health) don't
-        # notice the swap.
+        # Whisper is intentionally NOT a backend here — see
+        # parakeet_onnx_lane.py's module docstring for the post-mortem
+        # on why we ripped it out. Don't add a 'whisper' branch.
         backend = os.environ.get(
             "VIDEO_USE_SPEECH_LANE", "onnx"
         ).strip().lower() or "onnx"
@@ -174,14 +171,10 @@ def _run_lane(job: LaneJob) -> int:
             import_line = (
                 "from parakeet_lane import run_parakeet_lane_batch as fn"
             )
-        elif backend == "whisper":
-            import_line = (
-                "from whisper_lane import run_whisper_lane_batch as fn"
-            )
         else:
             raise ValueError(
                 f"unknown VIDEO_USE_SPEECH_LANE={backend!r} "
-                f"(valid: onnx, nemo, whisper)"
+                f"(valid: onnx, nemo)"
             )
     elif job.name == "audio":
         import_line = "from audio_lane import run_audio_lane_batch as fn"
@@ -288,9 +281,9 @@ def _kwargs_to_json(extra_args: list[str]) -> str:
 def _shared_audio_extraction(videos: list[Path], edit_dir: Path) -> None:
     """Pre-extract 16kHz mono WAVs for all videos before the lanes run.
 
-    Doing this up front (instead of inside whisper_lane / audio_lane)
+    Doing this up front (instead of inside the speech / audio lanes)
     means we get a clean progress bar over the ffmpeg work AND we avoid
-    a race when whisper + audio lanes run in parallel and both try to
+    a race when speech + audio lanes run in parallel and both try to
     extract the same WAV at the same time. The CLAP audio lane reads
     the same 16kHz mono PCM cache and resamples to 48kHz on the fly
     (CLAP's native rate) — no second WAV cache on disk.
@@ -380,20 +373,27 @@ def _dispatch(jobs: list[LaneJob], schedule: Schedule) -> list[LaneJob]:
     (mutated with returncode + elapsed_s) so the caller can summarize.
     """
     by_name = {j.name: j for j in jobs}
-    whisper = by_name.get("whisper")
+    speech = by_name.get("speech")
     audio = by_name.get("audio")
     visual = by_name.get("visual")
 
     # A null lane (job==None) means the user filtered it out via flags.
     # Build the actual run plan from whichever lanes exist.
+    #
+    # Note: the audio lane is OFF by default in the standard preprocess
+    # workflow — it's a Phase B step the agent invokes separately with
+    # a custom CLAP vocabulary derived from the speech + visual
+    # timelines. `--include-audio` opts into running it inline here
+    # with the baked-in baseline vocabulary, mostly for smoke tests
+    # and offline / agent-less usage.
 
     if schedule == Schedule.PARALLEL_3:
-        present = [j for j in (whisper, audio, visual) if j is not None]
+        present = [j for j in (speech, audio, visual) if j is not None]
         print(f"[orchestrator] PARALLEL_3: dispatching {[j.name for j in present]}")
         _spawn_parallel(present)
 
     elif schedule == Schedule.PARALLEL_2_SEQ_1:
-        # Pairing: Whisper + the small CLAP audio lane share the WAV
+        # Pairing: Parakeet + the small CLAP audio lane share the WAV
         # cache with a tiny combined footprint (~6 GB Parakeet pool +
         # ~1.5 GB CLAP ≈ 7.5 GB), while Florence (~2.5 GB) gets the
         # GPU solo afterward. Comfortably fits an 8 GB card. The
@@ -402,7 +402,7 @@ def _dispatch(jobs: list[LaneJob], schedule: Schedule) -> list[LaneJob]:
         # fragmentation issue documented in vram.py — but PARALLEL_2
         # is now genuinely viable again on consumer hardware after
         # the CLAP migration.
-        pair = [j for j in (whisper, audio) if j is not None]
+        pair = [j for j in (speech, audio) if j is not None]
         if pair:
             print(f"[orchestrator] PARALLEL_2: dispatching {[j.name for j in pair]}")
             _spawn_parallel(pair)
@@ -411,7 +411,7 @@ def _dispatch(jobs: list[LaneJob], schedule: Schedule) -> list[LaneJob]:
             _run_lane(visual)
 
     elif schedule == Schedule.SEQUENTIAL:
-        for j in (whisper, audio, visual):
+        for j in (speech, audio, visual):
             if j is None:
                 continue
             print(f"[orchestrator] SEQ:        dispatching {j.name}")
@@ -421,7 +421,7 @@ def _dispatch(jobs: list[LaneJob], schedule: Schedule) -> list[LaneJob]:
         # CPU is bottlenecked by core count — running parallel lanes
         # just thrashes the cache. Strict sequential, and we propagate
         # device=cpu to each lane via extra_args set up by the caller.
-        for j in (whisper, audio, visual):
+        for j in (speech, audio, visual):
             if j is None:
                 continue
             print(f"[orchestrator] CPU SEQ:    dispatching {j.name}")
@@ -439,15 +439,28 @@ def run_preprocess(
     edit_dir: Path,
     *,
     schedule: Schedule | None = None,
-    skip_whisper: bool = False,
-    skip_audio: bool = False,
+    skip_speech: bool = False,
+    include_audio: bool = False,
     skip_visual: bool = False,
     wealthy: bool = False,
     diarize: bool = False,
     language: str | None = None,
     force: bool = False,
 ) -> list[LaneJob]:
-    """Top-level orchestration. Returns finished LaneJob list."""
+    """Top-level orchestration. Returns finished LaneJob list.
+
+    Lanes:
+        speech  (Parakeet ONNX)  - ON by default
+        visual  (Florence-2)     - ON by default
+        audio   (CLAP zero-shot) - OFF by default; opt in with
+                                   `include_audio=True` to run the
+                                   baseline-vocab Phase A path inline.
+                                   The agent-curated Phase B path is
+                                   the recommended workflow and runs
+                                   as a separate audio_lane.py
+                                   invocation after preprocess
+                                   completes.
+    """
     if not videos:
         raise ValueError("no videos given")
     edit_dir = edit_dir.resolve()
@@ -493,7 +506,7 @@ def run_preprocess(
     audio_device_arg = "cpu" if use_cpu else "cuda"
 
     jobs: list[LaneJob] = []
-    if not skip_whisper:
+    if not skip_speech:
         wargs = ["--device", device_arg]
         if language:
             wargs += ["--language", language]
@@ -503,10 +516,20 @@ def run_preprocess(
             wargs += ["--force"]
         # Note: don't pass --wealthy here — it's already in env via
         # propagate_to_env, and is_wealthy(False) inside the lane will
-        # read it from the env automatically.
-        jobs.append(LaneJob("whisper", "whisper_lane.py", videos, edit_dir, wargs))
+        # read it from the env automatically. The actual backend
+        # script (parakeet_onnx_lane vs parakeet_lane) is selected
+        # inside _run_lane() based on VIDEO_USE_SPEECH_LANE; the
+        # `script` field below is just a label kept around for log
+        # diagnostics and the legacy LaneJob shape.
+        jobs.append(LaneJob("speech", "parakeet_onnx_lane.py", videos, edit_dir, wargs))
 
-    if not skip_audio:
+    if include_audio:
+        # Phase A audio with the baked-in baseline vocabulary. Off by
+        # default — the recommended workflow is for the editor agent
+        # to read the speech + visual timelines, generate a project-
+        # specific CLAP vocabulary, and then invoke audio_lane.py
+        # directly (Phase B). This branch exists so smoke tests and
+        # agent-less batch runs still produce SOMETHING in audio_tags/.
         aargs = ["--device", audio_device_arg]
         if force:
             aargs += ["--force"]
@@ -560,9 +583,15 @@ def main() -> None:
                     choices=[s.value for s in Schedule],
                     default=None,
                     help="Override the auto VRAM-based schedule")
-    ap.add_argument("--skip-whisper", action="store_true")
-    ap.add_argument("--skip-audio", action="store_true")
-    ap.add_argument("--skip-visual", action="store_true")
+    ap.add_argument("--skip-speech", action="store_true",
+                    help="Skip the Parakeet ONNX speech lane")
+    ap.add_argument("--include-audio", action="store_true",
+                    help="Run the CLAP audio lane inline with the baked-in "
+                         "baseline vocabulary. Off by default — the "
+                         "recommended workflow is to invoke audio_lane.py "
+                         "as a separate step with an agent-curated vocab.")
+    ap.add_argument("--skip-visual", action="store_true",
+                    help="Skip the Florence-2 visual lane")
     ap.add_argument("--wealthy", action="store_true",
                     help="Speed knob for 24GB+ GPUs. Bigger batches in all "
                          "lanes; same models, same outputs. Also reads "
@@ -570,7 +599,9 @@ def main() -> None:
     ap.add_argument("--diarize", action="store_true",
                     help="Enable pyannote speaker diarization (needs HF_TOKEN)")
     ap.add_argument("--language", default=None,
-                    help="ISO language code passed to Whisper (default: auto)")
+                    help="ISO language code for the speech lane "
+                         "(en -> Parakeet v2; otherwise Parakeet v3). "
+                         "Default: auto / English.")
     ap.add_argument("--force", action="store_true",
                     help="Bypass per-lane caches, always re-run")
     args = ap.parse_args()
@@ -594,8 +625,8 @@ def main() -> None:
         videos=videos,
         edit_dir=edit_dir,
         schedule=schedule,
-        skip_whisper=args.skip_whisper,
-        skip_audio=args.skip_audio,
+        skip_speech=args.skip_speech,
+        include_audio=args.include_audio,
         skip_visual=args.skip_visual,
         wealthy=args.wealthy,
         diarize=args.diarize,
