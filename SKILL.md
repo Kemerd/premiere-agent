@@ -8,7 +8,7 @@ description: Edit any video by conversation. Local three-lane preprocessing (Whi
 ## Principle
 
 1. **LLM reasons from raw transcript + audio events + visual captions + on-demand drill-down.** Three lightweight markdown views (`speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`) are the entire reading surface. Everything else — filler tagging, retake detection, shot classification, B-roll spotting, emphasis scoring — you derive at decision time.
-2. **Audio is primary, visuals follow.** Cut candidates come from speech boundaries and silence gaps. Audio events (`drill`, `applause`, `laughter`) flag beats. Visual captions answer "what's actually on screen here?" at decision points.
+2. **Speech is primary, visuals are secondary, audio events are noisy hints.** Cut candidates come from Whisper speech boundaries and silence gaps — that lane is highly accurate and is the editorial spine. Visual captions (Florence-2) are the second source of truth: they answer "what's actually on screen here?" and resolve ambiguous decision points (B-roll spotting, shot continuity, action beats). Audio events (PANNs: `drill`, `applause`, `laughter`, etc.) are **approximate** — the model frequently mis-labels (e.g. tags music as "speech", confuses tools, hallucinates applause). Treat them as suggestive prompts to look at the visual lane at that timestamp, **not** as ground truth. When PANNs and Florence-2 disagree, **trust Florence-2.**
 3. **Ask → confirm → execute → iterate → persist.** Never touch the cut until the user has confirmed the strategy in plain English.
 4. **Generalize.** Do not assume what kind of video this is. Look at the material, ask the user, then edit.
 5. **Artistic freedom is the default.** Every specific value, preset, font, color, duration, pitch structure, and technique in this document is a *worked example* from one proven video — not a mandate. Read them to understand what's possible and why each worked. Then make your own taste calls based on what the material actually is and what the user actually wants. **The only things you MUST do are in the Hard Rules section below.** Everything else is yours.
@@ -140,7 +140,7 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 
 0. **Health check.** Run `python helpers/health.py --json` first. Cached for 7 days; usually returns instantly. If `status != "ok"`, surface the `advice` strings to the user verbatim and stop. See the "Skill health check" section above.
 1. **Inventory.** `ffprobe` every source. `python helpers/preprocess_batch.py <videos_dir>` to run all three lanes (Whisper + PANNs + Florence-2) — cached by mtime, so this is one-time per source. Then `python helpers/pack_timelines.py --edit-dir <edit>` to produce the three timeline markdowns (and `--merge` if the material is action-heavy and you want all three context streams interleaved).
-2. **Pre-scan for problems.** One pass over `speech_timeline.md` to note verbal slips, mis-speaks, or phrasings to avoid. If the material has heavy non-speech action (workshop / sports / live event), also scan `audio_timeline.md` for the rhythm of events and `visual_timeline.md` for shot variety.
+2. **Pre-scan for problems.** One pass over `speech_timeline.md` to note verbal slips, mis-speaks, or phrasings to avoid. Then scan `visual_timeline.md` for shot variety, B-roll candidates, and visually continuous actions you'll want to keep whole. `audio_timeline.md` is a *last* pass and only as a rough hint at where non-speech beats might live — verify any PANNs label against the visual lane at the same timestamp before trusting it (the model is noisy, especially on tools, music, and crowd sounds).
 3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs, **delivery target (flattened mp4 vs FCPXML to NLE)**. Do not use a fixed checklist — the right questions are different every time.
 4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate, **delivery format**. **Wait for confirmation.**
 5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments where the visual_timeline caption alone isn't enough. Build animations in parallel sub-agents. Apply grade per-segment.
@@ -161,11 +161,11 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 
 ## Cut craft (techniques)
 
-- **Audio-first.** Candidate cuts from word boundaries and silence gaps in `speech_timeline.md`.
+- **Speech-first.** Candidate cuts from word boundaries and silence gaps in `speech_timeline.md`. Whisper is accurate to the word; this lane is the editorial spine.
 - **Preserve peaks.** Laughs, punchlines, emphasis beats. Extend past punchlines to include reactions — the laugh IS the beat.
 - **Speaker handoffs** benefit from air between utterances. Common values: 400–600ms. Less for fast-paced, more for cinematic. Taste call.
-- **Audio events as signals.** `audio_timeline.md` carries `(drill)`, `(applause)`, `(laughter)`, `(power_tool)` markers. Extend past them for satisfying beats; cut tightly through them for energy.
-- **Visual context as a sanity check.** Before committing to a cut, glance at `visual_timeline.md` around the cut point. If captions show a continuous action ("person holding drill") spanning your cut, you're cutting in the middle of a shot — usually fine, but be deliberate.
+- **Visual context is the second source of truth.** Before committing to *any* non-trivial cut, read `visual_timeline.md` around the cut point. If captions show a continuous action ("person holding drill") spanning your cut, you're cutting in the middle of a shot — usually fine, but be deliberate. Use the visual lane to find B-roll cutaway candidates, match cuts, shot changes, and to decide whether a moment is worth preserving even when speech is silent.
+- **Audio events are noisy hints, not signals.** `audio_timeline.md` carries `(drill 0.87)`, `(applause 0.92)`, `(laughter)`, `(power_tool)` markers from PANNs. **The model is approximate** — it mis-labels frequently (music tagged as speech, hammers tagged as drums, room tone tagged as applause). Use a marker only as a prompt to *go look* at the visual lane (and if needed `timeline_view`) at that timestamp. **Never cut purely on a PANNs label.** When PANNs and Florence-2 disagree about what's happening, trust Florence-2.
 - **Silence gaps are cut candidates.** Silences ≥400ms are usually the cleanest. 150–400ms phrase boundaries are usable with a visual check. <150ms is unsafe (mid-phrase).
 - **Example cut padding** (the launch video shipped with this): 50ms before the first kept word, 80ms after the last. Tighter for montage energy, looser for documentary. Stay in the 30–200ms working window (Hard Rule 7).
 - **Never reason audio and video independently.** Every cut must work on both tracks.
@@ -208,7 +208,7 @@ Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but 
   [006.08-006.74] S0 We fixed this.
 ```
 
-**`audio_timeline.md`** — PANNs CNN14 events, coalesced over time. Top scoring labels first per range. Use to find non-speech beats.
+**`audio_timeline.md`** — PANNs CNN14 events, coalesced over time. Top scoring labels first per range. **Approximate / noisy** — treat each marker as a *prompt to look at the visual lane at that timestamp*, not as a confirmed event. Confidence scores below ~0.6 are basically guesses; even high scores mis-label frequently on tools, music, and crowd sounds.
 
 ```
 ## C0108  (duration: 87.4s, 14 events)
@@ -217,7 +217,7 @@ Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but 
   [022.80-024.10] (hammer 0.65, metal 0.58)
 ```
 
-**`visual_timeline.md`** — Florence-2 detailed captions @ 1fps. Consecutive identical captions collapse to `(same)`. Use to spot shots, B-roll candidates, match cuts, action.
+**`visual_timeline.md`** — Florence-2 detailed captions @ 1fps. Consecutive identical captions collapse to `(same)`. Use to spot shots, B-roll candidates, match cuts, action. **This is the second source of truth after speech** — when classifying *what is happening* in a moment, prefer this over the audio events lane.
 
 ```
 ## C0108  (duration: 87.4s, 87 caps @ 1 fps)
@@ -237,10 +237,13 @@ When the task is "pick the best take of each beat across many clips," spawn a de
 You are editing a <type> video. Pick the best take of each beat and 
 assemble them chronologically by beat, not by source clip order.
 
-INPUTS:
-  - speech_timeline.md  (phrase-level Whisper transcripts of all takes)
-  - audio_timeline.md   (non-speech audio events: drills, laughs, etc.)
-  - visual_timeline.md  (1fps Florence-2 captions: what's on screen)
+INPUTS (in priority order — trust them in this order when they disagree):
+  - speech_timeline.md  (phrase-level Whisper transcripts; ACCURATE, the spine)
+  - visual_timeline.md  (1fps Florence-2 captions; second source of truth for
+                         what's on screen / what's happening)
+  - audio_timeline.md   (PANNs non-speech events; NOISY, mis-labels often —
+                         use only as a hint to go look at the visual lane at
+                         that timestamp; never cut purely on a PANNs label)
   - Product/narrative context: <2 sentences from the user>
   - Speaker(s): <name, role, delivery style note>
   - Expected structure: <pick an archetype or invent one>
@@ -264,7 +267,8 @@ RULES:
   - Prefer silences ≥ 400ms as cut targets.
   - Cross-reference visual_timeline.md before committing to a cut whose
     audio looks clean — make sure you're not cutting in the middle of a
-    visually continuous action you wanted to keep whole.
+    visually continuous action you wanted to keep whole. The visual lane
+    classifies the moment; the audio events lane only suggests where to look.
   - Use J/L cuts (audio_lead / video_tail) for interview answers and
     B-roll cutaways. Cross-dissolves (transition_in) for scene changes.
   - Unavoidable slips are kept if no better take exists. Note them in "reason".
