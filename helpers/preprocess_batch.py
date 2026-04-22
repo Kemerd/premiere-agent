@@ -61,16 +61,25 @@ def main() -> None:
                     choices=[s.value for s in Schedule],
                     default=None,
                     help="Override the auto VRAM-based schedule")
-    ap.add_argument("--skip-whisper", action="store_true")
-    ap.add_argument("--skip-audio", action="store_true")
-    ap.add_argument("--skip-visual", action="store_true")
+    ap.add_argument("--skip-speech", action="store_true",
+                    help="Skip the Parakeet ONNX speech lane")
+    ap.add_argument("--include-audio", action="store_true",
+                    help="Run the CLAP audio lane inline with the baked-in "
+                         "baseline vocabulary. Off by default — the "
+                         "recommended workflow is to invoke audio_lane.py "
+                         "as a separate Phase B step with an agent-curated "
+                         "vocab derived from the speech + visual timelines.")
+    ap.add_argument("--skip-visual", action="store_true",
+                    help="Skip the Florence-2 visual lane")
     ap.add_argument("--wealthy", action="store_true",
                     help="Speed knob for 24GB+ GPUs. Bigger batches, same "
                          "models, same outputs. Also reads VIDEO_USE_WEALTHY=1.")
     ap.add_argument("--diarize", action="store_true",
                     help="Enable pyannote speaker diarization (needs HF_TOKEN)")
     ap.add_argument("--language", default=None,
-                    help="ISO language code passed to Whisper (default: auto)")
+                    help="ISO language code for the speech lane "
+                         "(en -> Parakeet v2; otherwise Parakeet v3). "
+                         "Default: auto / English.")
     ap.add_argument("--force", action="store_true",
                     help="Bypass per-lane caches, always re-run")
     args = ap.parse_args()
@@ -100,8 +109,8 @@ def main() -> None:
         videos=videos,
         edit_dir=edit_dir,
         schedule=schedule,
-        skip_whisper=args.skip_whisper,
-        skip_audio=args.skip_audio,
+        skip_speech=args.skip_speech,
+        include_audio=args.include_audio,
         skip_visual=args.skip_visual,
         wealthy=args.wealthy,
         diarize=args.diarize,
