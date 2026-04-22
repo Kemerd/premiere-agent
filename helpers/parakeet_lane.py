@@ -71,8 +71,12 @@ from whisper_lane import _diarize_and_assign, _load_hf_token
 
 # ---------------------------------------------------------------------------
 # Defaults — tuned for an RTX 3060+ baseline. Wealthy mode (24 GB+) uses
-# WHISPER_BATCH (48) which Parakeet absorbs comfortably; the RNNT decoder
-# is small relative to Whisper-large-v3 so batch headroom is plentiful.
+# WHISPER_BATCH (currently 16, see helpers/wealthy.py) which Parakeet
+# absorbs comfortably; the RNNT decoder is small relative to
+# Whisper-large-v3 so batch headroom is plentiful. We re-use the same
+# constant so the user's --wealthy flag means the same thing across the
+# fallback chain — Parakeet COULD safely run higher batches, but matching
+# Whisper's number keeps logs / VRAM expectations consistent.
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"

@@ -818,7 +818,12 @@ def test_heavy(R: Results, tmp: Path) -> None:
             [clip], edit,
             model_id="openai/whisper-large-v3",
             language="en",
-            batch_size=24,
+            # Smoke test runs on whatever GPU the user happens to have —
+            # use the safe default rather than the wealthy override so it
+            # passes on a 12 GB 3060 too. The lane's adaptive backoff
+            # would catch a too-high value, but a fast clean pass here
+            # is the better signal.
+            batch_size=8,
             chunk_length_s=30,
             diarize=False,
             num_speakers=None,

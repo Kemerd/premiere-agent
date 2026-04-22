@@ -422,10 +422,12 @@ def _resolve_whisper_attn(device: str) -> str:
         pyproject.toml — sdpa on Whisper-large-v3 is well-tested there
         and saves us a HUGE amount of memory because sdpa never
         materializes the O(seq^2) attention matrix. With seq=1500 on
-        the encoder × batch=24 × 32 layers × 20 heads in fp16, eager
-        attention's matrices are ~50+ GB; sdpa folds them into the
-        kernel and peaks at ~5 GB. This is the difference between
-        batch=24 fitting in 32 GB vs. OOMing.
+        the encoder × batch=16 × 32 layers × 20 heads in fp16, eager
+        attention's intermediate matrices balloon to ~30+ GB; sdpa
+        folds them into the kernel and peaks at ~3 GB extra. This
+        is the difference between our wealthy-mode batch=16 fitting
+        in 32 GB vs. OOMing — the activations alone outweigh the
+        weights by an order of magnitude.
       * transformers >= 5.x is the user-escape-hatch path. The 5.x +
         sdpa + Whisper + Blackwell (sm_120) combination silently
         poisons the CUDA context (see
