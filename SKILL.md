@@ -12,7 +12,7 @@ description: Edit any video by conversation. Local two-phase preprocessing — P
 3. **Ask → confirm → execute → iterate → persist.** Never touch the cut until the user has confirmed the strategy in plain English.
 4. **Generalize.** Do not assume what kind of video this is. Look at the material, ask the user, then edit.
 5. **Artistic freedom is the default.** Every specific value, preset, font, color, duration, pitch structure, and technique in this document is a *worked example* from one proven video — not a mandate. Read them to understand what's possible and why each worked. Then make your own taste calls based on what the material actually is and what the user actually wants. **The only things you MUST do are in the Hard Rules section below.** Everything else is yours.
-6. **Invent freely.** If the material calls for a technique not described here — split-screen, picture-in-picture, lower-third identity cards, reaction cuts, speed ramps, freeze frames, crossfades, match cuts, L-cuts, J-cuts, speed ramps over breath, whatever — build it. The helpers are ffmpeg, PIL, and (for split edits / dissolves) the FCPXML exporter. They can do anything the format supports. Do not wait for permission.
+6. **Invent freely.** If the material calls for a technique not described here — split-screen, picture-in-picture, lower-third identity cards, reaction cuts, speed ramps, freeze frames, match cuts, speed ramps over breath, whatever — build it. The helpers are ffmpeg and PIL; the FCPXML exporter handles hard-cut delivery to NLEs. They can do anything the format supports. Do not wait for permission. (Note: J-cuts, L-cuts, and cross-dissolves are currently **deferred** — see "Split edits (DEFERRED)" below.)
 7. **Verify your own output before showing it to the user.** If you wouldn't ship it, don't present it.
 
 ## Hard Rules (production correctness — non-negotiable)
@@ -31,7 +31,9 @@ These are the things where deviation produces silent failures or broken output. 
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
 12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use-premiere/` project directory.
-13. **Editor sub-agent must read `merged_timeline.md` end-to-end before emitting a single EDL range.** The merged view interleaves all three lanes by timestamp — speech (the spine), visual captions (shot continuity / B-roll), and audio events (soundscape hints) — so a single full-file read gives the editor the same triangulated picture it would get from reading each lane separately, in one pass. Never edit from a single lane in isolation. A cut chosen blind to the other lanes will land mid-shot, mid-action, or on a CLAP mis-label. If something in the merged view is ambiguous (e.g. you need word-level timing detail not captured in the phrase grouping, or a denser CLAP scoring than the merged stream shows), drill into the corresponding per-lane file (`speech_timeline.md`, `visual_timeline.md`, `audio_timeline.md`) for that specific moment. The brief in "Editor sub-agent brief" enforces this with a mandatory PRE-FLIGHT block; do not strip it when spawning.
+13. **Pacing preset is REQUIRED before strategy.** Every session must have a pacing preset confirmed by the user (Calm / Measured / Paced / Energetic / Jumpy — default Paced). The preset defines four numbers used by the editor sub-agent: `min_silence_to_remove`, `min_talk_to_keep`, `lead_margin`, and `trail_margin`. See "Pacing presets" below. Never skip the prompt; never invent ad-hoc values.
+14. **No split edits (J/L cuts) and no cross-dissolves until further notice.** The editor sub-agent MUST emit `audio_lead = video_tail = transition_in = 0` on every range. They are deferred because the OTIO single-track audio model + per-clip independent frame-snapping causes cumulative audio drift across long timelines (visible as the audio sliding further out of sync with each subsequent cut). Audio at cut boundaries is protected by the 30ms `afade` pair from Hard Rule 3 — that's the current "small crossfade" story. See "Split edits (DEFERRED)".
+15. **Editor sub-agent must read `merged_timeline.md` end-to-end before emitting a single EDL range.** The merged view interleaves all three lanes by timestamp — speech (the spine), visual captions (shot continuity / B-roll), and audio events (soundscape hints) — so a single full-file read gives the editor the same triangulated picture it would get from reading each lane separately, in one pass. Never edit from a single lane in isolation. A cut chosen blind to the other lanes will land mid-shot, mid-action, or on a CLAP mis-label. If something in the merged view is ambiguous (e.g. you need word-level timing detail not captured in the phrase grouping, or a denser CLAP scoring than the merged stream shows), drill into the corresponding per-lane file (`speech_timeline.md`, `visual_timeline.md`, `audio_timeline.md`) for that specific moment. The brief in "Editor sub-agent brief" enforces this with a mandatory PRE-FLIGHT block; do not strip it when spawning.
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
@@ -148,9 +150,9 @@ The default audio workflow is: read `speech_timeline.md` + `visual_timeline.md` 
 ### Editing
 
 - **`helpers/timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly. The visual_timeline.md replaces 90% of the old "scan with timeline_view" workflow.
-- **`helpers/render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST → loudness norm → final.mp4. `--preview` for 1080p fast, `--draft` for 720p ultrafast, `--build-subtitles` to generate master.srt inline. **Flattens J/L cuts to hard cuts** — see Cut Techniques below.
+- **`helpers/render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST → loudness norm → final.mp4. `--preview` for 1080p fast, `--draft` for 720p ultrafast, `--build-subtitles` to generate master.srt inline. Bakes a 30ms `afade` at every boundary (Hard Rule 3) — that's the current "small audio crossfade." J/L cuts and dissolves are DEFERRED (Hard Rule 14); if any are present in the EDL the renderer warns and flattens them.
 - **`helpers/grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
-- **`helpers/export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit editor-ready timeline files. Honors `audio_lead` / `video_tail` (J/L cuts) and `transition_in` (cross-dissolves) natively. **Default emits BOTH `cut.fcpxml` AND `cut.xml`** side-by-side from a single timeline build, because Premiere Pro and Resolve/FCP X want different XML dialects: `.fcpxml` (FCPXML 1.10+) is native to DaVinci Resolve and Final Cut Pro X, `.xml` (Final Cut Pro 7 xmeml) is native to Premiere Pro. The recipient picks whichever NLE they live in — no XtoCC conversion required for Premiere. Override with `--targets {both,fcpxml,premiere}`. `--frame-rate 24` (default), 25, 29.97, 30, 60.
+- **`helpers/export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit editor-ready timeline files. Hard-cut delivery only right now (Hard Rule 14): the EDL's `audio_lead` / `video_tail` / `transition_in` fields are still consumed by the code path but the editor sub-agent must emit `0` for all three. **Default emits BOTH `cut.fcpxml` AND `cut.xml`** side-by-side from a single timeline build, because Premiere Pro and Resolve/FCP X want different XML dialects: `.fcpxml` (FCPXML 1.10+) is native to DaVinci Resolve and Final Cut Pro X, `.xml` (Final Cut Pro 7 xmeml) is native to Premiere Pro. The recipient picks whichever NLE they live in — no XtoCC conversion required for Premiere. Override with `--targets {both,fcpxml,premiere}`. `--frame-rate 24` (default), 25, 29.97, 30, 60.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
@@ -160,8 +162,8 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 1. **Inventory + Phase A preprocess.** `ffprobe` every source. `python helpers/preprocess_batch.py <videos_dir>` to run the speech + visual lanes (Parakeet ONNX + Florence-2) — cached by mtime, so this is one-time per source. Then `python helpers/pack_timelines.py --edit-dir <edit>` to produce `merged_timeline.md` (the default reading surface) plus the per-lane drill-down views `speech_timeline.md` and `visual_timeline.md`.
 2. **Phase B audio (agent-curated CLAP).** Read `merged_timeline.md` yourself (or `speech_timeline.md` + `visual_timeline.md` if you want the per-lane view), infer what kinds of sounds will plausibly appear in this footage (tools, materials, ambience, music, animals, vehicles, environments — be specific to *this* project), and write a vocabulary list of ~200–1000 short labels to `<edit>/audio_vocab.txt`. Include a healthy negative / unrelated set too so silence and out-of-domain sounds don't all latch onto your top labels. Then run `python helpers/audio_lane.py <videos> --vocab <edit>/audio_vocab.txt --edit-dir <edit>` and re-run `pack_timelines.py` to fold the new events into `merged_timeline.md` and `audio_timeline.md`. Skip this step only if the user explicitly says they don't care about audio events, or pass `--include-audio` to `preprocess_batch.py` upstream to use the baked-in baseline vocab instead (smoke tests, agent-less batch runs).
 3. **Pre-scan for problems.** One pass over `merged_timeline.md` end-to-end — every speech phrase, every audio event, every visual caption, all interleaved by timestamp. Note verbal slips, mis-speaks, or phrasings to avoid (from the `"..."` lines). Note shot variety, B-roll candidates, and visually continuous actions you'll want to keep whole (from the `visual:` lines). Treat `(audio: ...)` lines as the lowest-priority hints — verify any CLAP label against the visual line at the same timestamp before trusting it (the model is approximate, especially when the vocabulary is too small or too generic). Drill into the per-lane files only when the merged view leaves you guessing about word-level timing or denser audio scoring than the merged stream shows.
-4. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs, **delivery target (flattened mp4 vs FCPXML to NLE)**. Do not use a fixed checklist — the right questions are different every time.
-5. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate, **delivery format**. **Wait for confirmation.**
+4. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs, **delivery target (flattened mp4 vs FCPXML to NLE)**. Do not use a fixed checklist — the right questions are different every time. **One question is mandatory and not skippable: pacing preset** — present the five options (Calm / Measured / Paced / Energetic / Jumpy) with one-line descriptions and tell the user the default is **Paced**. They can pick a name or just say "use the default." See "Pacing presets" below for the value table you'll feed to the editor sub-agent.
+5. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, **chosen pacing preset (by name + the four numbers it expands to)**, animation plan, grade direction, subtitle style, length estimate, **delivery format**. **Wait for confirmation.**
 6. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments where the visual_timeline caption alone isn't enough. Build animations in parallel sub-agents. Apply grade per-segment.
    - **Flat MP4 path:** Compose via `render.py`.
    - **NLE handoff path:** Export via `export_fcpxml.py`. Default emits both `cut.fcpxml` (Resolve / FCP X) and `cut.xml` (Premiere Pro native xmeml) from one build — recipient picks. Tell Premiere users to `File → Import → cut.xml` (the `.fcpxml` does **not** work natively in Premiere — that's the file Adobe wants you to run through XtoCC, which we sidestep entirely).
@@ -178,42 +180,78 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
    If anything fails: fix → re-render → re-eval. **Cap at 3 self-eval passes** — if issues remain after 3, flag them to the user rather than looping forever. Only present the preview once the self-eval passes.
 9. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-preprocess unchanged sources. Final render on confirmation. Append to `project.md`.
 
+## Pacing presets
+
+Every session must have a pacing preset (Hard Rule 13). Ask the user up-front in step 4. Default is **Paced**. The preset expands to four numbers that the editor sub-agent applies when picking cut points and trimming silences:
+
+| Preset    | `min_silence_to_remove` | `min_talk_to_keep` | `lead_margin` | `trail_margin` | Vibe |
+|-----------|------------------------:|-------------------:|--------------:|---------------:|------|
+| Calm      | 500 ms                  | 500 ms             | 500 ms        | 500 ms         | Cinematic, contemplative, breathing room. Long silences are kept; only obvious dead air is trimmed. Documentary, interview, narrative. |
+| Measured  | 350 ms                  | 350 ms             | 350 ms        | 350 ms         | Conversational and considered. Professional talking-head, podcast-style, unhurried tutorial. |
+| **Paced** *(default)* | **200 ms** | **200 ms**     | **200 ms**    | **200 ms**     | Balanced and modern. Retains rhythm without dragging. Default for tech demos, launch videos, mid-form content. |
+| Energetic | 100 ms                  | 100 ms             | 100 ms        | 100 ms         | Tight and punchy. Social-friendly, fast tutorials, hype reels. |
+| Jumpy     |  50 ms                  |  50 ms             |  50 ms        |  50 ms         | Ultra-tight "every breath cut" style. Montage, trailer, vlog supercuts. Risks audible artifacts on poor source audio — verify on preview. |
+
+**What each number means** (apply at decision time inside the editor sub-agent):
+
+- **`min_silence_to_remove`** — silences (gaps between words from the speech lane) shorter than this are *kept*; longer ones are candidates to cut out entirely. A Jumpy preset chops out anything ≥50ms; a Calm preset only chops ≥500ms gaps so natural pauses survive.
+- **`min_talk_to_keep`** — speech segments shorter than this are *not* worth retaining as standalone clips. Used to filter out single-syllable false starts ("uh-", "th-") that survived the silence filter. Tighter presets keep shorter fragments because the editing rhythm absorbs them.
+- **`lead_margin`** — silent padding *before* the first kept word of a clip. Absorbs ASR drift (50–100ms typical) and gives the listener a beat of air before the talker comes in.
+- **`trail_margin`** — silent padding *after* the last kept word of a clip. Same purpose at the tail. Together with `lead_margin`, replaces the old "30–200ms working window" guidance with a preset-driven number — but Hard Rule 7's working window still bounds the legal range (so a Calm preset's 500ms margin is the upper end, not infinity).
+
+**Translating to the EDL:** when you build each range, expand the kept word boundary by the margins:
+
+```
+range.start = max(0, kept_first_word.start - lead_margin / 1000)
+range.end   = min(src_duration, kept_last_word.end + trail_margin / 1000)
+```
+
+And while picking ranges, only consider silence gaps `>= min_silence_to_remove` as legitimate cut targets, and discard any candidate kept clip whose net speech duration is `< min_talk_to_keep`.
+
+**Persist the choice.** Record the preset name (and the four expanded values) in `project.md` under "Strategy" so subsequent sessions inherit a sensible default — but still ask if the user wants to keep it.
+
 ## Cut craft (techniques)
 
 - **Speech-first.** Candidate cuts from word boundaries and silence gaps. Parakeet TDT is accurate to the word; the speech lane is the editorial spine. Read it interleaved in `merged_timeline.md`; drill into `speech_timeline.md` when you need word-level timing detail.
 - **Preserve peaks.** Laughs, punchlines, emphasis beats. Extend past punchlines to include reactions — the laugh IS the beat.
-- **Speaker handoffs** benefit from air between utterances. Common values: 400–600ms. Less for fast-paced, more for cinematic. Taste call.
+- **Speaker handoffs** benefit from air between utterances. The pacing preset's `lead_margin` + `trail_margin` largely sets this; only override per-handoff if the moment calls for it (e.g. a punchline beat that earns extra silence).
 - **Visual context is the second source of truth.** Before committing to *any* non-trivial cut, check the `visual:` lines around the cut point in `merged_timeline.md`. If captions show a continuous action ("person holding drill") spanning your cut, you're cutting in the middle of a shot — usually fine, but be deliberate. Use the visual lane to find B-roll cutaway candidates, match cuts, shot changes, and to decide whether a moment is worth preserving even when speech is silent. Drill into `visual_timeline.md` when you need the full 1-fps caption stream (the merged view drops `(same)` repeats).
 - **Audio events are noisy hints, not signals.** The `(audio: ...)` lines in `merged_timeline.md` carry `(drill 0.87)`, `(applause 0.92)`, `(laughter)`, `(power_tool)` markers from CLAP scored against the agent-curated vocab. **The model is approximate** — it mis-labels (music tagged as speech, hammers tagged as drums, room tone tagged as applause), especially when the vocabulary is too small or too generic. Use a marker only as a prompt to *go look* at the visual line (and if needed `timeline_view`) at that timestamp. **Never cut purely on a CLAP label.** When CLAP and Florence-2 disagree about what's happening, trust Florence-2. Drill into `audio_timeline.md` when you want the full per-window scoring instead of the collapsed merged form.
-- **Silence gaps are cut candidates.** Silences ≥400ms are usually the cleanest. 150–400ms phrase boundaries are usable with a visual check. <150ms is unsafe (mid-phrase).
-- **Example cut padding** (the launch video shipped with this): 50ms before the first kept word, 80ms after the last. Tighter for montage energy, looser for documentary. Stay in the 30–200ms working window (Hard Rule 7).
+- **Silence gaps are cut candidates.** Use the pacing preset's `min_silence_to_remove` as your threshold (Calm 500ms → Jumpy 50ms). Anything shorter than that is *not* a cut candidate — it's the natural rhythm of the speech. <30ms is always unsafe (mid-phoneme).
+- **Cut padding comes from the pacing preset**, not from per-cut taste. Expand each range by `lead_margin` at the head and `trail_margin` at the tail (see "Pacing presets"). Hard Rule 7's 30–200ms working window still bounds anything outside the preset table — never go below 30ms.
 - **Never reason audio and video independently.** Every cut must work on both tracks.
 
-### Split edits (J/L cuts) and dissolves
+### Split edits (DEFERRED — do not emit)
 
-Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but absolutely shine in FCPXML:
+J-cuts (`audio_lead`), L-cuts (`video_tail`), and cross-dissolves (`transition_in`) are **deferred** until further notice (Hard Rule 14). The EDL schema still accepts these fields and the FCPXML exporter still consumes them — but the editor sub-agent must emit `0` for all three on every range, and reviewers must reject any EDL that doesn't.
 
-- **J-cut** (`audio_lead` field) — the next clip's audio bleeds in BEFORE its video appears. Classic for interviews ("you hear the answer start while still seeing the question"). Typical: 200–800ms.
-- **L-cut** (`video_tail` field) — the previous clip's audio lingers UNDER the next clip's video. Used for B-roll cutaways while the speaker keeps talking. Typical: 500–2000ms.
-- **Cross-dissolve** (`transition_in` field) — symmetric video+audio dissolve into this clip. Use sparingly: scene changes, time jumps, montage transitions. Typical: 250–500ms.
+**Why deferred:** the current FCPXML build uses an OTIO single-track audio model with per-clip independent frame-snapping. When `audio_lead` or `video_tail` is non-zero, the math `cur_a = target_a_start + a_dur` (in `helpers/export_fcpxml.py`) drifts away from `cur_v` because:
 
-**EDL fields** (all optional, all default to 0 = hard cut):
+1. Snapping `a_src_start` and `a_src_end` independently to the frame grid doesn't always preserve `a_dur == v_dur` (sub-frame rounding error per clip).
+2. A single audio track can't actually overlap clips, so an L-cut tail forces the *next* clip's audio backward — but the gap-padding only handles the positive case (audio LATER than video). Negative gaps silently collapse to zero, so the next J-cut's audio starts at the wrong timeline position.
+3. Errors compound across every cut. On a 50-cut timeline the audio is visibly sliding out of alignment under the video by the end (the symptom the user reported).
+
+**Path forward when we revisit this** (not now): switch to two audio tracks (A1 carries the speech, A2 carries the lead/tail spillover) so overlaps are legal; lock the audio source range to the same snapped frame edges as the video; advance both `cur_v` and `cur_a` from a single canonical "next timeline position" rather than independent counters.
+
+**For now, the only legal split-edit story is the 30ms `afade` pair** at every cut boundary (Hard Rule 3) — that's the "small audio crossfade" the renderer bakes in to prevent boundary pops. It's not a J/L cut; it's a click-suppression fade. Good enough until the multi-track path lands.
+
+**EDL fields the editor MUST emit as zero:**
 
 ```json
 {"source": "C0103", "start": 12.20, "end": 18.45, "beat": "ANSWER",
- "audio_lead": 0.4,        // J-cut: audio leads video by 400ms
- "video_tail": 1.2,        // L-cut: audio lingers 1.2s past video end
- "transition_in": 0.3}     // 300ms cross-dissolve into this clip
+ "audio_lead": 0.0,        // DEFERRED — must be 0
+ "video_tail": 0.0,        // DEFERRED — must be 0
+ "transition_in": 0.0}     // DEFERRED — must be 0
 ```
 
-**Render path matrix:**
+**Render path matrix (current state):**
 
-| Output            | Hard cuts | J/L cuts            | Dissolves          |
-|-------------------|-----------|---------------------|--------------------|
-| `render.py` → mp4 | ✓         | flattened, warned   | flattened, warned  |
-| `export_fcpxml.py` → fcpxml | ✓ | native split edit | native cross-dissolve |
+| Output                       | Hard cuts | 30ms boundary afade | J/L cuts | Dissolves |
+|------------------------------|-----------|---------------------|----------|-----------|
+| `render.py` → mp4            | ✓         | ✓ (Hard Rule 3)     | DEFERRED | DEFERRED  |
+| `export_fcpxml.py` → fcpxml  | ✓         | colorist's job      | DEFERRED | DEFERRED  |
 
-**Workflow:** if the user wants J/L cuts or dissolves, build the EDL with those fields populated and run BOTH `render.py` (gives them a flattened preview MP4 to evaluate cuts) and `export_fcpxml.py` (gives them the editor file with the split edits intact). Tell them the MP4 is for reviewing cut points, the FCPXML is for finishing.
+If the user explicitly asks for J/L cuts or dissolves: explain the deferral honestly, ship hard cuts, and offer to log it in `project.md` as an outstanding item for the day the multi-track path lands.
 
 ## The timelines (primary reading view)
 
@@ -312,6 +350,11 @@ INPUTS (in priority order — trust them in this order when they disagree):
   - Verbal slips to avoid: <list from the pre-scan pass>
   - Target runtime: <seconds>
   - Delivery: <flat mp4 / fcpxml / both>
+  - Pacing preset: <Calm | Measured | Paced | Energetic | Jumpy>
+      min_silence_to_remove: <ms>     // skip silence gaps shorter than this
+      min_talk_to_keep:      <ms>     // drop kept clips shorter than this
+      lead_margin:           <ms>     // pad before first kept word
+      trail_margin:          <ms>     // pad after  last  kept word
 
 Common structural archetypes (pick, adapt, or invent):
   - Tech launch / demo:   HOOK → PROBLEM → SOLUTION → BENEFIT → EXAMPLE → CTA
@@ -325,18 +368,29 @@ Common structural archetypes (pick, adapt, or invent):
 
 RULES:
   - Start/end times must fall on word boundaries from speech_timeline.md.
-  - Pad cut boundaries (working window 30–200ms).
-  - Prefer silences ≥ 400ms as cut targets.
+  - Pad each range using the pacing preset:
+        range.start = max(0, first_kept_word.start - lead_margin/1000)
+        range.end   = min(src_dur, last_kept_word.end + trail_margin/1000)
+    Stay inside Hard Rule 7's 30-200ms working window.
+  - Only treat silence gaps >= min_silence_to_remove as cut targets.
+    Anything shorter is the natural rhythm of the speech — do not cut.
+  - Discard any kept clip whose net speech duration is < min_talk_to_keep
+    (filters single-syllable false starts that survived silence trimming).
   - Cross-reference visual_timeline.md before committing to a cut whose
     audio looks clean — make sure you're not cutting in the middle of a
     visually continuous action you wanted to keep whole. The visual lane
     classifies the moment; the audio events lane only suggests where to look.
-  - Use J/L cuts (audio_lead / video_tail) for interview answers and
-    B-roll cutaways. Cross-dissolves (transition_in) for scene changes.
+  - HARD RULE 14: split edits and dissolves are DEFERRED.
+    Emit audio_lead = video_tail = transition_in = 0.0 on EVERY range.
+    Do not use J-cuts, L-cuts, or cross-dissolves under any circumstances.
+    The 30ms afade pair at every boundary (baked into render.py) is the
+    only "audio crossfade" available right now and is sufficient to
+    suppress boundary pops.
   - Unavoidable slips are kept if no better take exists. Note them in "reason".
   - If over budget, revise: drop a beat or trim tails. Report total and self-correct.
 
-OUTPUT (JSON array, no prose):
+OUTPUT (JSON array, no prose — note all three split-edit fields are
+forced to 0.0 per Hard Rule 14):
   [{"source": "C0103", "start": 2.42, "end": 6.85, "beat": "HOOK",
     "audio_lead": 0.0, "video_tail": 0.0, "transition_in": 0.0,
     "quote": "...", "reason": "..."}, ...]
@@ -456,8 +510,13 @@ Match the source unless the user asked for something specific. Common targets: `
      "beat": "HOOK", "quote": "...", "reason": "Cleanest delivery, stops before slip at 38.46."},
     {"source": "C0108", "start": 14.30, "end": 28.90,
      "beat": "SOLUTION", "quote": "...", "reason": "Only take without the false start.",
-     "audio_lead": 0.4, "video_tail": 1.2, "transition_in": 0.3}
+     "audio_lead": 0.0, "video_tail": 0.0, "transition_in": 0.0}
   ],
+  "pacing_preset": "Paced",
+  "pacing": {"min_silence_to_remove_ms": 200,
+             "min_talk_to_keep_ms": 200,
+             "lead_margin_ms": 200,
+             "trail_margin_ms": 200},
   "grade": "warm_cinematic",
   "overlays": [
     {"file": "edit/animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0}
@@ -467,7 +526,7 @@ Match the source unless the user asked for something specific. Common targets: `
 }
 ```
 
-`grade` is a preset name or raw ffmpeg filter (ignored by FCPXML export — colorist's job). `overlays` are rendered animation clips (ffmpeg path only). `subtitles` is optional and applied LAST (ffmpeg path) or imported as a captions track (FCPXML path). `audio_lead` / `video_tail` / `transition_in` per range are optional split-edit / dissolve fields, all default 0 (hard cut). See "Cut Techniques → Split edits" above.
+`grade` is a preset name or raw ffmpeg filter (ignored by FCPXML export — colorist's job). `overlays` are rendered animation clips (ffmpeg path only). `subtitles` is optional and applied LAST (ffmpeg path) or imported as a captions track (FCPXML path). `pacing_preset` + `pacing` record the user's chosen preset and its expanded values for traceability (the editor sub-agent already applied them when picking ranges; downstream tools may re-read them for reporting). `audio_lead` / `video_tail` / `transition_in` per range are DEFERRED (Hard Rule 14) and must always be `0.0`.
 
 ## Memory — `project.md`
 
@@ -477,6 +536,7 @@ Append one section per session at `<edit>/project.md`:
 ## Session N — YYYY-MM-DD
 
 **Strategy:** one paragraph describing the approach
+**Pacing:** preset name + the four expanded ms values (so next session can default to it)
 **Decisions:** take choices, cuts, grades, animations + why
 **Reasoning log:** one-line rationale for non-obvious decisions
 **Outstanding:** deferred items
