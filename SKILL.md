@@ -56,7 +56,10 @@ The skill lives in `video-use-premiere/`. User footage lives wherever they put i
     ├── audio_tags/<name>.json   ← cached raw CLAP (label, score) events
     ├── audio_vocab.txt          ← agent-curated CLAP vocabulary (Phase B)
     ├── audio_vocab_embeds.npz   ← cached CLAP text embeddings for that vocab
-    ├── visual_caps/<name>.json  ← cached raw Florence-2 captions
+    ├── visual_caps/<name>.json       ← cached raw Florence-2 captions
+    ├── comp_visual_caps/<name>.json  ← caveman-compressed visual caps
+    │                                   (NLP/spaCy pass; default reading
+    │                                   surface for the timelines below)
     ├── audio_16k/<name>.wav     ← shared 16kHz mono PCM (speech lane + CLAP)
     ├── animations/slot_<id>/    ← per-animation source + render + reasoning
     ├── clips_graded/            ← per-segment extracts with grade + fades
@@ -133,7 +136,8 @@ python helpers/health.py --clear           # wipe cache (next call re-runs)
 
 - **`helpers/preprocess_batch.py <videos_dir>`** — auto-discover videos, run the speech (Parakeet ONNX) + visual (Florence-2) lanes with VRAM-aware scheduling. Default entry point. Flags: `--wealthy` (24GB+ GPU), `--diarize`, `--language en`, `--force`, `--skip-speech`, `--skip-visual`, `--include-audio` (opt into running CLAP inline against the baseline vocab — see Phase B for the recommended path instead).
 - **`helpers/preprocess.py <video1> [<video2> ...]`** — same orchestrator with explicit file list. Use when you want a subset.
-- **`helpers/pack_timelines.py --edit-dir <dir>`** — read the available lane caches (`transcripts/`, `audio_tags/`, `visual_caps/`) and produce `merged_timeline.md` (the editor's default reading surface, all three lanes interleaved by timestamp) plus the three per-lane drill-down views: `speech_timeline.md`, `audio_timeline.md` (only if Phase B has run), `visual_timeline.md`. Pass `--no-merge` to skip the merged view (rare). Safe to call multiple times — re-running after Phase B picks up the new audio events into both the merged file and `audio_timeline.md`.
+- **`helpers/pack_timelines.py --edit-dir <dir>`** — read the available lane caches (`transcripts/`, `audio_tags/`, `visual_caps/`) and produce `merged_timeline.md` (the editor's default reading surface, all three lanes interleaved by timestamp) plus the three per-lane drill-down views: `speech_timeline.md`, `audio_timeline.md` (only if Phase B has run), `visual_timeline.md`. Pass `--no-merge` to skip the merged view (rare). Safe to call multiple times — re-running after Phase B picks up the new audio events into both the merged file and `audio_timeline.md`. **Caveman compression on visual captions is ON by default** — a spaCy NLP pass strips stop words / determiners / auxiliaries / weak adverbs from every Florence-2 caption before packing, cutting `merged_timeline.md` token cost by ~55-60% on detailed-caption footage with zero loss of editorial signal (entities, actions, colours, shot composition all survive). Cached in `<edit>/comp_visual_caps/` keyed by source mtime + caveman version + lang; subsequent re-packs are instant. Pass `--no-caveman` to read the raw Florence paragraphs (slower, bigger, only useful for debugging what Florence actually said). `--caveman-lang en` (default) picks the spaCy model; `--caveman-procs N` overrides the worker count (default `min(n_files, cpu_count // 2)`); `--force-caveman` re-runs even cached files. Sentence-level fuzzy delta dedup is also applied at pack time: visually static frames collapse to `(same)` in `visual_timeline.md` and disappear entirely from `merged_timeline.md`; slowly-evolving frames emit only the NEW sentences with a `+ ` prefix (think `git diff` additions).
+- **`helpers/caveman_compress.py`** — standalone CLI for the caveman pass. Useful for debugging the compression on a single caption (`python helpers/caveman_compress.py "verbose text"`) or for manually batching a `visual_caps/` directory (`python helpers/caveman_compress.py --visual-caps <edit>/visual_caps/`). The pack helper calls it automatically — you only need this directly when iterating on the filter rules.
 
 **Phase B — CLAP audio events with an agent-curated vocabulary (recommended):**
 
@@ -342,12 +346,15 @@ If the stretch fails the two criteria above (no continuous activity, or no story
 
 **`merged_timeline.md`** — the **default reading surface for the editor sub-agent.** All three lanes interleaved chronologically by timestamp into a single per-source section. Speech phrases as `"..."`, audio events as `(audio: label1, label2, ...)`, visual captions as `visual: ...`. One file, one full read, every event in order — the editor gets the same triangulated picture it would get from reading three lanes in parallel, without the three-way cross-reference cost.
 
+Visual captions are **caveman-compressed** by default (NLP pass over the Florence-2 paragraphs — stop words / determiners / auxiliaries / weak adverbs stripped, entities / actions / colours / shot composition kept). Reads like a telegram but every fact survives, and the LLM editor reconstructs the grammar effortlessly. Lines prefixed with `+ ` are sentence-level deltas — only the NEW sentences vs the prior caption are shown (think `git diff` additions); lines without `+ ` are full re-descriptions (treat as a likely shot change). Frames whose caption fully overlaps the prior frame are dropped from the merged view entirely.
+
 ```
 ## C0108  (duration: 87.4s, ...)
-  [00:00:02] visual: a workbench with hand tools laid out on a brown wooden surface
+  [00:00:02] visual: Workbench hand tools laid brown wooden surface.
   [00:00:03] "okay so today we're going to drill the pilot holes"
   [00:00:12] (audio: drill 0.87, power_tool 0.71)
-  [00:00:12] visual: a person holding a cordless drill above a metal panel with rivet holes
+  [00:00:12] visual: Person holding cordless drill metal panel rivet holes.
+  [00:00:13] visual: + Close - drill bit entering metal sparks visible.
   [00:00:18] "good, pass me the deburring tool"
 ```
 

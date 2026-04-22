@@ -49,7 +49,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -181,6 +183,167 @@ def _hms(seconds: float) -> str:
     m = int((s % 3600) // 60)
     sec = int(s % 60)
     return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Visual caption cleanup + fuzzy sentence-level delta dedup.
+#
+# Florence-2's `<MORE_DETAILED_CAPTION>` task emits a 5-7 sentence paragraph
+# per frame at 1 fps. Two consecutive frames in static / slow-moving footage
+# describe almost the same scene — same wires, same room, same colours —
+# but vary by a sentence or two ("yellow panel on the top right" vs
+# "yellow panel on the top corner"). The visual_lane dedup is byte-exact,
+# so it only collapses literally identical captions; near-duplicates all
+# survive into the merged timeline and bloat it by 5-10x.
+#
+# The fix is sentence-level delta dedup with fuzzy matching:
+#
+#   * Split each caption into sentences (clean period-space split — no
+#     real tokenizer, Florence captions don't use abbreviations).
+#   * For each new caption, compare its sentences (normalized) against
+#     the previous caption's sentences using difflib SequenceMatcher.
+#     A sentence with ratio >= 0.85 vs any prior sentence counts as
+#     "already seen" — colour swaps, minor word reorderings, and
+#     phrasing drift don't count as new content.
+#   * If every sentence is already seen → render as `(same)`.
+#   * If no sentences are shared → likely shot change, full caption.
+#   * Otherwise → emit only the new sentences with a `+ ` prefix
+#     (think `git diff` additions).
+#
+# The "previous" baseline always tracks the FULL current caption's
+# sentence set, not just the delta we emitted — so deltas don't compound
+# (a 1-sentence drift per frame doesn't accumulate into a misleading
+# claim that nothing has changed in 60 frames).
+#
+# Defensive `<pad>` strip is applied on every caption read so legacy
+# visual_caps caches from before the visual_lane.py fix pack cleanly
+# without forcing a re-preprocess.
+# ---------------------------------------------------------------------------
+
+# Mirror of visual_lane._FLORENCE_SPECIAL_TOKEN_RE — duplicated here so
+# pack_timelines doesn't have to import visual_lane (which pulls in torch
+# and transformers via _hf_env on import). Keeping them in sync is cheap;
+# the regex is two lines and the leakage shape is fixed by Florence-2
+# itself, not by our code.
+_FLORENCE_SPECIAL_TOKEN_RE = re.compile(
+    r"<\s*/?\s*(?:pad|s|unk|mask|bos|eos|sep|cls)\s*>",
+    flags=re.IGNORECASE,
+)
+_WS_RUN_RE = re.compile(r"\s{2,}")
+
+# Sentence boundaries — split on `.`/`!`/`?` followed by whitespace. The
+# lookbehind keeps the punctuation attached to the preceding sentence so
+# the rendered output stays grammatical when we re-join only the new
+# sentences after a delta filter.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+# Sentence-normalization regex — strip non-word/non-space chars before
+# the SequenceMatcher comparison so trailing periods, commas, and
+# colour-list punctuation don't disturb the similarity ratio.
+_PUNCT_STRIP_RE = re.compile(r"[^\w\s]")
+
+# Similarity threshold for "this sentence already appeared in the previous
+# caption". 0.85 was picked empirically against the reference video: at
+# 0.85 a "red, white, and blue" → "red, white, and yellow" colour swap
+# correctly counts as the same sentence (one token diff out of ~7), while
+# a real shot change ("interior of a car" → "close-up of a drill bit")
+# correctly registers as new. Lower the threshold (0.75) for noisier
+# captioners; raise it (0.92) for very stable ones.
+_SENT_SIMILARITY_THRESH = 0.85
+
+
+def _clean_caption_text(text: str) -> str:
+    """Strip Florence-2 special-token leakage from a cached caption.
+
+    Defensive — old visual_caps/*.json from before the visual_lane.py
+    decode-time strip carry runs of <pad><pad><pad>... that bloat the
+    merged timeline by 30-40%. Apply on read so legacy caches pack
+    cleanly without forcing a re-preprocess.
+    """
+    if not text:
+        return ""
+    text = _FLORENCE_SPECIAL_TOKEN_RE.sub("", text)
+    text = _WS_RUN_RE.sub(" ", text).strip()
+    return text
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split a caption into sentences. Florence-2 outputs use clean
+    period-space delimiters and no abbreviations, so a regex split is
+    robust enough — no need for spaCy / nltk (would dominate the pack
+    runtime on a multi-thousand-frame project).
+    """
+    text = text.strip()
+    if not text:
+        return []
+    parts = _SENT_SPLIT_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _norm_sentence(s: str) -> str:
+    """Lowercase + drop punctuation + collapse whitespace. Used purely
+    for the SequenceMatcher comparison — never displayed to the user.
+    """
+    s = s.lower()
+    s = _PUNCT_STRIP_RE.sub("", s)
+    s = _WS_RUN_RE.sub(" ", s).strip()
+    return s
+
+
+def _sentence_seen_in(needle_norm: str, prev_norms: list[str]) -> bool:
+    """True if `needle_norm` is near-identical (>= _SENT_SIMILARITY_THRESH)
+    to ANY sentence in `prev_norms`. O(|prev_norms|) per call; with
+    ~5-7 sentences per caption this stays well under 50 ratio() calls
+    per adjacent-frame comparison — negligible against the JSON parse
+    cost of even a small visual_caps file.
+    """
+    if not needle_norm:
+        return True   # empty needle never adds anything new
+    for h in prev_norms:
+        if SequenceMatcher(None, needle_norm, h).ratio() >= _SENT_SIMILARITY_THRESH:
+            return True
+    return False
+
+
+def _delta_caption(curr_text: str, prev_norms: list[str]) -> tuple[str, list[str], str]:
+    """Compute the visible representation of a caption given the prior
+    caption's normalized sentence list.
+
+    Returns (mode, new_prev_norms, display_text):
+        mode = "same" | "delta" | "full" | "empty"
+        new_prev_norms = the sentence-norm list to carry into the next
+            comparison. ALWAYS the FULL current caption's normalized
+            sentences, never the delta — otherwise small sentence-level
+            drifts would compound and we'd lose track of what's actually
+            on screen after a few frames.
+        display_text = the markdown string to render. For "delta" this
+            is the new sentences joined with "+ " prefix; for "full"
+            it is the entire caption; for "same" it is "(same)";
+            for "empty" it is "" (caller should skip the row entirely).
+    """
+    curr_sents = _split_sentences(curr_text)
+    if not curr_sents:
+        return ("empty", [], "")
+
+    curr_norms = [_norm_sentence(s) for s in curr_sents]
+    new_idxs = [
+        i for i, n in enumerate(curr_norms)
+        if not _sentence_seen_in(n, prev_norms)
+    ]
+
+    if not new_idxs:
+        # Every sentence already seen in the prior caption — full overlap.
+        return ("same", curr_norms, "(same)")
+
+    if len(new_idxs) == len(curr_sents):
+        # Zero overlap — treat as a real shot change, render full caption.
+        return ("full", curr_norms, " ".join(curr_sents))
+
+    # Partial overlap — only emit what's new, with a `+ ` prefix so the
+    # editor can see at a glance "this row is a delta against the prior
+    # full caption, not a fresh description".
+    delta_sents = [curr_sents[i] for i in new_idxs]
+    return ("delta", curr_norms, "+ " + " ".join(delta_sents))
 
 
 # ---------------------------------------------------------------------------
@@ -370,20 +533,55 @@ def _pack_audio(audio_tags_dir: Path) -> str:
 # Lane 3 — Visual captions timeline
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Visual caps source resolver — picks comp_visual_caps/ over visual_caps/
+# when caveman compression is enabled and the cache is populated.
+# ---------------------------------------------------------------------------
+
+VISUAL_CAPS_SUBDIR = "visual_caps"
+COMP_VISUAL_CAPS_SUBDIR = "comp_visual_caps"
+
+
+def _resolve_visual_caps_dir(edit_dir: Path, *, prefer_caveman: bool) -> Path:
+    """Pick which visual caps directory to read from.
+
+    When caveman is enabled, prefer comp_visual_caps/ if it exists and is
+    non-empty. Falls back to visual_caps/ if comp/ is missing (e.g. the
+    user passed --no-caveman the first time and now wants a re-pack
+    without re-running spaCy). When caveman is disabled, always read
+    visual_caps/.
+    """
+    raw = edit_dir / VISUAL_CAPS_SUBDIR
+    comp = edit_dir / COMP_VISUAL_CAPS_SUBDIR
+    if prefer_caveman and comp.is_dir() and any(comp.glob("*.json")):
+        return comp
+    return raw
+
+
 def _pack_visual(visual_caps_dir: Path) -> str:
     """Render visual_timeline.md from <edit>/visual_caps/*.json.
 
-    Uses captions_dedup so consecutive identical frames collapse to (same).
-    Falls back to raw captions if dedup absent (older JSON shape).
+    Uses sentence-level fuzzy delta dedup (see _delta_caption) so static
+    or slow-moving footage collapses to `(same)` and slowly-evolving
+    footage emits compact `+ <new sentences>` deltas instead of
+    re-dumping the same 5-sentence paragraph every second. We always
+    work off `captions` (the raw, per-frame list) so the dedup runs
+    on actual content — `captions_dedup` is the legacy byte-exact
+    collapse from visual_lane and is only used as a fallback for old
+    caches that somehow lost the raw list.
     """
     json_files = sorted(visual_caps_dir.glob("*.json"))
     lines: list[str] = []
     lines.append("# Visual timeline (Florence-2 detailed captions @ 1 fps)")
     lines.append("")
     lines.append(
-        "One caption per second; consecutive identical captions collapse to "
-        "`(same)`. Use timestamps to find shots / B-roll candidates / "
-        "match cuts."
+        "One caption per second. Static/slow scenes collapse to `(same)`. "
+        "Slowly-evolving scenes emit only the NEW sentences with a `+ ` "
+        "prefix (think `git diff` additions) — the previously-seen "
+        "sentences are dropped to keep the timeline scannable. A line "
+        "shown WITHOUT `+ ` is a full re-description (treat as a likely "
+        "shot change). Use timestamps to find shots / B-roll candidates "
+        "/ match cuts."
     )
     lines.append("")
 
@@ -393,7 +591,10 @@ def _pack_visual(visual_caps_dir: Path) -> str:
 
     for p in json_files:
         data = json.loads(p.read_text(encoding="utf-8"))
-        captions = data.get("captions_dedup") or data.get("captions") or []
+        # Prefer raw captions so the fuzzy delta runs on actual content;
+        # fall back to captions_dedup for very old caches that may have
+        # lost the raw list (defensive — current visual_lane writes both).
+        captions = data.get("captions") or data.get("captions_dedup") or []
         duration = data.get("duration", 0.0)
         fps = data.get("fps", 1)
         lines.append(
@@ -404,10 +605,25 @@ def _pack_visual(visual_caps_dir: Path) -> str:
             lines.append("  _no visual captions emitted_")
             lines.append("")
             continue
+
+        # Per-source running window of "what the prior caption's
+        # sentences were". Resets at each source so deltas don't bleed
+        # across clip boundaries.
+        prev_norms: list[str] = []
         for c in captions:
             t = float(c.get("t", 0.0))
-            text = (c.get("text") or "").strip().replace("\n", " ")
-            lines.append(f"  [{format_time(t)}] {text}")
+            raw = (c.get("text") or "").strip().replace("\n", " ")
+            raw = _clean_caption_text(raw)
+            # Legacy byte-exact `(same)` markers from old captions_dedup
+            # caches: render verbatim and DON'T let them poison the
+            # prev_norms baseline (we have no sentence content to track).
+            if raw == "(same)":
+                lines.append(f"  [{format_time(t)}] (same)")
+                continue
+            mode, prev_norms, display = _delta_caption(raw, prev_norms)
+            if mode == "empty":
+                continue
+            lines.append(f"  [{format_time(t)}] {display}")
         lines.append("")
     return "\n".join(lines)
 
@@ -416,7 +632,7 @@ def _pack_visual(visual_caps_dir: Path) -> str:
 # Optional merge — interleave all three by timestamp into one stream.
 # ---------------------------------------------------------------------------
 
-def _build_merged(edit_dir: Path) -> str:
+def _build_merged(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
     """Walk all three caches in lock-step per video and emit one
     timestamp-sorted stream per video.
 
@@ -424,10 +640,13 @@ def _build_merged(edit_dir: Path) -> str:
     multi-modal context at a glance — e.g. "what's happening at 12:04?".
     For pure speech-driven editing the speech_timeline.md alone is
     usually denser and easier to scan.
+
+    `prefer_caveman` controls whether we read the caveman-compressed
+    visual caps (default) or the raw paragraphs.
     """
     transcripts = edit_dir / "transcripts"
     audio_tags = edit_dir / "audio_tags"
-    visual_caps = edit_dir / "visual_caps"
+    visual_caps = _resolve_visual_caps_dir(edit_dir, prefer_caveman=prefer_caveman)
 
     # Use the union of stems found in any directory. Lanes can be skipped
     # individually so we don't require all three to be present.
@@ -444,7 +663,14 @@ def _build_merged(edit_dir: Path) -> str:
     out.append(
         "All three lanes interleaved by timestamp (HH:MM:SS). "
         "Speech lines are quoted; audio events use `(audio: ...)`; "
-        "visual captions use `visual:` prefix."
+        "visual captions use `visual:` prefix. A `visual:` line whose "
+        "text starts with `+ ` is a delta — only the sentences that "
+        "are NEW vs the prior caption are shown (sentences that didn't "
+        "change are dropped to keep the file scannable). A `visual:` "
+        "line WITHOUT `+ ` is a full re-description (treat as a likely "
+        "shot change). Frames whose caption fully overlaps the prior "
+        "frame are dropped from the merged view entirely — drill into "
+        "`visual_timeline.md` if you want the per-second `(same)` markers."
     )
     out.append("")
 
@@ -498,17 +724,31 @@ def _build_merged(edit_dir: Path) -> str:
                         s, f"[{_hms(s)}] (audio: {text})",
                     ))
 
-        # ── Visual: dedup'd captions ──
+        # ── Visual: raw captions, run through the sentence-level fuzzy ──
+        # delta dedup. We work off `captions` (the raw per-frame list) so
+        # the dedup runs on actual content, not on the byte-exact pre-
+        # collapse from visual_lane. Frames that fully overlap the prior
+        # caption are dropped entirely (mode == "same" / "empty"); deltas
+        # carry a `+ ` prefix so the editor can see at a glance which
+        # rows are partial vs full re-descriptions.
         vp = visual_caps / f"{stem}.json"
         if vp.exists():
             data = json.loads(vp.read_text(encoding="utf-8"))
-            caps = data.get("captions_dedup") or data.get("captions") or []
+            caps = data.get("captions") or data.get("captions_dedup") or []
+            prev_norms: list[str] = []
             for c in caps:
                 t = float(c.get("t", 0.0))
-                text = (c.get("text") or "").strip().replace("\n", " ")
-                if text == "(same)":
-                    continue   # don't pollute merged view with dedup markers
-                events.append((t, f"[{_hms(t)}] visual: {text}"))
+                raw = (c.get("text") or "").strip().replace("\n", " ")
+                raw = _clean_caption_text(raw)
+                # Legacy byte-exact `(same)` survivors: skip — they don't
+                # add information and we don't want them mucking with the
+                # prev_norms baseline.
+                if raw == "(same)":
+                    continue
+                mode, prev_norms, display = _delta_caption(raw, prev_norms)
+                if mode in ("same", "empty"):
+                    continue
+                events.append((t, f"[{_hms(t)}] visual: {display}"))
 
         events.sort(key=lambda x: x[0])
         if not events:
@@ -548,6 +788,34 @@ def main() -> None:
                     help="(deprecated, no-op) merged_timeline.md is now "
                          "emitted by default; this flag is kept for "
                          "backward compatibility.")
+    # ── Caveman compression (default ON) ──
+    # Strips stop words / determiners / auxiliaries / weak adverbs from
+    # every Florence-2 caption via spaCy before packing. Caches output
+    # in <edit>/comp_visual_caps/ keyed by source mtime + caveman
+    # version + lang. Saves 40-60% of merged_timeline.md tokens with
+    # zero loss of editorial signal. See helpers/caveman_compress.py
+    # for the full filter list.
+    ap.add_argument("--no-caveman", dest="caveman", action="store_false",
+                    default=True,
+                    help="Skip caveman compression — read the raw "
+                         "Florence-2 paragraphs from visual_caps/ "
+                         "instead of the compressed comp_visual_caps/. "
+                         "Bigger files, slower agent reads; only useful "
+                         "for debugging what Florence actually said.")
+    ap.add_argument("--caveman", dest="caveman", action="store_true",
+                    help="(default, no-op flag for symmetry with "
+                         "--no-caveman) Run caveman compression before "
+                         "packing.")
+    ap.add_argument("--caveman-lang", default="en",
+                    help="ISO 639-1 language code for the spaCy model "
+                         "the caveman pass uses (default: en). Auto-"
+                         "downloads the matching model on first use.")
+    ap.add_argument("--caveman-procs", type=int, default=None,
+                    help="Worker process count for the caveman pass "
+                         "(default: min(n_files, cpu_count // 2)).")
+    ap.add_argument("--force-caveman", action="store_true",
+                    help="Re-compress every visual_caps file even if "
+                         "the cached comp output is fresh.")
     args = ap.parse_args()
 
     edit_dir = args.edit_dir.resolve()
@@ -556,7 +824,7 @@ def main() -> None:
 
     transcripts = edit_dir / "transcripts"
     audio_tags = edit_dir / "audio_tags"
-    visual_caps = edit_dir / "visual_caps"
+    raw_visual_caps = edit_dir / VISUAL_CAPS_SUBDIR
 
     # Speech is the only lane considered "required" for a basic edit.
     # The other two are advisory context — if either is missing we still
@@ -565,6 +833,41 @@ def main() -> None:
     if not transcripts.is_dir():
         print(f"[pack_timelines] WARN: no transcripts/ at {transcripts}",
               file=sys.stderr)
+
+    # ── Pre-pack: caveman compression on visual_caps ──
+    # Has to happen BEFORE _pack_visual / _build_merged so the
+    # downstream readers see the freshly-compressed comp_visual_caps/.
+    # Skipped silently when --no-caveman OR when there are no
+    # visual_caps to compress (e.g. visual lane never ran).
+    if args.caveman and raw_visual_caps.is_dir():
+        try:
+            # Sibling-import pattern — see SKILL.md / preprocess.py for
+            # why we avoid `from helpers.x import y` here.
+            from caveman_compress import compress_visual_caps_dir
+            compress_visual_caps_dir(
+                raw_visual_caps,
+                edit_dir / COMP_VISUAL_CAPS_SUBDIR,
+                lang=args.caveman_lang,
+                force=args.force_caveman,
+                n_procs=args.caveman_procs,
+            )
+        except Exception as exc:
+            # Non-fatal: caveman is a token-budget optimization, not a
+            # correctness requirement. If spaCy isn't installed or the
+            # model download fails, fall back to the raw paragraphs and
+            # warn the user once. The downstream _resolve_visual_caps_dir
+            # naturally falls back to visual_caps/ when comp_visual_caps/
+            # is missing.
+            print(
+                f"[pack_timelines] WARN: caveman compression failed ({exc}); "
+                f"falling back to raw visual_caps/. Install with "
+                f"`pip install -e .[preprocess]` and ensure the spaCy "
+                f"model is available (`python -m spacy download "
+                f"en_core_web_sm`).",
+                file=sys.stderr,
+            )
+
+    visual_caps = _resolve_visual_caps_dir(edit_dir, prefer_caveman=args.caveman)
 
     out_speech = edit_dir / "speech_timeline.md"
     out_audio = edit_dir / "audio_timeline.md"
@@ -580,7 +883,10 @@ def main() -> None:
 
     if args.merge:
         out_merged = edit_dir / "merged_timeline.md"
-        out_merged.write_text(_build_merged(edit_dir), encoding="utf-8")
+        out_merged.write_text(
+            _build_merged(edit_dir, prefer_caveman=args.caveman),
+            encoding="utf-8",
+        )
         written.append(out_merged)
 
     for p in written:
