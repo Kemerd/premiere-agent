@@ -82,6 +82,21 @@ preprocess = [
     "einops",                  # Florence-2 transitive
     "timm",                    # Florence-2 transitive
     "imageio-ffmpeg",          # in-memory frame extraction for visual_lane
+    # ── Caveman compression for the visual lane (default-on) ──
+    # spaCy drives the NLP-based "caveman compression" pass that strips
+    # stop words / determiners / auxiliaries / weak adverbs from every
+    # Florence-2 caption before it lands in merged_timeline.md. Cuts the
+    # editor-side token cost by 40-60% on detailed-caption footage with
+    # zero loss of editorial signal (entities, actions, colours, shot
+    # composition all survive). Runs in a per-file process pool with
+    # mtime-cached output in <edit>/comp_visual_caps/. See
+    # helpers/caveman_compress.py for the full filter list.
+    #
+    # The pass is opt-OUT via `pack_timelines.py --no-caveman` so users
+    # who want the raw paragraphs can still get them (e.g. for debugging
+    # what Florence actually said). The English model is downloaded on
+    # first use via `python -m spacy download en_core_web_sm`.
+    "spacy>=3.7,<4",
     # ── Shared I/O ──
     "soundfile",               # WAV reading for audio_lane + extract_audio cache
 ]
