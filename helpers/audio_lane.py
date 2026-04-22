@@ -419,18 +419,51 @@ def _load_audio_48k(wav_path: Path):
 # Text-embedding compute + cache
 # ---------------------------------------------------------------------------
 
+# Mapping from ORT input dtype strings (as reported by `session.get_inputs()`)
+# to their numpy equivalents. ORT graphs declare typed inputs, but the HF
+# tokenizer + feature_extractor pair returns whatever dtype is most natural
+# for the python side (e.g. tokenizer -> int32, feature_extractor -> float32).
+# Without an explicit cast, ORT raises:
+#     [ONNXRuntimeError] : 2 : INVALID_ARGUMENT :
+#     Unexpected input data type. Actual: (tensor(int32)) , expected: (tensor(int64))
+# Different CLAP exports differ here (Xenova's CLAP-HTSAT text graph is int64
+# for input_ids/attention_mask, the audio graph is float32 for input_features);
+# we drive the cast off the graph metadata so any future model variant Just Works.
+_ORT_TYPE_TO_NUMPY: dict[str, str] = {
+    "tensor(int64)":   "int64",
+    "tensor(int32)":   "int32",
+    "tensor(int16)":   "int16",
+    "tensor(int8)":    "int8",
+    "tensor(uint8)":   "uint8",
+    "tensor(float)":   "float32",
+    "tensor(float16)": "float16",
+    "tensor(double)":  "float64",
+    "tensor(bool)":    "bool",
+}
+
+
 def _processor_to_numpy_feed(inputs, session) -> dict:
-    """Filter a transformers `BatchFeature` down to the keys ORT wants.
+    """Filter a transformers `BatchFeature` down to the keys ORT wants
+    AND coerce each value to the dtype that the ONNX graph declares.
 
     The processor returns a dict-like with several tensors; the ONNX
     graph only declares a subset as inputs. We hand-pick by input
     name to avoid `Got invalid dimensions for input X` errors on
-    accidental extras.
+    accidental extras, and we cast to the graph-declared dtype to
+    avoid `Unexpected input data type` errors on int32 vs int64
+    (HF tokenizers default to int32; CLAP text graph wants int64).
     """
     import numpy as np
     feed: dict[str, "np.ndarray"] = {}
-    wanted = {inp.name for inp in session.get_inputs()}
-    for name in wanted:
+    # Build name -> (input_meta) map so we can grab dtype too, not just names.
+    input_meta = {inp.name: inp for inp in session.get_inputs()}
+    for name, meta in input_meta.items():
+        # Resolve the declared dtype via the small lookup above. Fall back
+        # to the value's own dtype if the ORT type string is one we haven't
+        # mapped yet (better to forward as-is and let ORT raise a clear
+        # error than to silently mis-cast).
+        target_dtype = _ORT_TYPE_TO_NUMPY.get(meta.type)
+
         if name not in inputs:
             # The CLAP audio graph sometimes declares `is_longer` even
             # though the processor only emits it when fed audio longer
@@ -449,6 +482,11 @@ def _processor_to_numpy_feed(inputs, session) -> dict:
         # cast to numpy for ORT. The `.numpy()` path is zero-copy on CPU.
         if hasattr(val, "numpy"):
             val = val.numpy()
+        # Conform to the graph's declared dtype. `copy=False` is a hint:
+        # numpy returns the same buffer when the dtype already matches
+        # (zero-copy), and only allocates when an actual cast is required.
+        if target_dtype is not None and val.dtype != np.dtype(target_dtype):
+            val = val.astype(target_dtype, copy=False)
         feed[name] = val
     return feed
 
@@ -486,23 +524,76 @@ def _compute_text_embeddings(text_session, processor, vocab: list[str]):
     return (text_embeds / norm).astype(np.float32)
 
 
+def _safe_unlink(path: Path) -> None:
+    """Best-effort delete that swallows missing-file + sharing-violation.
+
+    Used by the cache-cleanup paths where a failure to delete is not
+    interesting enough to abort the run — worst case the next run sees
+    a stale file and re-handles it via the same cleanup path.
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Windows AV / Search-Indexer briefly holds handles on freshly
+        # closed files; not worth the retry loop here because the next
+        # `_persist_text_cache` write will overwrite atomically anyway.
+        pass
+
+
 def _load_text_cache(edit_dir: Path, vocab_sha: str):
-    """Return cached text embeddings if the sha matches, else None."""
+    """Return cached text embeddings if the sha matches, else None.
+
+    Self-healing: a corrupt / wrong-shape / wrong-dtype cache file gets
+    unlinked here so the next attempt starts from a clean slate instead
+    of repeatedly re-failing the load. The SHA is the canonical match
+    test; everything else (shape sanity, finite-float check) is a belt-
+    and-suspenders guard against half-written or model-version-mismatched
+    files surviving on disk.
+    """
     import numpy as np
 
     cache_path = edit_dir / VOCAB_EMBEDS_CACHE_NAME
     if not cache_path.exists():
         return None
+
+    # Wrap the entire load+validate sequence so ANY failure mode lands
+    # in the cleanup branch. We deliberately catch broadly (ValueError,
+    # KeyError, OSError, EOFError, BadZipFile from numpy on truncated
+    # npz) because every one of these means "the cache is unusable".
     try:
         data = np.load(str(cache_path), allow_pickle=False)
         cached_sha = str(data["sha"].item()) if data["sha"].shape == () else str(data["sha"])
         if cached_sha != vocab_sha:
+            # Wrong vocab — caller will recompute and overwrite. Don't
+            # nuke; the new cache_persist will replace it atomically and
+            # the user's previous-vocab embeds were perfectly valid for
+            # what they were. (Premature delete = wasted re-encode on a
+            # vocab swap-back.)
             return None
-        return data["embeds"]
-    except (OSError, ValueError, KeyError):
-        # Corrupt / partial / wrong-format cache file — ignore and
-        # let the caller recompute. Don't try to delete it; the next
-        # write will overwrite atomically anyway.
+        embeds = data["embeds"]
+        # Shape sanity. CLAP embeds are 2D (N_labels, D). A 1D or 0D
+        # array here means a previous half-write or model-output drift.
+        if embeds.ndim != 2 or embeds.shape[0] == 0:
+            raise ValueError(
+                f"cached embeds have unexpected shape {embeds.shape}; "
+                f"treating as corrupt"
+            )
+        # Float-finite check. NaN/Inf in the embeds would silently break
+        # cosine sim into all-NaN scores downstream; cheap to verify.
+        if not np.all(np.isfinite(embeds)):
+            raise ValueError("cached embeds contain non-finite values")
+        return embeds
+    except Exception as exc:
+        # Self-heal: nuke the bad file so the recompute path doesn't have
+        # to. We log a single line so the user knows WHY they're paying
+        # the recompute cost on this run.
+        print(
+            f"  audio_lane: cached vocab embeds at {cache_path.name} are "
+            f"unusable ({type(exc).__name__}: {exc}); deleting and recomputing"
+        )
+        _safe_unlink(cache_path)
         return None
 
 
@@ -512,18 +603,32 @@ def _persist_text_cache(edit_dir: Path, vocab_sha: str, text_embeds, vocab: list
     `vocab` is persisted alongside for diagnostics — `np.load` it and
     you can audit what labels produced these embeddings without
     re-reading the source video's vocab text file.
+
+    Crash-safe: write goes to a `.npz.tmp` sibling and is atomically
+    renamed into place, so an interrupted process can never leave a
+    half-written cache that fools the next run's loader. If the rename
+    itself fails (Windows AV holding the destination), the .tmp file
+    is best-effort deleted before re-raising so we don't accumulate
+    orphan tmp files in the edit folder.
     """
     import numpy as np
 
     cache_path = edit_dir / VOCAB_EMBEDS_CACHE_NAME
     tmp_path = cache_path.with_suffix(".npz.tmp")
-    np.savez(
-        str(tmp_path),
-        sha=np.array(vocab_sha),
-        embeds=text_embeds.astype(np.float32),
-        vocab=np.array(vocab, dtype=object),
-    )
-    _atomic_replace_with_retry(tmp_path, cache_path)
+    try:
+        np.savez(
+            str(tmp_path),
+            sha=np.array(vocab_sha),
+            embeds=text_embeds.astype(np.float32),
+            vocab=np.array(vocab, dtype=object),
+        )
+        _atomic_replace_with_retry(tmp_path, cache_path)
+    except Exception:
+        # Either the savez or the atomic rename failed. Either way, the
+        # .tmp file is dead weight — delete it so the next run doesn't
+        # see a stale tmp sibling and so the edit folder stays tidy.
+        _safe_unlink(tmp_path)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +953,22 @@ def run_audio_lane_batch(
     out_dir = (edit_dir / AUDIO_TAGS_SUBDIR).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # --force: nuke EVERY cached artifact this lane owns (per-video event
+    # JSONs AND the vocab text-embeds .npz) so the recompute path has no
+    # historical baggage to argue with. Without this, --force only re-tagged
+    # the audio side but kept whatever stale embeds happened to be on disk,
+    # which made `--force` useless for the most common reason people reach
+    # for it (recovering from a previous half-broken run).
+    if force:
+        embeds_path = edit_dir / VOCAB_EMBEDS_CACHE_NAME
+        if embeds_path.exists():
+            print(f"  audio_lane: --force: deleting stale {embeds_path.name}")
+            _safe_unlink(embeds_path)
+        for v in video_paths:
+            tag_path = out_dir / f"{v.stem}.json"
+            if tag_path.exists():
+                _safe_unlink(tag_path)
+
     # All-cache-hit fast path. Avoids the ~5-10s of model + processor
     # + session construction on a fully-cached re-run.
     if not force:
@@ -882,7 +1003,25 @@ def run_audio_lane_batch(
             f"tower (first run for this vocab; cache miss)"
         )
         t0 = time.time()
-        text_embeds = _compute_text_embeddings(text_session, processor, vocab)
+        try:
+            text_embeds = _compute_text_embeddings(text_session, processor, vocab)
+        except Exception:
+            # If the text encoder itself blows up (dtype mismatch, OOM,
+            # CUDA error mid-forward, ...) make sure we don't leave a
+            # prior partial / stale cache file in place to confuse the
+            # next attempt. The encoding hadn't started writing yet, but
+            # an OLDER cache might exist from a previous successful run
+            # against a different model — the user's most-likely next
+            # action is `--force`, and they shouldn't have to remember
+            # to rm an .npz manually.
+            embeds_path = edit_dir / VOCAB_EMBEDS_CACHE_NAME
+            if embeds_path.exists():
+                print(
+                    f"  audio_lane: text encoding failed; nuking possibly-"
+                    f"stale {embeds_path.name} so retry starts clean"
+                )
+                _safe_unlink(embeds_path)
+            raise
         print(f"  clap: text encoding done in {time.time() - t0:.1f}s")
         _persist_text_cache(edit_dir, vocab_sha, text_embeds, vocab)
     else:
@@ -946,8 +1085,16 @@ def main() -> None:
         description="Audio lane: LAION CLAP via ONNX -> vocab-scored sound events",
     )
     ap.add_argument(
-        "video", type=Path,
-        help="Path to source video file",
+        # nargs="+" so the CLI matches `run_audio_lane_batch`'s multi-video
+        # contract AND the SKILL.md documented invocation:
+        #   audio_lane.py <video1> [<video2> ...] --vocab ... --edit-dir ...
+        # Calling once with N videos is strictly cheaper than N invocations:
+        # the CLAP model + processor + ORT sessions + text-tower forward
+        # pass on the vocab are paid ONCE and amortized across all videos.
+        # A shell-loop wrapper would re-pay all of that per file.
+        "video", type=Path, nargs="+",
+        help="One or more source video files. The model + vocab text "
+             "embeddings are loaded ONCE and reused across all videos.",
     )
     ap.add_argument(
         "--edit-dir", type=Path, default=None,
@@ -1006,10 +1153,33 @@ def main() -> None:
 
     install_lane_prefix()
 
-    video = args.video.resolve()
-    if not video.exists():
-        sys.exit(f"video not found: {video}")
-    edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
+    # Resolve + validate every video up front. Failing fast on a typo'd
+    # path is cheaper than discovering it after the model has been loaded
+    # and the first N-1 videos have already been tagged.
+    videos: list[Path] = []
+    for raw in args.video:
+        v = raw.resolve()
+        if not v.exists():
+            sys.exit(f"video not found: {v}")
+        videos.append(v)
+
+    # --edit-dir, when given, applies to ALL videos (matches the orchestrator
+    # contract: one edit folder per "project" of related clips). When omitted
+    # we derive it per-video from `<video parent>/edit`, which means a mixed
+    # batch of videos from different folders gets sensible default edit dirs.
+    if args.edit_dir is not None:
+        edit_dir = args.edit_dir.resolve()
+    else:
+        # Pick the parent of the FIRST video. If the user passes a multi-folder
+        # batch without --edit-dir, that's almost certainly a mistake — warn so
+        # they don't end up with all tags written into one folder unexpectedly.
+        edit_dir = (videos[0].parent / "edit").resolve()
+        parents = {v.parent.resolve() for v in videos}
+        if len(parents) > 1:
+            print(
+                f"  audio_lane: WARNING — videos span {len(parents)} folders "
+                f"but no --edit-dir given; writing all output under {edit_dir}"
+            )
 
     # If --wealthy was passed on the CLI, mirror it to the env so the
     # tier resolution inside run_audio_lane_batch sees it. (Same
@@ -1017,8 +1187,10 @@ def main() -> None:
     if args.wealthy:
         os.environ["VIDEO_USE_WEALTHY"] = "1"
 
-    run_audio_lane(
-        video_path=video,
+    # Single batch call: model load + ORT sessions + vocab text encoding
+    # are paid ONCE; the per-video work happens in the lane's internal loop.
+    run_audio_lane_batch(
+        video_paths=videos,
         edit_dir=edit_dir,
         vocab_path=args.vocab,
         model_tier=args.model,
