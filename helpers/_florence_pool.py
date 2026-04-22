@@ -17,12 +17,15 @@ Why a pool, not a queue feeding a single captioner:
     diminishing returns past N=3 on the same card.
 
 Why duplicating the four-subgraph state per worker is OK:
-    Florence-2-base fp16 weights are ~545 MB on disk (vision 184 MB +
-    embed 79 MB + encoder 87 MB + decoder 195 MB).  ORT's CUDA EP
-    keeps these resident; a 2-instance pool resident-only is ~1.1 GB.
-    Add ~600-800 MB activation arena and ~370 MB peak KV cache per
-    instance and the steady-state ceiling is ~3-3.5 GB for N=2.  Fits
-    comfortably alongside the speech lane on a 12 GB+ card.
+    In the default "mixed" dtype mode (fp16 vision/embed/encoder + fp32
+    decoder, the only currently-loadable combination -- see
+    florence_onnx.py for why), Florence-2-base ONNX weights are ~620
+    MB on disk (vision 184 MB + embed 79 MB + encoder 87 MB + decoder
+    270 MB fp32).  ORT's CUDA EP keeps these resident; a 2-instance
+    pool resident-only is ~1.25 GB.  Add ~700-900 MB activation arena
+    and ~720 MB peak KV cache (fp32 KV) per instance and the
+    steady-state ceiling is ~4-4.5 GB for N=2.  Fits comfortably
+    alongside the speech lane on a 12 GB+ card.
 
 VRAM-aware sizing:
     The caller passes a *desired* pool size (from ``wealthy.py``).  At
@@ -37,7 +40,7 @@ Public API::
 
     pool = FlorenceCaptionerPool(model_dir,
                                  desired_size=2,
-                                 dtype="fp16",
+                                 dtype="mixed",
                                  quantized_decoder=False)
     captions_per_frame = pool.caption_batch(frames, task=...)
     pool.close()  # release captioners (or let the context manager / GC do it)
@@ -71,16 +74,23 @@ from florence_onnx import FlorenceCaptioner, DEFAULT_NUM_BEAMS, DEFAULT_MAX_NEW_
 # the parameter count.
 #
 # Tuned for `onnx-community/Florence-2-base`:
-#   * fp16 (default): ~1.6 GB per instance peak (~1.1 GB resident
-#     weights + ~500 MB activations + ~250 MB KV cache).
+#   * mixed (default): ~1.95 GB per instance peak (~1.25 GB resident
+#     weights with fp32 decoder + ~500 MB activations + ~200 MB KV
+#     cache).  KV is fp32 so 2x the fp16 number, but per-instance
+#     batch is small enough that 200 MB is the right ballpark.
+#   * fp16: ~1.6 GB per instance peak -- BROKEN UPSTREAM right now.
+#     Kept for the day onnx-community re-exports the decoder cleanly.
 #   * fp32: roughly 2x weights + 1.5x activations -> ~2.8 GB per inst.
-#   * q4f16 decoder: knocks ~150 MB off the resident, so ~1.4 GB peak.
+#   * mixed+q4f16dec: knocks ~150 MB off the resident, so ~1.8 GB
+#     peak.  Also currently broken upstream alongside fp16 decoder.
 # ---------------------------------------------------------------------------
 
 _PER_INSTANCE_RESIDENT_GB: dict[str, float] = {
-    "fp16":          1.1,   # default fp16, all four graphs in fp16
-    "fp32":          2.2,   # all four graphs in fp32 (paranoid mode)
-    "fp16+q4f16dec": 0.95,  # quantized decoder; encoder/embed/vision stay fp16
+    "mixed":          1.25,  # default; fp16 vision/embed/encoder + fp32 decoder
+    "fp16":           1.1,   # all four graphs in fp16 (broken upstream)
+    "fp32":           2.2,   # all four graphs in fp32 (paranoid mode)
+    "mixed+q4f16dec": 0.95,  # quantized decoder; vision/embed/encoder stay fp16
+    "fp16+q4f16dec":  0.95,  # legacy alias from before the mixed-dtype mode
 }
 
 # Transient peak above resident, hit during a single decoder step's
@@ -102,9 +112,10 @@ def _per_instance_peak_gb(dtype: str, quantized_decoder: bool) -> float:
     don't over-allocate instances that would be fine in steady state
     but OOM during the first decoder step.
     """
-    key = "fp16+q4f16dec" if (dtype == "fp16" and quantized_decoder) else dtype.lower()
+    base = dtype.lower()
+    key = f"{base}+q4f16dec" if quantized_decoder else base
     resident = _PER_INSTANCE_RESIDENT_GB.get(
-        key, _PER_INSTANCE_RESIDENT_GB["fp16"],
+        key, _PER_INSTANCE_RESIDENT_GB["mixed"],
     )
     return resident + _PER_INSTANCE_TRANSIENT_GB
 
@@ -152,7 +163,7 @@ class FlorenceCaptionerPool:
         model_dir: str | Path,
         *,
         desired_size: int,
-        dtype: str = "fp16",
+        dtype: str = "mixed",
         quantized_decoder: bool = False,
         prefer_tensorrt: bool | None = None,
     ) -> None:
@@ -164,7 +175,10 @@ class FlorenceCaptionerPool:
             desired_size: Caller's requested pool size.  Will be
                 clamped down by available VRAM; clamped up to a
                 minimum of 1 so the pool is always usable.
-            dtype: ``"fp16"`` (default) or ``"fp32"``.
+            dtype: ``"mixed"`` (default, recommended), ``"fp16"``
+                (broken upstream right now), or ``"fp32"`` (paranoid
+                quality reference).  See :class:`FlorenceCaptioner`
+                for the full breakdown.
             quantized_decoder: Forwarded verbatim to FlorenceCaptioner.
             prefer_tensorrt: Forwarded to ``resolve_providers``.  When
                 ``None`` (default), reads ``VIDEO_USE_FLORENCE_TRT=1``
@@ -469,7 +483,7 @@ class FlorenceCaptionerPool:
 
     @property
     def dtype(self) -> str:
-        """``"fp16"`` or ``"fp32"`` -- the float dtype these instances were built with."""
+        """``"mixed"``, ``"fp16"``, or ``"fp32"`` -- dtype the instances were built with."""
         return self._dtype
 
     @property
@@ -552,7 +566,7 @@ class FlorenceCaptionerPool:
 def make_solo_captioner(
     model_dir: str | Path,
     *,
-    dtype: str = "fp16",
+    dtype: str = "mixed",
     quantized_decoder: bool = False,
     prefer_tensorrt: bool | None = None,
     intra_op_threads: int = 4,
@@ -561,7 +575,8 @@ def make_solo_captioner(
 
     Args:
         model_dir: Path to the ``onnx-community/Florence-2-base`` snapshot.
-        dtype: ``"fp16"`` (default) or ``"fp32"``.
+        dtype: ``"mixed"`` (default), ``"fp16"`` (broken upstream),
+            or ``"fp32"`` (paranoid reference).
         quantized_decoder: Use the q4f16 decoder weight variant.
         prefer_tensorrt: Forwarded to ``resolve_providers``.  ``None``
             (default) reads ``VIDEO_USE_FLORENCE_TRT=1`` from env.

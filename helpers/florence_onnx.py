@@ -119,13 +119,110 @@ DEFAULT_MAX_NEW_TOKENS: int = 256  # matches the existing torch-path call site
 
 
 # ---------------------------------------------------------------------------
+# Per-subgraph weight-precision resolution
+#
+# Critical context, two intertwined facts that drove this design:
+#
+#   FACT 1 (the upstream bug we work around):
+#     onnx-community's Florence-2 export ships with three decoder
+#     variants (fp32, fp16, q4f16), but the FP16 + Q4F16 decoder
+#     graphs are STRUCTURALLY INVALID -- the FP16 conversion produced
+#     an If-node subgraph that returns a `logits` value defined in
+#     the OUTER scope without an Identity-node bridge, violating the
+#     ONNX spec.  ONNX Runtime >= 1.16 rejects it with:
+#
+#       "Subgraph output (logits) is an outer scope value being
+#        returned directly. Please update the model to add an
+#        Identity node between the outer scope value and the
+#        subgraph output."
+#
+#     Tracked at https://huggingface.co/onnx-community/Florence-2-large-ft/discussions/7
+#     (open since Sep 2025, unresolved).  The transformers.js README
+#     for Florence-2-base works around this by using `dtype: 'fp32'`
+#     for the whole model.  We do BETTER: only the broken decoder is
+#     forced to FP32, while the vision encoder (biggest forward pass
+#     per frame) stays on the fp16-weights variant for max throughput.
+#
+#   FACT 2 (the I/O contract that simplifies everything):
+#     The "_fp16" suffix on these onnx-community files refers to the
+#     INTERNAL weight precision only -- input and output tensors are
+#     uniformly FP32 across ALL four graph variants.  This is the
+#     standard `optimum` + `onnxconverter-common` weight-only fp16
+#     quantization pattern.  So there is NO encoder->decoder dtype
+#     boundary cast to worry about; we just always feed fp32 ndarrays.
+#
+# Mode summary:
+#   "mixed" (DEFAULT, recommended):
+#       Loads vision/embed/encoder from the fp16-weight variants
+#       (smaller download, faster GEMMs on tensor cores) and the
+#       decoder from the fp32 variant (the only loadable decoder).
+#       Best speed achievable while remaining functionally correct.
+#   "fp16": all-fp16-weights.  CURRENTLY BROKEN at decoder-load time
+#       upstream; kept as an opt-in for the day onnx-community
+#       re-exports a valid FP16 decoder.
+#   "fp32": all-fp32-weights.  Matches the upstream transformers.js
+#       README example exactly.  Bigger download (~745 MB vs ~620 MB
+#       for "mixed"), modestly slower vision pass; useful as a
+#       paranoid quality-reference baseline when debugging.
+#
+# Bonus complication (handled in _make_session below):
+#   ORT's SimplifiedLayerNormFusion graph optimizer pass crashes on
+#   the fp16 vision_encoder + fp16 encoder graphs with
+#   "InsertedPrecisionFreeCast ... attempting to get index by a name
+#   which does not exist".  Tracked at microsoft/onnxruntime#25692.
+#   We disable that one specific fusion via `disabled_optimizers` so
+#   the graphs load cleanly on every EP, including the CPU fallback.
+# ---------------------------------------------------------------------------
+
+
+# Per-subgraph default weight-precision map.  Keyed by the four ONNX
+# subgraphs we orchestrate.  Mutating this changes what dtype="mixed"
+# resolves to.
+_MIXED_DTYPE_MAP: dict[str, str] = {
+    "vision":  "fp16",
+    "embed":   "fp16",
+    "encoder": "fp16",
+    "decoder": "fp32",   # forced FP32 -- see module-top docstring
+}
+
+
+def _resolve_dtype_map(dtype: str) -> dict[str, str]:
+    """Expand a single ``dtype`` string into a per-subgraph weight map.
+
+    Args:
+        dtype: ``"mixed"`` (default), ``"fp16"`` (broken upstream),
+            or ``"fp32"`` (paranoid reference).  Any unknown value
+            raises ``ValueError`` so typos surface at construction
+            time, not three hours into a preprocess.
+
+    Returns:
+        Dict with keys ``"vision"``, ``"embed"``, ``"encoder"``,
+        ``"decoder"`` mapping to ``"fp16"`` or ``"fp32"``.  These
+        select WHICH .onnx file to load -- they do NOT change the
+        I/O dtype, which is uniformly fp32 across all variants.
+    """
+    if dtype == "mixed":
+        # Copy so the caller can mutate without polluting the module
+        # constant.  Cheap (4 entries).
+        return dict(_MIXED_DTYPE_MAP)
+    if dtype == "fp16":
+        return {k: "fp16" for k in _MIXED_DTYPE_MAP}
+    if dtype == "fp32":
+        return {k: "fp32" for k in _MIXED_DTYPE_MAP}
+    raise ValueError(
+        f"dtype must be one of 'mixed' (default), 'fp16', 'fp32'; "
+        f"got {dtype!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # File discovery: pick the right ONNX variants based on dtype + quantized
 # ---------------------------------------------------------------------------
 
 def _resolve_onnx_paths(
     model_dir: Path,
     *,
-    dtype: str,
+    dtype_map: dict[str, str],
     quantized_decoder: bool,
 ) -> dict[str, Path]:
     """Return absolute paths to the four ONNX files for this dtype combo.
@@ -134,17 +231,19 @@ def _resolve_onnx_paths(
         model_dir: Root of the ``snapshot_download`` cache for the
             ``onnx-community/Florence-2-base`` repo.  Must contain an
             ``onnx/`` subdirectory.
-        dtype: ``"fp16"`` (default, recommended) or ``"fp32"`` (paranoid
-            quality reference).  The ``fp16`` variants are ~2x smaller
-            on disk and ~1.5x faster on a CUDA EP at indistinguishable
-            caption quality.
-        quantized_decoder: If True, swap the fp16 decoder for the
+        dtype_map: Per-subgraph dtype dict from :func:`_resolve_dtype_map`,
+            with keys ``vision``, ``embed``, ``encoder``, ``decoder``
+            mapping to ``"fp16"`` / ``"fp32"``.  Each subgraph is
+            resolved independently so the default "mixed" mode picks
+            the FP16 vision encoder + FP32 decoder.
+        quantized_decoder: If True, swap the decoder for the
             ``decoder_model_merged_q4f16.onnx`` int4-weight variant.
             ~3.5x smaller decoder file, ~1.5-2x faster decoder step
             on a CUDA EP, very minor caption drift on long generations.
-            Vision encoder + text encoder + embed graphs stay fp16
-            because they're already small and any quality drift there
-            propagates into every decoder step.
+            **Currently broken upstream** with the same outer-scope
+            subgraph bug as the FP16 decoder; kept wired for the day
+            it gets re-exported cleanly.  Vision encoder + text
+            encoder + embed graphs stay on whatever dtype_map says.
 
     Returns:
         Dict with keys ``"vision"``, ``"embed"``, ``"encoder"``,
@@ -163,18 +262,21 @@ def _resolve_onnx_paths(
             f"be incomplete -- delete the local cache and re-download"
         )
 
-    # FP16 variant suffix.  The fp32 path is intentionally unsuffixed
-    # because that's the upstream default in onnx-community's exporter.
-    suffix = "" if dtype == "fp32" else "_fp16"
+    # Per-subgraph FP16 suffix.  The fp32 path is intentionally
+    # unsuffixed because that's the upstream default in onnx-community's
+    # exporter (`vision_encoder.onnx` is fp32; `vision_encoder_fp16.onnx`
+    # is fp16).
+    def _suffix(role: str) -> str:
+        return "" if dtype_map[role] == "fp32" else "_fp16"
 
     files = {
-        "vision":  onnx_dir / f"vision_encoder{suffix}.onnx",
-        "embed":   onnx_dir / f"embed_tokens{suffix}.onnx",
-        "encoder": onnx_dir / f"encoder_model{suffix}.onnx",
+        "vision":  onnx_dir / f"vision_encoder{_suffix('vision')}.onnx",
+        "embed":   onnx_dir / f"embed_tokens{_suffix('embed')}.onnx",
+        "encoder": onnx_dir / f"encoder_model{_suffix('encoder')}.onnx",
         "decoder": onnx_dir / (
             "decoder_model_merged_q4f16.onnx"
             if quantized_decoder
-            else f"decoder_model_merged{suffix}.onnx"
+            else f"decoder_model_merged{_suffix('decoder')}.onnx"
         ),
     }
 
@@ -231,11 +333,27 @@ def _make_session(
     sess_options.intra_op_num_threads = intra_op_threads
     sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-    # `providers` may be a list of plain strings ('CUDAExecutionProvider')
-    # or list of (name, options_dict) tuples for the TRT EP.  ORT accepts
-    # both; we pass through unmodified.
+    # SimplifiedLayerNormFusion crashes during init on the fp16
+    # vision_encoder + fp16 encoder graphs (and any other graph that
+    # has an "InsertedPrecisionFreeCast" node inside a layer-norm
+    # pattern).  The fusion pass tries to look up the cast node by
+    # name in a dict that doesn't contain it and asserts:
+    #   "Attempting to get index by a name which does not exist:
+    #    InsertedPrecisionFreeCast_/...".
+    # Tracked at microsoft/onnxruntime#25692.  Disabling this one
+    # specific fusion lets the fp16 graphs load on every EP, including
+    # the CPU fallback we hit during smoke tests.  The cost is a
+    # ~3-5% slowdown vs. the fused kernel on the layer-norm steps,
+    # which is invisible next to the decoder's autoregressive cost.
+    #
+    # We pass the disabled_optimizers list directly to InferenceSession
+    # because SessionOptions doesn't expose a setter for it -- ORT's
+    # Python API takes it as a separate constructor arg.
     return ort.InferenceSession(
-        str(onnx_path), sess_options=sess_options, providers=providers,
+        str(onnx_path),
+        sess_options=sess_options,
+        providers=providers,
+        disabled_optimizers=["SimplifiedLayerNormFusion"],
     )
 
 
@@ -326,9 +444,12 @@ def _init_past_kv(
 
     Args:
         batch_beams: Effective batch dimension = ``frames * num_beams``.
-        dtype: Match the model's float dtype (``np.float16`` for the
-            fp16 graph).  ONNX shape-checks dtype on every input even
-            for zero-length tensors.
+        dtype: Decoder I/O float dtype.  The onnx-community decoder
+            graphs all use FP32 I/O regardless of internal weight
+            precision, so callers should pass ``np.float32``.  Kept
+            as a parameter for symmetry / future-proofing if a real
+            FP16 decoder ever ships upstream.  ONNX shape-checks
+            dtype on every input even for zero-length tensors.
 
     Returns:
         Dict of 24 entries (6 layers x {encoder,decoder} x {key,value})
@@ -381,20 +502,28 @@ class FlorenceCaptioner:
     case, so use one ``FlorenceCaptioner`` per worker thread (the
     ``_florence_pool`` module provides a managed pool of these).
 
-    Memory footprint after construction (CUDA fp16, batch up to 8,
-    beams=3, 256 max_new_tokens):
-      * ONNX weights resident on GPU: ~545 MB
-      * Activation arena steady-state: ~600-800 MB
-      * KV cache peak (B*beams=24, src_len~600, tgt_len~256): ~370 MB
-      * Total per-session: ~1.5-1.7 GB
+    Memory footprint after construction (CUDA mixed-dtype default,
+    batch up to 8, beams=3, 256 max_new_tokens):
+      * ONNX weights resident on GPU: ~620 MB (fp16-weight vision/
+        embed/encoder + fp32-weight decoder)
+      * Activation arena steady-state: ~700-900 MB
+      * KV cache peak (B*beams=24, src_len~600, tgt_len~256): ~720 MB
+        (fp32 KV is 2x the fp16 size; the trade for not crashing on
+        the broken upstream fp16 decoder)
+      * Total per-session: ~2.0-2.3 GB
 
     Attributes:
         model_id: Hugging Face repo id this captioner was loaded from.
             Returned in the JSON cache so cache invalidation can
-            differentiate model versions.
-        dtype: ``"fp16"`` or ``"fp32"`` -- the float dtype of the
-            three non-decoder graphs (and of the decoder unless
-            ``quantized=True``).
+            differentiate model versions.  Suffixed with the dtype
+            mode so changing dtype re-tags the cache transparently.
+        dtype: ``"mixed"`` (default), ``"fp16"`` (broken upstream),
+            or ``"fp32"`` (paranoid reference).  See module-top docs.
+            Selects WHICH .onnx file gets loaded for each subgraph;
+            does NOT affect the I/O dtype which is always fp32.
+        dtype_map: Per-subgraph weight-precision dict actually used
+            to pick the four ONNX files.  Useful for debugging and
+            for the JSON sidecar's ``model_dtype_map`` field.
         quantized_decoder: Whether the q4f16 decoder variant is loaded.
     """
 
@@ -403,7 +532,7 @@ class FlorenceCaptioner:
         model_dir: str | Path,
         providers,
         *,
-        dtype: str = "fp16",
+        dtype: str = "mixed",
         quantized_decoder: bool = False,
         intra_op_threads: int = 1,
     ) -> None:
@@ -418,43 +547,55 @@ class FlorenceCaptioner:
                 ``_onnx_providers.resolve_providers()``.  Each session
                 gets the same ladder; ORT picks the highest-priority
                 EP that supports the model's ops.
-            dtype: ``"fp16"`` (default) or ``"fp32"``.  fp16 matches the
-                quality of the upstream torch fp16 path; fp32 is the
-                paranoid reference for caption-quality regressions.
+            dtype: ``"mixed"`` (default), ``"fp16"`` (broken upstream),
+                or ``"fp32"`` (paranoid reference).  See the module-
+                level docstring for the long story; tl;dr the upstream
+                onnx-community fp16 decoder graph is structurally
+                invalid and won't load on ORT >= 1.16, so the default
+                "mixed" path picks the fp32 decoder file while keeping
+                the rest of the graphs on the fp16-weight variants
+                for max speed.  All graphs use FP32 I/O regardless of
+                weight precision -- the dtype switch is purely about
+                which .onnx file lives on disk.
             quantized_decoder: Swap the decoder for the q4f16 variant.
-                ~1.5-2x faster decoder step on a CUDA EP with very
-                minor caption drift.  Off by default; flip via the
-                visual_lane CLI ``--quantized`` flag.
+                Currently broken upstream with the same subgraph bug
+                as the fp16 decoder; kept wired for the day it gets
+                re-exported cleanly.  Off by default.
             intra_op_threads: Per-session intra-op thread count.  1
                 is correct for the multi-session pool; bump to 4-8
                 if running a single captioner standalone.
         """
-        if dtype not in ("fp16", "fp32"):
-            raise ValueError(
-                f"dtype must be 'fp16' or 'fp32', got {dtype!r}"
-            )
+        # Resolve dtype string into a per-subgraph weight-precision map
+        # upfront.  _resolve_dtype_map raises ValueError on unknown
+        # strings, so typos surface here instead of three hours into a
+        # preprocess.  This map only drives FILE SELECTION -- the
+        # actual ndarray dtype we feed at runtime is always fp32 (see
+        # the long-form note in the module-top docstring).
         self.dtype = dtype
+        self.dtype_map = _resolve_dtype_map(dtype)
         self.quantized_decoder = quantized_decoder
         self.model_dir = Path(model_dir)
+
         # Track an ID that uniquely identifies the bytes we're about to
         # encode against, for cache-invalidation in the visual lane's
-        # JSON sidecar.  Quantized variant is encoded separately so a
-        # toggle re-tags transparently.
-        self.model_id = "onnx-community/Florence-2-base"
+        # JSON sidecar.  The dtype suffix means swapping --dtype re-tags
+        # the cache without needing --force.  Quantized variant gets
+        # its own suffix on top.
+        self.model_id = f"onnx-community/Florence-2-base+{dtype}"
         if quantized_decoder:
-            # Suffix tags the cache key so flipping --quantized re-tags
-            # without --force.  Same pattern as audio_lane's vocab_sha.
+            # Same pattern as audio_lane's vocab_sha -- a small textual
+            # discriminator on the cache key so flipping the flag at
+            # the CLI re-tags transparently.
             self.model_id += "+q4f16dec"
 
-        # ONNX float dtype matching the loaded graphs.  fp16 graphs
-        # take fp16 inputs everywhere except integer-typed ids.
-        self._np_float = np.float16 if dtype == "fp16" else np.float32
-
         paths = _resolve_onnx_paths(
-            self.model_dir, dtype=dtype, quantized_decoder=quantized_decoder,
+            self.model_dir,
+            dtype_map=self.dtype_map,
+            quantized_decoder=quantized_decoder,
         )
         _log.info(
-            "florence-onnx: vision=%s embed=%s encoder=%s decoder=%s",
+            "florence-onnx[%s]: vision=%s embed=%s encoder=%s decoder=%s",
+            dtype,
             paths["vision"].name, paths["embed"].name,
             paths["encoder"].name, paths["decoder"].name,
         )
@@ -482,9 +623,12 @@ class FlorenceCaptioner:
             o.name for o in self._decoder.get_outputs()
         ]
 
-        # Pure-NumPy preprocessor matched to the encoder's expected
-        # dtype.  fp32 graph wants fp32 input, fp16 graph wants fp16.
-        self._image_processor = FlorenceImageProcessor(dtype=self._np_float)
+        # Pure-NumPy preprocessor.  All four ONNX variants have FP32
+        # I/O contracts (the "_fp16" suffix in the filenames is purely
+        # internal weight precision; inputs and outputs stay fp32).
+        # So the preprocessor always produces fp32, regardless of
+        # which graph variant is loaded.  No per-step casts needed.
+        self._image_processor = FlorenceImageProcessor(dtype=np.float32)
 
         tokenizer_json = self.model_dir / "tokenizer.json"
         self._tokenizer = FlorenceTokenizer(tokenizer_json)
@@ -501,13 +645,14 @@ class FlorenceCaptioner:
         """Forward the vision encoder on a batch of pixel_values.
 
         Args:
-            pixel_values: ``(N, 3, 768, 768)`` matching the float dtype
-                of the loaded graph.  Produced by
-                :class:`FlorenceImageProcessor`.
+            pixel_values: ``(N, 3, 768, 768) float32``.  Produced by
+                :class:`FlorenceImageProcessor`.  All four ONNX
+                graph variants have FP32 I/O regardless of internal
+                weight precision.
 
         Returns:
-            ``(N, NUM_IMAGE_TOKENS=577, HIDDEN_SIZE=768)`` image-feature
-            tokens in the model's float dtype.
+            ``(N, NUM_IMAGE_TOKENS=577, HIDDEN_SIZE=768) float32``
+            image-feature tokens.
         """
         outputs = self._vision.run(
             None, {"pixel_values": pixel_values},
@@ -523,8 +668,8 @@ class FlorenceCaptioner:
                 use this same graph.
 
         Returns:
-            ``(N, L, HIDDEN_SIZE=768)`` token embeddings in the model's
-            float dtype.
+            ``(N, L, HIDDEN_SIZE=768) float32`` token embeddings.
+            All variants of the embed graph have FP32 outputs.
         """
         outputs = self._embed.run(
             None, {"input_ids": input_ids.astype(np.int64, copy=False)},
@@ -539,17 +684,17 @@ class FlorenceCaptioner:
         """Forward the BART text encoder on merged image+prompt embeds.
 
         Args:
-            merged_embeds: ``(N, 577 + L_prompt, 768)`` -- concatenation
-                of vision_encoder output and prompt embeds along axis 1.
-                Float dtype must match the loaded graph.
+            merged_embeds: ``(N, 577 + L_prompt, 768) float32`` --
+                concatenation of vision_encoder output and prompt
+                embeds along axis 1.
             merged_attn: ``(N, 577 + L_prompt) int64`` -- ones for the
                 image prefix concatenated with the tokenizer's prompt
                 attention_mask.
 
         Returns:
-            ``(N, 577 + L_prompt, 768)`` encoder hidden states in the
-            model's float dtype.  Fed straight to the decoder as
-            ``encoder_hidden_states`` for cross-attention.
+            ``(N, 577 + L_prompt, 768) float32`` encoder hidden states.
+            Fed straight to the decoder as ``encoder_hidden_states``
+            for cross-attention.
         """
         outputs = self._encoder.run(
             None,
@@ -607,6 +752,12 @@ class FlorenceCaptioner:
         enc_attn = np.repeat(
             encoder_attn.astype(np.int64, copy=False), num_beams, axis=0,
         )
+        # No encoder -> decoder dtype cast needed.  All four
+        # subgraphs (regardless of weight precision) have FP32 I/O
+        # contracts -- the "_fp16" suffix in the filenames is purely
+        # internal weight precision per the standard optimum +
+        # onnxconverter-common weight-only fp16 quantization pattern.
+        # See the module-top docstring for the long story.
 
         tok = self._tokenizer
         decoder_start = tok.decoder_start_token_id
@@ -638,8 +789,10 @@ class FlorenceCaptioner:
 
         # Past KV initialized to zero-len for both encoder and decoder
         # sides.  use_cache_branch=False on step 0 ignores values but
-        # still shape-checks the names.
-        past_kv = _init_past_kv(bb, dtype=self._np_float)
+        # still shape-checks the names.  Decoder I/O is uniformly fp32
+        # across all weight-precision variants, so the KV cache is
+        # always fp32 too.
+        past_kv = _init_past_kv(bb, dtype=np.float32)
 
         # Per-frame finished-hypothesis collectors.  Each entry is a
         # tuple (length_normalized_score, token_id_list).
@@ -660,6 +813,9 @@ class FlorenceCaptioner:
 
         for step in range(max_new_tokens):
             # 1. Embed the current single token per beam -> (BB, 1, 768).
+            #    The embed graph emits fp32 regardless of weight
+            #    precision, so this drops straight into the decoder
+            #    feed without a cast.
             inputs_embeds = self._run_embed(cur_tokens)
 
             # 2. Decoder forward.  Feed includes ALL 24 past_kv tensors
@@ -1009,7 +1165,7 @@ class FlorenceCaptioner:
 def download_florence_onnx(
     model_id: str = "onnx-community/Florence-2-base",
     *,
-    dtype: str = "fp16",
+    dtype: str = "mixed",
     quantized_decoder: bool = False,
 ) -> Path:
     """Snapshot-download the Florence-2 ONNX repo, return the local path.
@@ -1020,12 +1176,15 @@ def download_florence_onnx(
             because no other Florence-2 repo on the Hub matches the
             exact ONNX I/O contract we depend on.
         dtype: Match the captioner's :attr:`FlorenceCaptioner.dtype`.
-            Used to gate which ONNX file variants get pulled (fp32
-            adds ~600 MB to the download for no quality benefit on
-            modern GPUs).
+            ``"mixed"`` (default) pulls fp16 vision/embed/encoder +
+            fp32 decoder (~620 MB); ``"fp16"`` pulls all-fp16 (~250 MB,
+            but the decoder is currently broken upstream and will
+            fail to load); ``"fp32"`` pulls all-fp32 (~745 MB, the
+            paranoid quality reference).
         quantized_decoder: When True, also pull the
             ``decoder_model_merged_q4f16.onnx`` weight (~56 MB);
-            otherwise skip it.
+            otherwise skip it.  Currently broken upstream in the same
+            way as the fp16 decoder.
 
     Returns:
         Path to the local snapshot directory.  Subsequent calls with
@@ -1034,26 +1193,32 @@ def download_florence_onnx(
     """
     from huggingface_hub import snapshot_download
 
-    suffix = "" if dtype == "fp32" else "_fp16"
+    # Resolve the per-subgraph dtype map up front so this function
+    # picks exactly the same files _resolve_onnx_paths() will look
+    # for at session-load time.  Matching them up is the whole point
+    # of having one constant table at the top of the module.
+    dtype_map = _resolve_dtype_map(dtype)
+
+    def _suffix(role: str) -> str:
+        return "" if dtype_map[role] == "fp32" else "_fp16"
 
     # Always pull config + tokenizer + processor JSONs (small, all
-    # required).  Pull the matched-dtype variants of the four ONNX
-    # files plus any external_data sidecars (the .onnx_data pattern
-    # catches the >2 GB-ONNX-spec external-weight files; for the
-    # base model the fp16 variants are all under 200 MB so they're
-    # weight-inline, but the fp32 vision_encoder is 366 MB and might
-    # use external data on a future re-export).
+    # required).  Pull the matched-per-subgraph variants of the four
+    # ONNX files plus any external_data sidecars (the .onnx_data
+    # pattern catches the >2 GB-ONNX-spec external-weight files;
+    # the fp16 graphs are all weight-inline but the fp32 decoder
+    # uses an external data file on disk).
     allow_patterns = [
         "*.json",
         "*.txt",
-        f"onnx/vision_encoder{suffix}.onnx",
-        f"onnx/vision_encoder{suffix}.onnx_data",
-        f"onnx/embed_tokens{suffix}.onnx",
-        f"onnx/embed_tokens{suffix}.onnx_data",
-        f"onnx/encoder_model{suffix}.onnx",
-        f"onnx/encoder_model{suffix}.onnx_data",
-        f"onnx/decoder_model_merged{suffix}.onnx",
-        f"onnx/decoder_model_merged{suffix}.onnx_data",
+        f"onnx/vision_encoder{_suffix('vision')}.onnx",
+        f"onnx/vision_encoder{_suffix('vision')}.onnx_data",
+        f"onnx/embed_tokens{_suffix('embed')}.onnx",
+        f"onnx/embed_tokens{_suffix('embed')}.onnx_data",
+        f"onnx/encoder_model{_suffix('encoder')}.onnx",
+        f"onnx/encoder_model{_suffix('encoder')}.onnx_data",
+        f"onnx/decoder_model_merged{_suffix('decoder')}.onnx",
+        f"onnx/decoder_model_merged{_suffix('decoder')}.onnx_data",
     ]
     if quantized_decoder:
         allow_patterns.extend([

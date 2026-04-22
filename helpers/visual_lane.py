@@ -304,13 +304,19 @@ def _build_pool(
         model_id: HF Hub repo id.  Auto-remapped via
             :func:`_resolve_model_id` if the caller passed a legacy
             torch-era id.
-        dtype_name: ``"fp16"`` (default, recommended) or ``"fp32"``
-            (paranoid quality reference).  ``"bf16"`` is silently
-            mapped to fp16 for backward compat with the old torch
+        dtype_name: ``"mixed"`` (default, recommended), ``"fp16"``
+            (CURRENTLY BROKEN -- the upstream onnx-community fp16
+            decoder graph won't load on ORT >= 1.16; kept for the
+            day they re-export it cleanly), or ``"fp32"`` (the
+            paranoid quality reference, matches the transformers.js
+            README example exactly).  ``"bf16"`` is silently mapped
+            to ``"mixed"`` for backward compat with the old torch
             CLI -- ORT's CUDA EP doesn't carry a bf16 path for
             Florence-2's ops at the time of writing.
-        quantized_decoder: When True, use the q4f16 decoder weights
-            (~1.5-2x faster decoder, very minor caption drift).
+        quantized_decoder: When True, use the q4f16 decoder weights.
+            **Currently broken upstream** with the same outer-scope
+            subgraph bug as the fp16 decoder; kept wired for the day
+            it gets re-exported cleanly.
         pool_size: Number of parallel captioner instances.  Pool clamps
             this down if VRAM is tight.
 
@@ -327,19 +333,20 @@ def _build_pool(
 
     resolved_id = _resolve_model_id(model_id)
 
-    # Coerce dtype_name to the captioner's accepted set.  bf16 falls
-    # back to fp16 because the ONNX exports are fp16/fp32-only -- bf16
-    # would require re-exporting through onnxconverter-common, which
-    # is more complexity than the bf16 path is worth on Florence-base.
+    # Coerce dtype_name to the captioner's accepted set.  bf16 maps
+    # to "mixed" because the ONNX exports are fp16/fp32-only and the
+    # mixed mode gives the closest "fast but functional" experience
+    # to the old torch bf16 path.  Anything else falls through to
+    # the captioner's strict ValueError.
     if dtype_name == "bf16":
         print(
             "  visual_lane: dtype 'bf16' is not supported by the ONNX path; "
-            "falling back to fp16 (numerically equivalent for caption quality)"
+            "falling back to 'mixed' (fp16 vision/encoder + fp32 decoder)"
         )
-        dtype_name = "fp16"
-    if dtype_name not in ("fp16", "fp32"):
+        dtype_name = "mixed"
+    if dtype_name not in ("mixed", "fp16", "fp32"):
         raise ValueError(
-            f"unknown dtype '{dtype_name}'; valid: fp16, fp32"
+            f"unknown dtype '{dtype_name}'; valid: mixed, fp16, fp32"
         )
 
     print(
@@ -547,7 +554,11 @@ def run_visual_lane_batch(
     fps: int = DEFAULT_FPS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     device: str | None = "cuda:0",       # kept for backward compat (no-op on ONNX path)
-    dtype_name: str = "fp16",
+    # "mixed" = fp16 vision/embed/encoder + fp32 decoder.  Default
+    # because the upstream onnx-community fp16 decoder export is
+    # structurally invalid and won't load on ORT >= 1.16 (see
+    # florence_onnx.py module-top docs for the full story).
+    dtype_name: str = "mixed",
     task: str = DEFAULT_TASK_PROMPT,
     num_beams: int | None = None,
     max_new_tokens: int | None = None,
@@ -577,8 +588,11 @@ def run_visual_lane_batch(
             see :mod:`_onnx_providers`.  Kept on the signature so the
             orchestrator's ``--device cuda:0`` flag passthrough doesn't
             crash; ignored at runtime.
-        dtype_name: ``"fp16"`` (default) or ``"fp32"``.  ``"bf16"``
-            silently maps to fp16 (no ONNX bf16 export available).
+        dtype_name: ``"mixed"`` (default, recommended), ``"fp16"``
+            (broken upstream until they re-export the decoder), or
+            ``"fp32"`` (paranoid quality reference).  ``"bf16"``
+            silently maps to ``"mixed"`` (no ONNX bf16 export
+            available).
         task: Florence task token.  ``<MORE_DETAILED_CAPTION>`` is the
             default; OD/OCR/region tasks intentionally raise.
         num_beams: Beam width override.  ``None`` -> Florence default
@@ -760,9 +774,13 @@ def main() -> None:
                     help="LEGACY: ignored on the ONNX path. EP selection "
                          "lives in helpers/_onnx_providers.py "
                          "(VIDEO_USE_FLORENCE_TRT=1 opts into TensorRT).")
-    ap.add_argument("--dtype", default="fp16", choices=["fp16", "fp32", "bf16"],
-                    help="Float dtype for the three non-decoder ONNX graphs. "
-                         "bf16 silently maps to fp16 (no ONNX bf16 export).")
+    ap.add_argument("--dtype", default="mixed",
+                    choices=["mixed", "fp16", "fp32", "bf16"],
+                    help="ONNX dtype mode. 'mixed' (default) = fp16 "
+                         "vision/encoder + fp32 decoder; 'fp16' is broken "
+                         "upstream right now (decoder graph rejects on ORT); "
+                         "'fp32' is the paranoid reference; 'bf16' falls "
+                         "back to 'mixed'.")
     ap.add_argument("--task", default=DEFAULT_TASK_PROMPT,
                     help="Florence task prompt (default: <MORE_DETAILED_CAPTION>)")
     ap.add_argument("--force", action="store_true",

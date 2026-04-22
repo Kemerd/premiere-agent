@@ -157,12 +157,16 @@ class FlorenceImageProcessor:
     than redoing the resize in PIL/NumPy.  We ONLY normalize and
     transpose to NCHW here.
 
-    Output dtype is selectable so the caller can match whichever
-    Florence ONNX variant is loaded (fp16 by default, fp32 for the
-    paranoid-quality test path).
+    Output dtype is selectable, but in practice every onnx-community
+    Florence-2 graph variant accepts FP32 pixel_values regardless of
+    the internal weight precision (the "_fp16" file suffixes refer to
+    weight-only quantization; I/O stays fp32 across all variants).
+    The captioner always passes ``dtype=np.float32``; the parameter
+    is kept for forward-compat with future graph exports that genuinely
+    use FP16 I/O.
     """
 
-    def __init__(self, dtype: np.dtype | str = np.float16) -> None:
+    def __init__(self, dtype: np.dtype | str = np.float32) -> None:
         # Pre-compute mean/std as broadcastable (1, 3, 1, 1) buffers in
         # the target dtype so the per-frame normalize is a single
         # fused multiply-add the BLAS / SIMD path already optimizes.
