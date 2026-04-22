@@ -139,7 +139,7 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 ## The process
 
 0. **Health check.** Run `python helpers/health.py --json` first. Cached for 7 days; usually returns instantly. If `status != "ok"`, surface the `advice` strings to the user verbatim and stop. See the "Skill health check" section above.
-1. **Inventory.** `ffprobe` every source. `preprocess_batch.py <videos_dir>` to run all three lanes (Whisper + PANNs + Florence-2) — cached by mtime, so this is one-time per source. Then `pack_timelines.py --edit-dir <edit>` to produce the three timeline markdowns (and `--merge` if the material is action-heavy and you want all three context streams interleaved).
+1. **Inventory.** `ffprobe` every source. `python helpers/preprocess_batch.py <videos_dir>` to run all three lanes (Whisper + PANNs + Florence-2) — cached by mtime, so this is one-time per source. Then `python helpers/pack_timelines.py --edit-dir <edit>` to produce the three timeline markdowns (and `--merge` if the material is action-heavy and you want all three context streams interleaved).
 2. **Pre-scan for problems.** One pass over `speech_timeline.md` to note verbal slips, mis-speaks, or phrasings to avoid. If the material has heavy non-speech action (workshop / sports / live event), also scan `audio_timeline.md` for the rhythm of events and `visual_timeline.md` for shot variety.
 3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs, **delivery target (flattened mp4 vs FCPXML to NLE)**. Do not use a fixed checklist — the right questions are different every time.
 4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate, **delivery format**. **Wait for confirmation.**
@@ -425,7 +425,7 @@ Things that consistently fail regardless of style:
 - **Hierarchical pre-computed codec formats** with USABILITY / tone tags / shot layers. Over-engineering. Derive from the timelines at decision time.
 - **Hand-tuned moment-scoring functions.** The LLM picks better than any heuristic you'll write.
 - **Whisper SRT / phrase-level output.** Loses sub-second gap data. Always word-level verbatim.
-- **Re-running `preprocess_batch.py --force` reflexively.** The mtime-based cache is correct; bypass only when the source file actually changed or you've upgraded a model.
+- **Re-running `helpers/preprocess_batch.py --force` reflexively.** The mtime-based cache is correct; bypass only when the source file actually changed or you've upgraded a model.
 - **Reading `transcripts/*.json` directly.** Use `speech_timeline.md`. Same data, 1/10 the tokens, phrase-aligned.
 - **Burning subtitles into base before compositing overlays.** Overlays hide them. (Hard Rule 1.)
 - **Single-pass filtergraph when you have overlays.** Double re-encodes. Use per-segment extract → concat.
