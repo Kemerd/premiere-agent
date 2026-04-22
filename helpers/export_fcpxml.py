@@ -19,6 +19,27 @@ Default behaviour is to emit BOTH from a single timeline build so the
 recipient picks whichever NLE they live in without us having to re-run
 anything. Override with `--targets {fcpxml,premiere,both}`.
 
+Time-squeezing (timelapse) support:
+  Every range may carry an optional `speed` field (float, default 1.0).
+  When `speed > 1.0` the source segment plays back compressed by that
+  factor on the output timeline — e.g. 60s of source at speed=12.0 lands
+  as a 5s timelapse on the cut. Both XML dialects encode this natively:
+    - FCPXML 1.10+ : a <timeMap> element inside the <clip>, mapping
+                     timeline-clip-time → source-clip-time linearly.
+    - FCP7 xmeml   : a <filter> block carrying the standard "Time Remap"
+                     effect (effectid=timeremap) with a constant speed
+                     percentage. Premiere imports this without prompting.
+  An optional `audio_strategy` field per range chooses the audio
+  behaviour for sped-up clips:
+    - "drop" (default for speed != 1.0): the audio track is a silent gap
+      over the output duration. The intended workflow for timelapses
+      where the raw audio (sustained tool noise, ambience) is going to
+      be replaced by music or sound design in the NLE.
+    - "keep" : the audio clip is retimed alongside the video. NLEs that
+      expose a "preserve pitch on retime" toggle (Premiere, FCP X) will
+      let the editor decide whether the audio sounds natural or chipmunk.
+  See "Time-squeezing" in SKILL.md for when to actually reach for this.
+
 Why split-edit-friendly XML and not EDL/AAF/CMX 3600:
   - Both XML dialects natively encode SPLIT EDITS (J-cuts and L-cuts)
     via independent audio + video extents per clip. CMX 3600 is
@@ -515,6 +536,90 @@ def _range(start_s: float, dur_s: float, frame_rate: float):
 
 
 # ---------------------------------------------------------------------------
+# Time-squeezing (timelapse) — speed handling.
+#
+# The EDL allows each range to set `speed` (float, default 1.0). speed > 1
+# compresses the source segment on the output timeline (8.0 = 8x timelapse).
+#
+# We CLAMP to [1.0, MAX_SPEED]. The cap reflects two practical realities:
+#   * Both NLE retime UIs (Premiere "Speed/Duration", FCP X "Custom Speed")
+#     express speed as a percentage and start showing visible decimation
+#     artifacts above ~1000% on standard 24/30fps source. Beyond that the
+#     editor really wants frame-blending or optical flow, which is best
+#     left to the colourist post-import — we ship the clean retime.
+#   * Anything faster than 10x is almost always a sign the agent should
+#     have CUT the boring stretch instead of squeezing it. The cap nudges
+#     the editor toward the right tool.
+# Sub-1.0x slow-mo is intentionally NOT supported here — it would expand
+# the timeline and turn 30s of source into N minutes, which fights every
+# downstream assumption about pacing and SRT placement. If the user asks
+# for it, decline and explain why.
+# ---------------------------------------------------------------------------
+
+# Hard upper bound on retime — see module-comment rationale above.
+MAX_SPEED = 10.0
+# Floor at 1.0 — slow-mo expansion is a separate feature with its own
+# cost model (frame interpolation, audio drop-or-pitch, output-timeline
+# explosion). Until we design that, anything < 1.0 is treated as 1.0.
+MIN_SPEED = 1.0
+
+
+def _read_speed(r: dict, range_idx: int) -> float:
+    """Pull and validate the per-range `speed` field.
+
+    Returns a float in [MIN_SPEED, MAX_SPEED]. Missing / null / non-numeric
+    values resolve to 1.0. Out-of-range values are clamped with a warning
+    so a typo can't silently produce a 9-frame "timelapse" of a 4-hour
+    source (which would happen at speed=1000) or stretch the cut.
+    """
+    raw = r.get("speed")
+    if raw is None:
+        return 1.0
+    try:
+        spd = float(raw)
+    except (TypeError, ValueError):
+        print(f"  warn: range[{range_idx}] has non-numeric speed={raw!r}; "
+              "treating as 1.0 (no time-remap).", file=sys.stderr)
+        return 1.0
+    if spd < MIN_SPEED:
+        print(f"  warn: range[{range_idx}] speed={spd:g} < {MIN_SPEED:g} "
+              "(slow-mo not supported by this exporter); clamped to 1.0.",
+              file=sys.stderr)
+        return 1.0
+    if spd > MAX_SPEED:
+        print(f"  warn: range[{range_idx}] speed={spd:g} > {MAX_SPEED:g} "
+              f"(beyond the {int(MAX_SPEED * 100)}% retime ceiling); "
+              f"clamped to {MAX_SPEED:g}. Consider CUTTING the range "
+              "instead of squeezing it harder.", file=sys.stderr)
+        return MAX_SPEED
+    return spd
+
+
+def _read_audio_strategy(r: dict, speed: float, range_idx: int) -> str:
+    """Pick the audio behaviour for a range.
+
+    Defaults:
+      - speed == 1.0  → "keep" (audio plays normally — the standard cut)
+      - speed != 1.0  → "drop" (silent gap; timelapses almost always want
+                        the raw shop noise replaced by music in the NLE)
+    Honors an explicit `audio_strategy` if the EDL sets one, with a soft
+    warning when the value is unrecognised so we don't silently mis-handle
+    the audio track on a typo.
+    """
+    raw = r.get("audio_strategy")
+    if raw is None:
+        return "keep" if abs(speed - 1.0) < 1e-9 else "drop"
+    s = str(raw).strip().lower()
+    if s in ("drop", "keep"):
+        return s
+    print(f"  warn: range[{range_idx}] has unknown audio_strategy={raw!r}; "
+          "valid: 'drop' | 'keep'. Falling back to "
+          f"{'keep' if abs(speed - 1.0) < 1e-9 else 'drop'}.",
+          file=sys.stderr)
+    return "keep" if abs(speed - 1.0) < 1e-9 else "drop"
+
+
+# ---------------------------------------------------------------------------
 # Core build — produces an OTIO Timeline with two tracks (V1 + A1).
 #
 # Why we build two parallel tracks instead of relying on a single video
@@ -534,6 +639,12 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
         - audio_lead      : J-cut offset (seconds, optional, default 0)
         - video_tail      : L-cut offset (seconds, optional, default 0)
         - transition_in   : dissolve seconds before this clip (optional)
+        - speed           : timelapse multiplier (float, default 1.0,
+                            clamped to [1.0, 10.0]); >1 compresses the
+                            source segment on the output timeline
+        - audio_strategy  : "drop" (silent gap) or "keep" (audio retimed
+                            with video). Default "keep" at speed=1.0,
+                            "drop" at speed!=1.0.
         - beat / quote    : copied to clip metadata for editor reference
 
     `sequence_settings` (optional) carries the resolved sequence-shape
@@ -541,6 +652,11 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
     space/audio rate. We stash it on the Timeline's metadata so the
     post-write patchers can find it without re-probing. When None we
     skip the stash; the patchers will fall back to per-asset probing.
+
+    Returns the otio.schema.Timeline. The retime side-channel needed by
+    the post-write XML patchers is stashed on
+    `timeline.metadata['video-use-premiere']['speed_map']` — see
+    `_speed_map_from_timeline()` for the read side.
     """
     otio = _import_otio()
 
@@ -578,6 +694,16 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
     cur_v = 0.0
     cur_a = 0.0
 
+    # ── Retime side-channel ───────────────────────────────────────────
+    # Both XML adapters silently DROP otio.schema.LinearTimeWarp
+    # (verified against opentimelineio 0.18.x + otio-fcpx-xml-adapter
+    # 0.2.x + otio-fcp-adapter 0.2.x — no <timeMap> in fcpxml, no
+    # timeremap <filter> in xmeml). So we record every retime in this
+    # side-channel and inject the dialect-correct retime element in a
+    # post-write patch (see _patch_fcpxml_speed / _patch_xmeml_speed).
+    # Keyed by the unique clip name we mint below.
+    speed_map: dict[str, dict] = {}
+
     for i, r in enumerate(ranges):
         src_name = r["source"]
         if src_name not in sources:
@@ -597,16 +723,58 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
         v_tail = float(r.get("video_tail", 0) or 0)   # L: audio ends later
         trans_in = float(r.get("transition_in", 0) or 0)
 
+        # ── Time-squeezing (timelapse) ────────────────────────────────
+        # Per-range speed multiplier, clamped to [1.0, 10.0]. Defaults
+        # to 1.0 (no retime) so untouched EDLs behave exactly as before.
+        speed = _read_speed(r, i)
+        audio_strategy = _read_audio_strategy(r, speed, i)
+
+        # Refuse to combine retime with split edits / dissolves — the
+        # timeline math (audio offsets vs. retimed video) is ambiguous
+        # and we don't want to silently produce drift on a 30-clip cut.
+        # Because Hard Rule 14 forces these fields to 0 in the editor
+        # sub-agent's output today, this is mostly defensive against a
+        # hand-written EDL that uses both at once.
+        if speed != 1.0 and (a_lead != 0.0 or v_tail != 0.0 or trans_in != 0.0):
+            print(f"  warn: range[{i}] combines speed={speed:g} with "
+                  f"audio_lead/video_tail/transition_in; the split-edit "
+                  "fields are IGNORED on retimed ranges (undefined math). "
+                  "Hard-cut + retime only.", file=sys.stderr)
+            a_lead = v_tail = trans_in = 0.0
+
         # Snap everything to whole frames so NLE imports are clean.
         v_start = _snap_to_frame(start, frame_rate)
         v_end = _snap_to_frame(end, frame_rate)
-        v_dur = max(0.0, v_end - v_start)
+        v_src_dur = max(0.0, v_end - v_start)
+
+        # Output-timeline duration of this clip after retime. At
+        # speed=1.0 this is identical to the source duration; at
+        # speed=8.0 a 40-second source range lands as 5 timeline
+        # seconds. We snap the output duration to a whole frame so the
+        # NLE's frame-aligned import path stays drift-free.
+        v_out_dur = _snap_to_frame(v_src_dur / speed, frame_rate)
+        if v_out_dur <= 0.0:
+            # A range so short it disappears at the chosen speed (e.g.
+            # 80ms at 10x = 8ms < 1 frame at 24fps). Better to drop
+            # than to write an empty clip.
+            print(f"  skip range[{i}] {src_name}: speed={speed:g} would "
+                  f"produce {v_out_dur*1000:.1f}ms output; below frame.",
+                  file=sys.stderr)
+            continue
+        v_dur = v_out_dur  # what the timeline / OTIO layout sees
 
         # Audio source range is independently snapped — could be different
         # from the video range by ±half a frame after rounding.
         a_src_start = _snap_to_frame(start - a_lead, frame_rate)
         a_src_end = _snap_to_frame(end + v_tail, frame_rate)
-        a_dur = max(0.0, a_src_end - a_src_start)
+        # When retime is on, the audio's TIMELINE duration is the
+        # video's output duration regardless of audio_strategy; the
+        # patcher injects the matching audio retime when "keep" is
+        # selected, or we emit a silent Gap when "drop" is selected.
+        if speed != 1.0:
+            a_dur = v_out_dur
+        else:
+            a_dur = max(0.0, a_src_end - a_src_start)
 
         # ── External media reference (one per clip — file path only) ──
         # OTIO's ExternalReference resolves to file:// URIs at write time.
@@ -684,11 +852,18 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
             }
             return ref
 
-        # Video clip
+        # Video clip — source_range carries the SOURCE in-point (v_start)
+        # but the OUTPUT duration (v_out_dur). At speed=1.0 these match
+        # the source duration, so we lay out exactly as before; at
+        # speed>1.0 OTIO sees the compressed timeline length and offsets
+        # subsequent clips correctly. The patcher injects the actual
+        # retime element so the NLE plays the FULL source range
+        # (v_src_dur) inside that compressed window.
+        v_clip_name = f"{src_name}_v_{i:02d}"
         v_clip = otio.schema.Clip(
-            name=f"{src_name}_v_{i:02d}",
+            name=v_clip_name,
             media_reference=_new_media_ref(),
-            source_range=_range(v_start, v_dur, frame_rate),
+            source_range=_range(v_start, v_out_dur, frame_rate),
         )
         # Stash editorial metadata so the user can see WHY this cut was
         # chosen when they hover the clip in the NLE's clip inspector.
@@ -696,15 +871,66 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
             "beat": r.get("beat"),
             "quote": r.get("quote"),
             "reason": r.get("reason"),
+            "speed": speed,
         }
+        # Belt-and-braces: also attach OTIO's LinearTimeWarp effect for
+        # any future adapter version that DOES honor it. Today both
+        # adapters drop it silently — the post-write patcher is what
+        # actually carries the retime through to the .fcpxml / .xml.
+        if speed != 1.0:
+            v_clip.effects.append(otio.schema.LinearTimeWarp(
+                name=f"timelapse_{i:02d}", time_scalar=float(speed),
+            ))
+            speed_map[v_clip_name] = {
+                "kind": "video",
+                "speed": float(speed),
+                "src_start_s": v_start,
+                "src_dur_s": v_src_dur,
+                "out_dur_s": v_out_dur,
+                "frame_rate": float(frame_rate),
+            }
 
-        # Audio clip — independent source_range to support split edits.
-        # Same source media (NLE will only pull the audio track from it).
-        a_clip = otio.schema.Clip(
-            name=f"{src_name}_a_{i:02d}",
-            media_reference=_new_media_ref(),
-            source_range=_range(a_src_start, a_dur, frame_rate),
-        )
+        # Audio handling — three paths:
+        #   1. speed == 1.0  → standard A1 clip (existing behaviour).
+        #   2. speed != 1.0 + audio_strategy=="drop" → silent Gap on A1
+        #      of the same OUTPUT duration as the video. This is the
+        #      sane default for timelapses (raw shop noise sped up
+        #      sounds awful; the editor will replace it with music).
+        #   3. speed != 1.0 + audio_strategy=="keep" → A1 clip with the
+        #      SAME shape as the video, marked in the side-channel so
+        #      the patcher applies the matching audio retime. Will
+        #      sound chipmunk-y in the NLE unless the editor toggles
+        #      "Maintain Audio Pitch" (Premiere) / "Preserve Pitch"
+        #      (FCP X), which is a one-click property on the clip.
+        a_clip = None
+        a_clip_name = f"{src_name}_a_{i:02d}"
+        if speed == 1.0:
+            a_clip = otio.schema.Clip(
+                name=a_clip_name,
+                media_reference=_new_media_ref(),
+                source_range=_range(a_src_start, a_dur, frame_rate),
+            )
+        elif audio_strategy == "keep":
+            a_clip = otio.schema.Clip(
+                name=a_clip_name,
+                media_reference=_new_media_ref(),
+                # Same OUTPUT duration as the video; patcher rewrites
+                # in/out (xmeml) and timeMap (fcpxml) to consume the
+                # full source range under that timeline window.
+                source_range=_range(v_start, v_out_dur, frame_rate),
+            )
+            a_clip.effects.append(otio.schema.LinearTimeWarp(
+                name=f"timelapse_a_{i:02d}", time_scalar=float(speed),
+            ))
+            speed_map[a_clip_name] = {
+                "kind": "audio",
+                "speed": float(speed),
+                "src_start_s": v_start,
+                "src_dur_s": v_src_dur,
+                "out_dur_s": v_out_dur,
+                "frame_rate": float(frame_rate),
+            }
+        # else: drop branch — fall through and append a Gap below.
 
         # ── Cross-dissolve (transition_in) ────────────────────────────
         # Place a Transition BEFORE this clip on both tracks. OTIO's
@@ -744,10 +970,25 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
             ))
 
         v_track.append(v_clip)
-        a_track.append(a_clip)
+        if a_clip is not None:
+            a_track.append(a_clip)
+        else:
+            # audio_strategy=="drop" path on a retimed range — silent
+            # filler covering the same OUTPUT span as the video clip.
+            a_track.append(otio.schema.Gap(
+                name=f"silence_{i:02d}",
+                source_range=_range(0.0, v_out_dur, frame_rate),
+            ))
 
         cur_v += v_dur
         cur_a = target_a_start + a_dur  # inherits both lead AND tail
+
+    # Stash the speed map on the timeline so the post-write patchers can
+    # find it. Existing 'video-use-premiere' bucket is preserved (it
+    # already carries 'sequence' from the sequence-settings stash).
+    if speed_map:
+        bucket = timeline.metadata.setdefault("video-use-premiere", {})
+        bucket["speed_map"] = dict(speed_map)
 
     return timeline
 
@@ -1079,6 +1320,295 @@ def _sequence_meta_from_timeline(timeline) -> dict | None:
         return None
 
 
+def _speed_map_from_timeline(timeline) -> dict | None:
+    """Pull the per-clip retime side-channel stashed by build_timeline().
+
+    Same lookup pattern as _sequence_meta_from_timeline — the speed map
+    is keyed by clip name, so the post-write patchers can find each
+    retimed element in the XML without re-walking the EDL.
+    """
+    try:
+        return (timeline.metadata.get("video-use-premiere") or {}).get("speed_map")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Time-squeezing post-write patchers — one per dialect.
+#
+# Both XML adapters (otio-fcpx-xml-adapter, otio-fcp-adapter) silently
+# DROP otio.schema.LinearTimeWarp during serialization (verified against
+# OTIO 0.18.x). So the timeline we wrote describes the OUTPUT durations
+# correctly (we set source_range.duration = out_dur in build_timeline),
+# but it does NOT carry any retime element — every clip would play at
+# 1x and the sped-up segments would be silently truncated by the NLE.
+#
+# We fix that here by injecting the dialect-correct retime element into
+# each clip whose name appears in the speed_map side-channel. The patch
+# is idempotent (re-running it on an already-patched file is a no-op
+# because we check for existing <timeMap> / timeremap <filter> nodes
+# before adding) and adapter-version-agnostic.
+# ---------------------------------------------------------------------------
+
+def _fmt_seconds_for_fcpxml(seconds: float, frame_rate: float) -> str:
+    """Format a float-seconds value as the rational-seconds string FCPXML wants.
+
+    FCPXML 1.x expresses time as `<num>/<den>s` (whole frames over the
+    timeline rate), with `0s` as the special zero literal. The denominator
+    must match the timeline's frameDuration so the importer doesn't have
+    to re-fraction.
+    """
+    if abs(seconds) < 1e-9:
+        return "0s"
+    # Snap to whole frames so the numerator stays an integer at the
+    # timeline rate. (We already snap in build_timeline, but a stray
+    # caller / variable-speed extension might pass arbitrary values.)
+    frames = int(round(seconds * frame_rate))
+    den = int(round(frame_rate))
+    if den <= 0:
+        den = 24
+    return f"{frames}/{den}s"
+
+
+def _patch_fcpxml_speed(out_path: Path, speed_map: dict | None) -> int:
+    """Inject FCPXML 1.10+ <timeMap> elements for every retimed clip.
+
+    Each entry in `speed_map` is keyed by the OTIO clip name we minted
+    in build_timeline (e.g. "C0103_v_05" / "C0103_a_05"). FCPXML emits
+    those names verbatim onto the spine's <clip name="..."> elements,
+    so we can find each retimed element with a name lookup.
+
+    For every match we prepend a <timeMap> child like:
+
+        <timeMap>
+          <timept time="0s"           value="0s"           interp="linear"/>
+          <timept time="<out_dur>s"   value="<src_dur>s"   interp="linear"/>
+        </timeMap>
+
+    which tells FCP X / Resolve "play <src_dur> seconds of source media
+    inside <out_dur> seconds of the timeline, linearly" — i.e. constant
+    speed = src_dur / out_dur. This is the canonical FCPXML retime form
+    and round-trips through both NLEs cleanly.
+
+    Returns the count of clips patched. Non-fatal on any error — the
+    file is left as a valid (un-retimed) FCPXML and the warning prints
+    to stderr.
+    """
+    if not speed_map:
+        return 0
+
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(str(out_path))
+        root = tree.getroot()
+    except Exception as e:
+        print(f"  warn: could not parse {out_path.name} for FCPXML "
+              f"speed patch ({type(e).__name__}: {e}); leaving as-is.",
+              file=sys.stderr)
+        return 0
+
+    patched = 0
+    # Walk every <clip> element in the file (typically one per timeline
+    # entry). The OTIO FCPXML adapter places retime-eligible clips
+    # under <spine> as <clip name="..."> with nested <video>/<audio>;
+    # iterating root-wide is robust to future nesting changes.
+    for clip_e in root.iter("clip"):
+        name = clip_e.get("name")
+        if not name or name not in speed_map:
+            continue
+        info = speed_map[name]
+        fr = float(info.get("frame_rate") or 24.0)
+        src_dur = float(info["src_dur_s"])
+        out_dur = float(info["out_dur_s"])
+
+        # Idempotence — if a <timeMap> is already there, leave it.
+        if clip_e.find("timeMap") is not None:
+            continue
+
+        # Build the retime element. FCPXML wants children in a specific
+        # order (timeMap goes before any conform-rate sibling typically
+        # appears in real-world files), but Resolve / FCP X are tolerant
+        # of leading-position children, so prepending is safe.
+        tm = ET.Element("timeMap")
+        ET.SubElement(tm, "timept", {
+            "time":   "0s",
+            "value":  "0s",
+            "interp": "linear",
+        })
+        ET.SubElement(tm, "timept", {
+            "time":   _fmt_seconds_for_fcpxml(out_dur, fr),
+            "value":  _fmt_seconds_for_fcpxml(src_dur, fr),
+            "interp": "linear",
+        })
+        # Prepend so the importer reads the retime before the inner
+        # <video>/<audio> element it modifies.
+        clip_e.insert(0, tm)
+        patched += 1
+
+    if patched == 0:
+        return 0
+
+    try:
+        tree.write(str(out_path), encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        print(f"  warn: FCPXML speed patch built {patched} timeMap(s) but "
+              f"failed to write back to {out_path.name} "
+              f"({type(e).__name__}: {e}); the file is still valid FCPXML, "
+              "just without the retime elements.", file=sys.stderr)
+        return 0
+
+    return patched
+
+
+def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
+    """Inject Premiere "Time Remap" filters for every retimed clipitem.
+
+    The FCP7 xmeml encoding for constant speed is a <filter> block on
+    the clipitem carrying the standard timeremap effect:
+
+        <filter>
+          <effect>
+            <name>Time Remap</name>
+            <effectid>timeremap</effectid>
+            <effectcategory>motion</effectcategory>
+            <effecttype>motion</effecttype>
+            <mediatype>video</mediatype>     (or "audio" on A1 clips)
+            <parameter>
+              <parameterid>variablespeed</parameterid>
+              <value>0</value>               (0=constant, 1=keyframed)
+            </parameter>
+            <parameter>
+              <parameterid>speed</parameterid>
+              <value>SPEED_PCT</value>       (200 = 2x, 1000 = 10x)
+            </parameter>
+            <parameter>
+              <parameterid>reverse</parameterid>
+              <value>FALSE</value>
+            </parameter>
+            <parameter>
+              <parameterid>frameblending</parameterid>
+              <value>FALSE</value>
+            </parameter>
+          </effect>
+        </filter>
+
+    We also extend the clipitem's <out> tag from src_start + out_dur to
+    src_start + src_dur so Premiere knows to consume the FULL source
+    range under the (already correct) timeline duration. <duration>,
+    <start>, <end>, <in> stay as-is.
+
+    Returns the count of clipitems patched. Non-fatal on any error.
+    """
+    if not speed_map:
+        return 0
+
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(str(out_path))
+        root = tree.getroot()
+    except Exception as e:
+        print(f"  warn: could not parse {out_path.name} for xmeml "
+              f"speed patch ({type(e).__name__}: {e}); leaving as-is.",
+              file=sys.stderr)
+        return 0
+
+    patched = 0
+    for ci in root.iter("clipitem"):
+        # In xmeml the OTIO clip name lives in the clipitem's <name>
+        # CHILD, not as an attribute. (The `id` attribute is a synthetic
+        # adapter-generated counter we can't rely on for lookup.)
+        name_e = ci.find("name")
+        if name_e is None or not name_e.text:
+            continue
+        name = name_e.text.strip()
+        if name not in speed_map:
+            continue
+        info = speed_map[name]
+        kind = info.get("kind", "video")
+        speed_pct = float(info["speed"]) * 100.0  # 4.0 → 400 (Premiere %)
+        fr = float(info.get("frame_rate") or 24.0)
+
+        # Idempotence — skip if a timeremap filter is already present.
+        # We check effectid because Premiere ships several motion-y
+        # filter blocks and we only want to skip on a real prior patch.
+        already_patched = False
+        for filt in ci.findall("filter"):
+            eff = filt.find("effect")
+            if eff is None:
+                continue
+            eid = eff.find("effectid")
+            if eid is not None and (eid.text or "").strip() == "timeremap":
+                already_patched = True
+                break
+        if already_patched:
+            continue
+
+        # Extend <out> so the source range Premiere reads under the
+        # (already compressed) timeline duration is the FULL src_dur.
+        # OTIO wrote out = in + out_dur_frames; we want in + src_dur_frames.
+        in_e = ci.find("in")
+        out_e = ci.find("out")
+        if in_e is not None and out_e is not None:
+            try:
+                in_frames = int(float((in_e.text or "0").strip()))
+                src_dur_frames = int(round(float(info["src_dur_s"]) * fr))
+                out_e.text = str(in_frames + src_dur_frames)
+            except (TypeError, ValueError):
+                # Leave the existing <out> alone if it's unparseable —
+                # Premiere will still apply the speed % to whatever
+                # source range it finds, just less precisely.
+                pass
+
+        # Build the timeremap filter. We hand-build the element tree so
+        # nothing depends on the OTIO adapter's filter serialization.
+        filt = ET.SubElement(ci, "filter")
+        eff = ET.SubElement(filt, "effect")
+        ET.SubElement(eff, "name").text = "Time Remap"
+        ET.SubElement(eff, "effectid").text = "timeremap"
+        ET.SubElement(eff, "effectcategory").text = "motion"
+        ET.SubElement(eff, "effecttype").text = "motion"
+        ET.SubElement(eff, "mediatype").text = (
+            "audio" if kind == "audio" else "video"
+        )
+
+        def _add_param(eff_e, pid, value, vmin=None, vmax=None):
+            """Helper: append a <parameter> with id/name/value/(min/max)."""
+            p = ET.SubElement(eff_e, "parameter")
+            p.set("authoringApp", "PremierePro")
+            ET.SubElement(p, "parameterid").text = pid
+            ET.SubElement(p, "name").text = pid
+            if vmin is not None:
+                ET.SubElement(p, "valuemin").text = str(vmin)
+            if vmax is not None:
+                ET.SubElement(p, "valuemax").text = str(vmax)
+            ET.SubElement(p, "value").text = str(value)
+
+        # Constant speed: variablespeed=0, speed=<pct>, no keyframe spline.
+        _add_param(eff, "variablespeed", 0, vmin=0, vmax=1)
+        # Premiere's hard limits on speed are -100000..100000 (%) — the
+        # MAX_SPEED clamp upstream keeps us inside the sane window.
+        _add_param(eff, "speed", f"{speed_pct:g}",
+                   vmin=-100000, vmax=100000)
+        _add_param(eff, "reverse", "FALSE")
+        _add_param(eff, "frameblending", "FALSE")
+
+        patched += 1
+
+    if patched == 0:
+        return 0
+
+    try:
+        tree.write(str(out_path), encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        print(f"  warn: xmeml speed patch built {patched} timeremap "
+              f"filter(s) but failed to write back to {out_path.name} "
+              f"({type(e).__name__}: {e}); the file is still valid xmeml, "
+              "just without the retime filters.", file=sys.stderr)
+        return 0
+
+    return patched
+
+
 def write_fcpxml(timeline, out_path: Path) -> None:
     """Write the timeline as FCPXML 1.10+ (.fcpxml) — Resolve / FCP X path.
 
@@ -1108,11 +1638,18 @@ def write_fcpxml(timeline, out_path: Path) -> None:
             "(this pulls in otio-fcpx-xml-adapter for Resolve / FCP X "
             "and otio-fcp-adapter for Premiere Pro)."
         )
-    # Best-effort post-write patches. Both helpers swallow their own
-    # exceptions and only print warnings, so the .fcpxml is always left
-    # in a usable state even if the patches can't run.
+    # Best-effort post-write patches. Each helper swallows its own
+    # exceptions and only prints warnings, so the .fcpxml is always
+    # left in a usable state even if a patch can't run.
     seq_meta = _sequence_meta_from_timeline(timeline)
     _patch_fcpxml_audio_shape(out_path, sequence_meta=seq_meta)
+    # Inject <timeMap> retime elements for any range whose `speed` was
+    # > 1.0. Idempotent and a no-op when speed_map is empty.
+    speed_map = _speed_map_from_timeline(timeline)
+    n_speed = _patch_fcpxml_speed(out_path, speed_map)
+    if n_speed:
+        print(f"  retime: patched {n_speed} timeMap element(s) "
+              f"in {out_path.name}")
 
 
 def write_premiere_xml(timeline, out_path: Path) -> None:
@@ -1145,6 +1682,13 @@ def write_premiere_xml(timeline, out_path: Path) -> None:
         )
     seq_meta = _sequence_meta_from_timeline(timeline)
     _patch_xmeml_sequence_format(out_path, sequence_meta=seq_meta)
+    # Inject Premiere's "Time Remap" filter for every retimed clipitem.
+    # Idempotent; no-op when speed_map is empty.
+    speed_map = _speed_map_from_timeline(timeline)
+    n_speed = _patch_xmeml_speed(out_path, speed_map)
+    if n_speed:
+        print(f"  retime: patched {n_speed} timeremap filter(s) "
+              f"in {out_path.name}")
 
 
 # ---------------------------------------------------------------------------

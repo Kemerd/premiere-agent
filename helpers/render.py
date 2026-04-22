@@ -126,6 +126,68 @@ def _has_jl_cuts(edl: dict) -> tuple[bool, int]:
     return n > 0, n
 
 
+# ---------------------------------------------------------------------------
+# Time-squeezing (timelapse) support — flat MP4 path.
+#
+# Mirrors helpers/export_fcpxml.py:
+#   - Per-range `speed` (float, default 1.0), clamped to [1.0, MAX_SPEED].
+#   - Per-range `audio_strategy` ("drop" default at speed != 1.0, else "keep").
+# At speed > 1.0 we apply `setpts=PTS/{speed}` to the video and either:
+#   - `atempo={speed}` to the audio    (audio_strategy="keep", pitch-preserving
+#     chipmunk effect — ffmpeg's atempo handles 0.5..100 in one stage so a 10x
+#     cap fits without chaining)
+#   - replace audio with `anullsrc`    (audio_strategy="drop", silent gap; the
+#     editor can drop a music bed under the timelapse in post)
+# Subtitles for retimed ranges are SKIPPED — by editor convention timelapses
+# never contain speech (otherwise it'd be unintelligible at 4x+), so there's
+# nothing to caption. The seg_offset accumulator uses OUTPUT duration so any
+# captions in adjacent normal-speed ranges land on the right output time.
+# ---------------------------------------------------------------------------
+
+# Same ceiling as the FCPXML exporter — see that module's MAX_SPEED block
+# for why 1000% is the practical maximum for clean retime without frame
+# blending. Beyond it the LLM should be CUTTING, not squeezing harder.
+MAX_SPEED = 10.0
+MIN_SPEED = 1.0
+
+
+def _read_speed(r: dict, range_idx: int) -> float:
+    """Pull the per-range speed; clamp to [MIN_SPEED, MAX_SPEED] with warn."""
+    raw = r.get("speed")
+    if raw is None:
+        return 1.0
+    try:
+        spd = float(raw)
+    except (TypeError, ValueError):
+        print(f"  warn: range[{range_idx}] non-numeric speed={raw!r}; "
+              "treating as 1.0.", file=sys.stderr)
+        return 1.0
+    if spd < MIN_SPEED:
+        print(f"  warn: range[{range_idx}] speed={spd:g} < {MIN_SPEED:g} "
+              "(slow-mo not supported); clamped to 1.0.", file=sys.stderr)
+        return 1.0
+    if spd > MAX_SPEED:
+        print(f"  warn: range[{range_idx}] speed={spd:g} > {MAX_SPEED:g} "
+              f"({int(MAX_SPEED * 100)}% retime ceiling); clamped to "
+              f"{MAX_SPEED:g}. Cut the range instead of squeezing harder.",
+              file=sys.stderr)
+        return MAX_SPEED
+    return spd
+
+
+def _read_audio_strategy(r: dict, speed: float, range_idx: int) -> str:
+    """Pick "drop" / "keep" with sensible defaults — see exporter."""
+    raw = r.get("audio_strategy")
+    if raw is None:
+        return "keep" if abs(speed - 1.0) < 1e-9 else "drop"
+    s = str(raw).strip().lower()
+    if s in ("drop", "keep"):
+        return s
+    print(f"  warn: range[{range_idx}] unknown audio_strategy={raw!r}; "
+          "valid: 'drop' | 'keep'.", file=sys.stderr)
+    return "keep" if abs(speed - 1.0) < 1e-9 else "drop"
+
+
 def warn_if_jl_cuts(edl: dict) -> None:
     """Print a one-time, loud-but-not-fatal warning when J/L cuts are
     present in the EDL but we're rendering via the ffmpeg path.
@@ -161,6 +223,8 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    speed: float = 1.0,
+    audio_strategy: str = "keep",
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -170,6 +234,17 @@ def extract_segment(
       - final (default): 1080p libx264 fast CRF 20
       - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
       - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
+
+    Time-squeezing (speed > 1.0):
+      Video: `setpts=PTS/{speed}` compresses N source seconds into N/speed
+             output seconds with no frame-blending (fine up to 10x on 24/30fps
+             source — beyond that the editor should cut, not squeeze).
+      Audio: `audio_strategy="keep"` runs `atempo={speed}` (one-stage filter
+             that handles 0.5..100; pitch-preserving — avoids chipmunk).
+             `audio_strategy="drop"` swaps the audio for `anullsrc` of the
+             output duration (silent gap; editor adds a music bed in post).
+      The 30ms boundary fades (Hard Rule 3) still apply, computed on the
+      OUTPUT duration so we never read past the rendered end.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -181,11 +256,18 @@ def extract_segment(
     vf_parts = [scale]
     if grade_filter:
         vf_parts.append(grade_filter)
+    # When retiming, append the setpts BEFORE encode. Order matters here:
+    # scale + grade run on every input frame, THEN setpts re-stamps each
+    # frame's PTS so the encoder writes them at the new cadence. Doing
+    # setpts first would still work but wastes filter cycles on frames
+    # we'll then drop — scale-then-stamp is the cheaper graph.
+    if speed != 1.0:
+        vf_parts.append(f"setpts=PTS/{speed:g}")
     vf = ",".join(vf_parts)
 
-    # 30ms audio fades at both edges (Rule 3) — prevent pops
-    fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    # Output duration after retime — used for fades AND for anullsrc.
+    out_dur = duration / speed if speed != 1.0 else duration
+    fade_out_start = max(0.0, out_dur - 0.03)
 
     if draft:
         preset, crf = "ultrafast", "28"
@@ -194,19 +276,72 @@ def extract_segment(
     else:
         preset, crf = "fast", "20"
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", f"{seg_start:.3f}",
-        "-i", str(source),
-        "-t", f"{duration:.3f}",
-        "-vf", vf,
-        "-af", af,
-        "-c:v", "libx264", "-preset", preset, "-crf", crf,
-        "-pix_fmt", "yuv420p", "-r", "24",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        "-movflags", "+faststart",
-        str(out_path),
-    ]
+    # ── Audio handling ────────────────────────────────────────────────
+    # Three branches:
+    #   1. speed == 1.0          → standard -af path (existing behaviour).
+    #   2. speed != 1.0, "keep"  → atempo=N pitch-preserving stretch +
+    #                              boundary fades on the output cadence.
+    #   3. speed != 1.0, "drop"  → swap audio source for anullsrc lavfi
+    #                              of out_dur seconds; no fades needed
+    #                              (it's already digital silence).
+    if speed == 1.0:
+        af = (f"afade=t=in:st=0:d=0.03,"
+              f"afade=t=out:st={fade_out_start:.3f}:d=0.03")
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{seg_start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-vf", vf,
+            "-af", af,
+            "-c:v", "libx264", "-preset", preset, "-crf", crf,
+            "-pix_fmt", "yuv420p", "-r", "24",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+    elif audio_strategy == "drop":
+        # Build a silent stereo 48k stream of the OUTPUT duration. We
+        # use `-shortest` so any tiny mismatch between the retimed
+        # video duration and the lavfi audio duration ends on the
+        # video edge (which is the authoritative timeline).
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{seg_start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-f", "lavfi",
+            "-t", f"{out_dur:.3f}",
+            "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-vf", vf,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", preset, "-crf", crf,
+            "-pix_fmt", "yuv420p", "-r", "24",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-shortest",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+    else:  # speed != 1.0, audio_strategy == "keep"
+        # atempo handles 0.5..100 in one stage; our speed is bounded to
+        # MAX_SPEED (10.0) so a single-stage filter is always enough.
+        # Fades stay at 30ms on the OUTPUT timeline.
+        af = (f"atempo={speed:g},"
+              f"afade=t=in:st=0:d=0.03,"
+              f"afade=t=out:st={fade_out_start:.3f}:d=0.03")
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{seg_start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-vf", vf,
+            "-af", af,
+            "-c:v", "libx264", "-preset", preset, "-crf", crf,
+            "-pix_fmt", "yuv420p", "-r", "24",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -243,6 +378,12 @@ def extract_all_segments(
         start = float(r["start"])
         end = float(r["end"])
         duration = end - start
+        # Per-range retime — defaults to 1.0 (no-op). Audio strategy
+        # defaults flip to "drop" automatically when speed > 1.0; see
+        # _read_audio_strategy() for the rule.
+        speed = _read_speed(r, i)
+        audio_strategy = _read_audio_strategy(r, speed, i)
+        out_dur = duration / speed if speed != 1.0 else duration
         out_path = clips_dir / f"seg_{i:02d}_{src_name}.mp4"
 
         if is_auto:
@@ -251,10 +392,21 @@ def extract_all_segments(
             seg_filter = resolved
 
         note = r.get("beat") or r.get("note") or ""
-        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
+        # Append a retime tag to the per-segment log line so the user
+        # can immediately see which ranges are squeezed and by how much.
+        retime_tag = ""
+        if speed != 1.0:
+            retime_tag = (f"  [⚡{speed:g}x → {out_dur:.2f}s, "
+                          f"audio={audio_strategy}]")
+        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  "
+              f"({duration:5.2f}s){retime_tag}  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        extract_segment(
+            src_path, start, duration, seg_filter, out_path,
+            preview=preview, draft=draft,
+            speed=speed, audio_strategy=audio_strategy,
+        )
         seg_paths.append(out_path)
 
     return seg_paths
@@ -324,11 +476,26 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
     entries: list[tuple[float, float, str]] = []
     seg_offset = 0.0
 
-    for r in edl["ranges"]:
+    for i, r in enumerate(edl["ranges"]):
         src_name = r["source"]
         seg_start = float(r["start"])
         seg_end = float(r["end"])
         seg_duration = seg_end - seg_start
+        # Retime-aware OUTPUT duration. SRT timestamps live on the
+        # output timeline, so the accumulator advances by what the
+        # viewer actually sees, not the source range.
+        seg_speed = _read_speed(r, i)
+        seg_out_dur = seg_duration / seg_speed if seg_speed != 1.0 else seg_duration
+
+        # Skip caption synthesis on retimed ranges — by editor convention
+        # timelapses contain no speech (Hard Rule below; see SKILL.md
+        # "Time-squeezing"). Even if the source had stray dialogue,
+        # speech sped up 4x+ is unintelligible and shouldn't be
+        # captioned. We still advance seg_offset by the OUTPUT duration
+        # so subsequent ranges' captions land on the right output time.
+        if seg_speed != 1.0:
+            seg_offset += seg_out_dur
+            continue
 
         # Transcripts are cached by the *source file stem* (see parakeet_onnx_lane.py:
         # `transcripts_dir / f"{video_path.stem}.json"`), NOT by the EDL short label.
@@ -339,7 +506,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         src_ref = sources.get(src_name)
         if not src_ref:
             print(f"  no source mapping for {src_name}, skipping captions for this segment")
-            seg_offset += seg_duration
+            seg_offset += seg_out_dur
             continue
         src_stem = Path(src_ref).stem
 
@@ -352,7 +519,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
                 tr_path = legacy
             else:
                 print(f"  no transcript for {src_name} (looked for {src_stem}.json), skipping captions for this segment")
-                seg_offset += seg_duration
+                seg_offset += seg_out_dur
                 continue
 
         # Parakeet writes transcripts as UTF-8; be explicit so Windows hosts
@@ -390,7 +557,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
             text = text.upper()
             entries.append((out_start, out_end, text))
 
-        seg_offset += seg_duration
+        seg_offset += seg_out_dur
 
     # Sort and write as SRT
     entries.sort(key=lambda e: e[0])

@@ -273,12 +273,68 @@ J-cuts (`audio_lead`), L-cuts (`video_tail`), and cross-dissolves (`transition_i
 
 **Render path matrix (current state):**
 
-| Output                       | Hard cuts | 30ms boundary afade | J/L cuts | Dissolves |
-|------------------------------|-----------|---------------------|----------|-----------|
-| `render.py` → mp4            | ✓         | ✓ (Hard Rule 3)     | DEFERRED | DEFERRED  |
-| `export_fcpxml.py` → fcpxml  | ✓         | colorist's job      | DEFERRED | DEFERRED  |
+| Output                       | Hard cuts | 30ms boundary afade | J/L cuts | Dissolves | Time-squeeze (≤10x) |
+|------------------------------|-----------|---------------------|----------|-----------|---------------------|
+| `render.py` → mp4            | ✓         | ✓ (Hard Rule 3)     | DEFERRED | DEFERRED  | ✓ (`setpts` + `atempo`/`anullsrc`) |
+| `export_fcpxml.py` → fcpxml  | ✓         | colorist's job      | DEFERRED | DEFERRED  | ✓ (`<timeMap>` + Premiere `timeremap`) |
 
 If the user explicitly asks for J/L cuts or dissolves: explain the deferral honestly, ship hard cuts, and offer to log it in `project.md` as an outstanding item for the day the multi-track path lands.
+
+### Time-squeezing (timelapse) — when the source has long no-speech stretches
+
+Real-world footage is often "1 minute of explanation, then 25 minutes of silently doing the work, then 2 minutes of wrap-up." Cutting the 25 minutes entirely throws away the visual story; keeping it 1× bores the viewer. The third option is **time-squeezing**: compress the work segment into a 5–30s timelapse on the output timeline so the viewer sees the whole arc in seconds. Both delivery paths (`render.py` and `export_fcpxml.py`) support this natively — see the matrix above.
+
+**When to reach for it.** Look for stretches in `merged_timeline.md` where BOTH of these are true:
+
+1. **Visually continuous activity** — long runs of `(same)` collapses in `visual_timeline.md` OR successive `visual:` lines describing the same scene with mild variation ("a person sanding a board" → "hand pushing a sander across wood" → "sawdust accumulating"). Pure dead-air (camera abandoned on a tripod, nothing moving) is a CUT candidate, not a timelapse candidate.
+2. **A coherent story-of-progress** the viewer benefits from seeing compressed: assembly, packing, walking, driving, cooking, painting, prep, teardown. If the squeezed result wouldn't read as "watch them do this thing fast," cut instead.
+
+**Speech inside the stretch is a judgement call, not a blocker.** The real test is "**does the viewer need to hear this?**" not "is anyone talking?":
+
+- **Load-bearing speech** (instruction, explanation, narration that carries the cut, the punchline that lands the beat): split AROUND it. Emit a 1× range for the words, then a `speed > 1.0` range for the silent / no-words-that-matter middle, then another 1× range for whatever talks next. This is the cleaner edit when the language is doing real work.
+- **Filler speech** (mumbling, swearing at a misplaced screw, idle narration of "okay … there we go … hmm"; rambling backstory the viewer doesn't need; 30 minutes of casual chatter while building that isn't actually teaching anything): squeeze right over it. With `audio_strategy="drop"` (the default at `speed != 1.0`) the words vanish along with the room tone, the visual story plays compressed, and the viewer thanks you for the 28 minutes of their life back. The decision is editorial — would keeping the words make the video better, or just longer?
+
+When in doubt: lean toward squeezing over filler speech rather than splitting into a hundred tiny 1× ranges. The video is for the viewer.
+
+If the stretch fails the two criteria above (no continuous activity, or no story-of-progress), just CUT it — squeezing nothing into less nothing is wasted budget.
+
+**How to size the squeeze.** Pick `speed` so the resulting OUTPUT segment lands between **5–30 seconds** (the sweet spot where the viewer registers the activity without it overstaying). Examples:
+
+| Source stretch | Speed | Output | Read as |
+|----------------|-------|--------|---------|
+|  30 s          | 4x    |  7.5s  | quick montage |
+|  2 min         | 8x    |  15s   | "they assembled it" |
+|  5 min         | 10x   |  30s   | full build sequence |
+| 10 min         | 10x   |  60s   | over budget — split into two squeezes with a beat between, or cut |
+| 30 min         | 10x   | 180s   | far over — pick the visually richest 5-min sub-stretch and squeeze that; cut the rest |
+
+**Hard ceiling: `speed = 10.0` (1000%).** Both helpers clamp to it with a warning. Beyond that the retime starts decimating frames and looks broken on standard 24/30fps source — and besides, if you wanted >10x you should have CUT.
+
+**Audio strategy.** Two values, picked automatically from `speed`:
+
+- `audio_strategy = "drop"` (default at `speed != 1.0`): the audio track is silenced over the squeezed range. Both helpers emit a silent gap. This is the right answer for ~95% of timelapses — sustained shop noise / room tone sped up 5–10× sounds awful, and the editor will drop a music bed under the squeeze in the NLE.
+- `audio_strategy = "keep"`: the audio is retimed alongside the video. In `render.py` we use `atempo` (pitch-preserving — sounds natural at moderate speeds). In FCPXML / xmeml the audio gets a matching retime element and will be chipmunk-y unless the editor toggles "Maintain Audio Pitch" (Premiere) / "Preserve Pitch" (FCP X) on the clip — both NLEs offer this as a one-click clip property. Use this only when there's a specific reason to keep the source audio (recognisable voice in the background, distinctive ambient texture).
+
+**Editorial discipline for time-squeezing** (not in the numbered Hard Rules block — these are taste calls, not silent-failure issues):
+
+- **Decide per-stretch: is the speech worth keeping?** Load-bearing speech earns a 1× split around it; filler speech gets squeezed over with `audio_strategy="drop"`. See the "judgement call, not a blocker" paragraph above. There is no universal rule — read the words and ask whether the viewer benefits from hearing them.
+- **Cut FIRST, squeeze SECOND.** Apply the pacing preset's silence-removal pass first (drop dead air ≥ `min_silence_to_remove`); then identify the surviving long stretches that fit the "coherent activity + story-of-progress" criteria; then squeeze those ranges. Squeezing dead air is just slower nothing.
+- **Word-boundary discipline still applies on adjacent 1× ranges** (Hard Rule 6 / 7). The squeezed range itself doesn't need word-boundary alignment when `audio_strategy="drop"` (the audio's gone anyway), but pad it generously (~1–2s on each side of the activity) so the viewer's eye registers the speed change cleanly.
+- **`speed` field is OPTIONAL and defaults to 1.0.** Untouched EDLs behave exactly as before. Only emit a `speed` value when you're actively squeezing.
+
+**EDL example with a timelapse:**
+
+```json
+"ranges": [
+  {"source": "C0210", "start":   2.40, "end":  62.30, "beat": "INTRO",
+   "quote": "today we're going to build a bench from scratch"},
+  {"source": "C0210", "start":  68.10, "end": 1248.40, "beat": "BUILD",
+   "speed": 10.0, "audio_strategy": "drop",
+   "reason": "19.6 min of cutting/sanding/assembly with no speech and continuous visual activity → 118s timelapse; editor adds music in NLE"},
+  {"source": "C0210", "start": 1255.20, "end": 1310.80, "beat": "REVEAL",
+   "quote": "and that's the finished bench"}
+]
+```
 
 ## The timelines (primary reading view)
 
@@ -427,14 +483,45 @@ RULES:
     The 30ms afade pair at every boundary (baked into render.py) is the
     only "audio crossfade" available right now and is sufficient to
     suppress boundary pops.
-  - Unavoidable slips are kept if no better take exists. Note them in "reason".
-  - If over budget, revise: drop a beat or trim tails. Report total and self-correct.
+  - TIME-SQUEEZING (timelapse) is available — see "Time-squeezing" in
+    SKILL.md for the full editorial rules. Short version: when you find
+    a stretch with visually continuous activity (assembly, walking,
+    prep, teardown) AND a coherent story-of-progress, emit a single
+    range with "speed": <2.0..10.0> over that stretch. Pick speed so
+    the OUTPUT lands in the 5-30s sweet spot. Default audio_strategy
+    is "drop" (silent gap) — accept the default unless there's a
+    specific reason to keep the source audio.
 
-OUTPUT (JSON array, no prose — note all three split-edit fields are
-forced to 0.0 per Hard Rule 14):
+    Speech inside the stretch is a JUDGEMENT CALL, not a blocker. The
+    real question is "does the viewer need to hear this?":
+      * Load-bearing speech (instruction, explanation, narration that
+        carries the cut, the punchline) → SPLIT around it: 1× for the
+        words, speed>1 for the silent middle, 1× for the next words.
+      * Filler speech (mumbling, swearing at a screw, "okay there we
+        go", rambling that doesn't teach anything) → SQUEEZE right
+        over it; "drop" makes the words vanish with the room tone and
+        the visual story plays compressed.
+    When in doubt, lean toward squeezing over filler rather than
+    splitting into many tiny 1× ranges. The video is for the viewer.
+
+    Pure dead-air (camera abandoned, nothing moving) is a CUT, not a
+    squeeze. The `speed` field is OPTIONAL and defaults to 1.0; omit
+    it on every normal range.
+  - Unavoidable slips are kept if no better take exists. Note them in "reason".
+  - If over budget, revise: drop a beat or trim tails, OR squeeze a
+    qualifying long no-speech stretch (per "Time-squeezing" above)
+    instead of cutting it entirely. Report total and self-correct.
+
+OUTPUT (JSON array, no prose — split-edit fields forced to 0.0 per
+Hard Rule 14; `speed` and `audio_strategy` are OPTIONAL and only
+appear on time-squeezed ranges):
   [{"source": "C0103", "start": 2.42, "end": 6.85, "beat": "HOOK",
     "audio_lead": 0.0, "video_tail": 0.0, "transition_in": 0.0,
-    "quote": "...", "reason": "..."}, ...]
+    "quote": "...", "reason": "..."},
+   {"source": "C0210", "start": 68.10, "end": 1248.40, "beat": "BUILD",
+    "audio_lead": 0.0, "video_tail": 0.0, "transition_in": 0.0,
+    "speed": 10.0, "audio_strategy": "drop",
+    "reason": "19.6 min of silent assembly → 118s timelapse"}, ...]
 
 Return the final EDL and a one-line total runtime check.
 ```
@@ -551,6 +638,10 @@ Match the source unless the user asked for something specific. Common targets: `
      "beat": "HOOK", "quote": "...", "reason": "Cleanest delivery, stops before slip at 38.46."},
     {"source": "C0108", "start": 14.30, "end": 28.90,
      "beat": "SOLUTION", "quote": "...", "reason": "Only take without the false start.",
+     "audio_lead": 0.0, "video_tail": 0.0, "transition_in": 0.0},
+    {"source": "C0210", "start": 68.10, "end": 1248.40,
+     "beat": "BUILD", "reason": "19.6 min of silent assembly → 118s timelapse",
+     "speed": 10.0, "audio_strategy": "drop",
      "audio_lead": 0.0, "video_tail": 0.0, "transition_in": 0.0}
   ],
   "pacing_preset": "Paced",
@@ -606,3 +697,7 @@ Things that consistently fail regardless of style:
 - **Assuming what kind of video it is.** Look first, ask second, edit last.
 - **Skipping the pacing prompt or inventing ad-hoc cut-padding numbers.** Hard Rule 13 — every session uses one of the five presets; default is Paced.
 - **Emitting non-zero `audio_lead` / `video_tail` / `transition_in`.** Hard Rule 14 — split edits and dissolves are deferred. The current FCPXML pipeline drifts the audio across long timelines under non-zero values; until the multi-track rebuild lands, hard cuts only.
+- **Squeezing pure dead air instead of cutting it.** A camera abandoned on a tripod with nothing moving is not a timelapse candidate — it's a CUT candidate. Time-squeezing is for visually continuous *activity* (assembly, walking, prep, teardown). Compressing 30 minutes of nothing into 3 seconds of nothing is just slower nothing.
+- **Picking `speed` so the squeezed result lands < 5s or > 30s.** Under 5s the viewer doesn't register the activity; over 30s it overstays its welcome. Re-pick speed to land in the 5–30s sweet spot, OR split a long source stretch into multiple squeezes with a beat between, OR cut some of it.
+- **Setting `speed > 10.0` and expecting it to apply.** Both helpers clamp to 10.0 (1000%) with a warning. Beyond that retime decimates frames and looks broken; if you wanted >10x you should have cut.
+- **Splitting around every word of filler speech inside an otherwise-squeezable stretch.** If the speech isn't load-bearing, squeeze right over it with `audio_strategy="drop"`. A hundred 1× micro-ranges interleaved with a hundred speed=8 micro-ranges is worse cut than one honest squeeze that drops the rambling. The video is for the viewer.
