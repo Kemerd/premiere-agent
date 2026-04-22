@@ -604,28 +604,50 @@ def _persist_text_cache(edit_dir: Path, vocab_sha: str, text_embeds, vocab: list
     you can audit what labels produced these embeddings without
     re-reading the source video's vocab text file.
 
-    Crash-safe: write goes to a `.npz.tmp` sibling and is atomically
-    renamed into place, so an interrupted process can never leave a
-    half-written cache that fools the next run's loader. If the rename
-    itself fails (Windows AV holding the destination), the .tmp file
-    is best-effort deleted before re-raising so we don't accumulate
-    orphan tmp files in the edit folder.
+    Crash-safe: write goes to a sibling `.tmp.npz` file and is then
+    atomically renamed into place, so an interrupted process can never
+    leave a half-written cache that fools the next run's loader. If
+    the rename itself fails (Windows AV holding the destination), the
+    .tmp.npz file is best-effort deleted before re-raising so we
+    don't accumulate orphan tmp files in the edit folder.
+
+    Suffix-trap note (this bit us once): when `np.savez` is given a
+    string/Path target whose name does NOT already end in `.npz`, it
+    silently appends `.npz` itself (see numpy.lib.npyio.savez source).
+    Naming the staging file `audio_vocab_embeds.npz.tmp` therefore
+    caused numpy to write `audio_vocab_embeds.npz.tmp.npz` and the
+    follow-up rename of `.npz.tmp` failed with FileNotFoundError.
+    Fix: open the staging file ourselves and pass the file OBJECT to
+    savez — file-object inputs bypass the auto-append logic entirely,
+    so the bytes land at exactly the path we asked for and no name
+    inference can sneak in. The new staging suffix `.tmp.npz` is also
+    self-correct (already ends in `.npz`) for any future caller that
+    forgets to use the file-object path.
     """
     import numpy as np
 
     cache_path = edit_dir / VOCAB_EMBEDS_CACHE_NAME
-    tmp_path = cache_path.with_suffix(".npz.tmp")
+    # `.with_suffix(".tmp.npz")` -> `audio_vocab_embeds.tmp.npz`. Ends in
+    # `.npz` so even a stray `np.savez(str(tmp_path), ...)` would land
+    # at the right path; we use the file-object form below for
+    # belt-and-suspenders correctness.
+    tmp_path = cache_path.with_suffix(".tmp.npz")
     try:
-        np.savez(
-            str(tmp_path),
-            sha=np.array(vocab_sha),
-            embeds=text_embeds.astype(np.float32),
-            vocab=np.array(vocab, dtype=object),
-        )
+        # File-object form: numpy writes raw bytes to the handle and
+        # does NOT mangle the filename. The `with` block guarantees
+        # the handle is closed before the rename, which matters on
+        # Windows where you can't replace an open file.
+        with open(tmp_path, "wb") as fh:
+            np.savez(
+                fh,
+                sha=np.array(vocab_sha),
+                embeds=text_embeds.astype(np.float32),
+                vocab=np.array(vocab, dtype=object),
+            )
         _atomic_replace_with_retry(tmp_path, cache_path)
     except Exception:
         # Either the savez or the atomic rename failed. Either way, the
-        # .tmp file is dead weight — delete it so the next run doesn't
+        # tmp file is dead weight — delete it so the next run doesn't
         # see a stale tmp sibling and so the edit folder stays tidy.
         _safe_unlink(tmp_path)
         raise
