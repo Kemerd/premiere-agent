@@ -67,7 +67,7 @@ The skill lives in `video-use-premiere/`. User footage lives wherever they put i
 
 - **`HF_TOKEN` in `.env` at project root** — only required for speaker diarization (pyannote). Skip if single-speaker.
 - **`ffmpeg` + `ffprobe` on PATH.** Hard requirement. Win: `winget install Gyan.FFmpeg`. macOS: `brew install ffmpeg`. Linux: `apt install ffmpeg`.
-- **Python deps**: run `install.sh` (Linux/macOS) or `install.bat` (Windows). Installs PyTorch + the `[preprocess,fcpxml]` extras. Optional: `pip install -e .[flash]` for Flash Attention 2 (Florence-2 speedup), `pip install -e .[diarize]` for pyannote speaker diarization, `pip install -e .[parakeet]` to pre-install the NVIDIA Parakeet NeMo fallback (only needed when ONNX Runtime can't load on the host).
+- **Python deps**: run `install.sh` (Linux/macOS) or `install.bat` (Windows). Installs **ONNX Runtime** (`onnxruntime-gpu` on Linux/Win, plain `onnxruntime` on macOS) + the `[preprocess,fcpxml]` extras (`tokenizers`, `huggingface_hub`, `soxr`, `opentimelineio`, …). The default install is **PyTorch-FREE** since the Florence-2 ONNX port. Optional: set `INSTALL_DIARIZE=1` before running the installer to also pull `[diarize]` (pyannote → torch); `pip install -e .[parakeet]` to pre-install the NeMo Parakeet fallback (only needed when ONNX Runtime can't load on the host).
 - **Speech lane backends**: the default is `parakeet_onnx_lane.py` — NVIDIA Parakeet TDT 0.6B running on ONNX Runtime through a multi-session pool (TensorRT / CUDA / DirectML / CPU EP ladder, English v2 / multilingual v3 auto-routed by language). The only sanctioned alternative is `parakeet_lane.py` (NeMo torch-mode Parakeet) for hosts where ORT can't load — pin via `VIDEO_USE_SPEECH_LANE=nemo`. Output JSON shape is byte-identical between the two so cuts, diarization, and FCPXML export are lane-agnostic. `helpers/health.py --json` surfaces non-default backends in `fallbacks_active` so you know which one is running before the lane fires. **Fully air-gapped?** Pre-download the ONNX directory and set `PARAKEET_ONNX_DIR=/path/to/parakeet-onnx`; the lane skips all network calls. There is no Whisper backend in this codebase by design — Whisper hallucinates on silence and has a known word-timestamp memory regression that crashes long-form runs.
 - **`yt-dlp`, `manim`, Remotion** installed only on first use.
 - This skill vendors `skills/manim-video/`. Read its SKILL.md when building a Manim slot.
@@ -80,7 +80,7 @@ Before doing anything else in a session, run:
 python helpers/health.py --json
 ```
 
-This is **idempotent and cached** — first call runs the smoke suite (~3s), subsequent calls within 7 days return the cached result instantly (<500ms). Cache auto-invalidates when `python` / `torch` / `transformers` / `opentimelineio` versions change, so a `pip install --upgrade` triggers a fresh check.
+This is **idempotent and cached** — first call runs the smoke suite (~3s), subsequent calls within 7 days return the cached result instantly (<500ms). Cache auto-invalidates when `python` / `onnxruntime` / `tokenizers` / `huggingface_hub` / `opentimelineio` versions change (plus `torch` / `transformers` when present for the `[diarize]` extra or CLAP processor), so a `pip install --upgrade` triggers a fresh check.
 
 Cache lives at `~/.video-use-premiere/health.json` — **outside** the per-session `<videos_dir>/edit/` so it persists across projects. This is the one exception to Hard Rule 12, and it's intentional: skill-environment health is a per-machine property, not a per-session one.
 
@@ -102,11 +102,11 @@ Cache lives at `~/.video-use-premiere/health.json` — **outside** the per-sessi
 |---|---|
 | `ok`   | Silent. Don't bother the user. Proceed to inventory. |
 | `warn` | One-line note: "skipped X check(s), continuing." Proceed. |
-| `fail` | **Stop.** Print the failure list + the `advice` strings verbatim. Ask the user to run the fix and re-invoke. Don't pretend the rest of the skill will work — broken `ffmpeg` or missing `transformers` will silently corrupt every subsequent step. |
+| `fail` | **Stop.** Print the failure list + the `advice` strings verbatim. Ask the user to run the fix and re-invoke. Don't pretend the rest of the skill will work — broken `ffmpeg` or a missing `onnxruntime` GPU EP will silently corrupt every subsequent step (or drop you to a 50× slower CPU fallback you didn't ask for). |
 
 **When to force a re-run:**
 - User reports something stopped working
-- User just upgraded Python or PyTorch
+- User just upgraded Python, `onnxruntime`, an NVIDIA driver, or any model dep
 - User asks "is the skill set up correctly?"
 
 ```bash

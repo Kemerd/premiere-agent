@@ -2,12 +2,18 @@
 REM ---------------------------------------------------------------------------
 REM video-use-premiere bootstrap (Windows).
 REM
-REM Idempotent. Honors TORCH_INDEX env var so CPU-only / ROCm users can swap:
-REM   set TORCH_INDEX=https://download.pytorch.org/whl/cpu
-REM   install.bat
+REM Idempotent. As of the Florence-2 ONNX port, the default [preprocess]
+REM install is torch-FREE — both the speech lane (Parakeet ONNX) and the
+REM visual lane (Florence-2 ONNX, helpers/florence_onnx.py) run on
+REM ONNX Runtime via the bundled CUDA / TensorRT EPs.
 REM
-REM Default is CUDA 12.1 wheels which match the cuDNN bundled with the
-REM ONNX Runtime CUDA EP shipped in the onnxruntime-gpu>=1.22 wheel matrix.
+REM TORCH_INDEX is now LEGACY — only consulted if the user opts into the
+REM [diarize] extra (which pulls pyannote.audio, the only remaining
+REM torch-dependent component). For default installs it is ignored.
+REM
+REM Default ONNX Runtime CUDA EP target is CUDA 12.x via the cuDNN
+REM bundled with onnxruntime-gpu>=1.22 — no separate torch CUDA install
+REM is required for the speech / visual lanes.
 REM ---------------------------------------------------------------------------
 setlocal EnableExtensions EnableDelayedExpansion
 
@@ -44,19 +50,34 @@ echo [video-use-premiere] upgrading pip
 %PYTHON% -m pip install --upgrade pip || goto :err
 
 REM ---------------------------------------------------------------------------
-REM 2. PyTorch from the right index.
-REM ---------------------------------------------------------------------------
-if "%TORCH_INDEX%"=="" set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-echo [video-use-premiere] installing torch from %TORCH_INDEX%
-%PYTHON% -m pip install torch torchvision torchaudio --index-url %TORCH_INDEX% || goto :err
-
-REM ---------------------------------------------------------------------------
-REM 3. The package itself + heavy preprocess + fcpxml extras. Diarize is
-REM    intentionally NOT pulled by default (pyannote is heavy, most users
-REM    don't need speaker IDs).
+REM 2. The package itself + heavy preprocess + fcpxml extras. Diarize is
+REM    intentionally NOT pulled by default (pyannote is heavy AND the
+REM    ONLY remaining torch-dependent component, so most users skip it).
+REM
+REM    The [preprocess] extra now installs:
+REM      - onnx-asr[gpu,hub] + onnxruntime-gpu (speech + visual ONNX runtime)
+REM      - tensorrt-cu12-libs (opt-in TensorRT EP for both lanes)
+REM      - tokenizers + huggingface_hub (Florence-2 BART tokenizer + weights)
+REM      - imageio-ffmpeg (frame extraction for visual_lane)
+REM      - transformers (CLAP audio lane processor only — no torch needed
+REM        for transformers' tokenizer/feature-extractor code paths)
+REM      - soundfile + soxr (WAV I/O + fast resample)
 REM ---------------------------------------------------------------------------
 echo [video-use-premiere] installing package + preprocess + fcpxml extras
 %PYTHON% -m pip install -e ".[preprocess,fcpxml]" || goto :err
+
+REM ---------------------------------------------------------------------------
+REM 3. Optional torch install for the [diarize] extra. Skipped by default.
+REM    User opts in via INSTALL_DIARIZE=1 (then the script pulls torch from
+REM    TORCH_INDEX and adds [diarize] to the pip install).
+REM ---------------------------------------------------------------------------
+if /I "%INSTALL_DIARIZE%"=="1" (
+    if "%TORCH_INDEX%"=="" set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
+    echo [video-use-premiere] [diarize] opt-in: installing torch from !TORCH_INDEX!
+    %PYTHON% -m pip install torch torchvision torchaudio --index-url !TORCH_INDEX! || goto :err
+    echo [video-use-premiere] installing [diarize] extra ^(pyannote.audio^)
+    %PYTHON% -m pip install -e ".[diarize]" || goto :err
+)
 
 REM ---------------------------------------------------------------------------
 REM 4. ffmpeg PATH check. Not fatal but warn loudly — most failures
@@ -72,16 +93,22 @@ if errorlevel 1 (
 )
 
 REM ---------------------------------------------------------------------------
-REM 5. CUDA smoke test. Doesn't fail install if CUDA is missing — CPU
-REM    fallback path exists. Just informs the user what they'll get.
+REM 5. ONNX Runtime providers smoke test. Doesn't fail install if no GPU
+REM    EP is available — the CPU EP is a working fallback. Reports which
+REM    EPs the freshly-installed onnxruntime-gpu wheel can actually load
+REM    on this host. Useful for spotting cuDNN / CUDA version mismatches
+REM    BEFORE the user kicks off a 30-min preprocess.
 REM ---------------------------------------------------------------------------
-echo [video-use-premiere] CUDA smoke test:
-%PYTHON% -c "import torch; ok=torch.cuda.is_available(); name=torch.cuda.get_device_name(0) if ok else 'n/a'; tot=(torch.cuda.get_device_properties(0).total_memory/(1024**3)) if ok else 0.0; print(f'  cuda available : {ok}'); print(f'  device         : {name}'); print(f'  total VRAM     : {tot:.1f} GB')"
+echo [video-use-premiere] ONNX Runtime providers:
+%PYTHON% -c "import onnxruntime as ort; eps = ort.get_available_providers(); print('  available EPs :', eps); has_cuda = 'CUDAExecutionProvider' in eps; has_trt = 'TensorrtExecutionProvider' in eps; has_dml = 'DmlExecutionProvider' in eps; print(f'  CUDA EP       : {has_cuda}'); print(f'  TensorRT EP   : {has_trt}'); print(f'  DirectML EP   : {has_dml}'); print(f'  ORT version   : {ort.__version__}')"
 
 echo.
 echo [video-use-premiere] install complete.
 echo   next: copy .env.example .env       ^(only needed for --diarize^)
 echo         %PYTHON% helpers\preprocess_batch.py C:\path\to\your\videos
+echo.
+echo   To opt into speaker diarization (adds torch + pyannote.audio):
+echo         set INSTALL_DIARIZE=1 ^&^& install.bat
 echo.
 
 popd

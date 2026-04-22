@@ -18,28 +18,53 @@ Approximate steady-state model footprints with conservative settings:
     (audio + text encoders resident, batch=16 windows × 10s × 48kHz
      transient mel + activation working set; ~3 GB peak with the
      "large" tier under --wealthy)
-  - Florence-2-base, fp16, batch 8:                        ~2.5 GB
+  - Florence-2-base ONNX, fp16, batch 8 + KV cache:        ~1.8 GB peak
+    (4 ONNX subgraphs co-resident: vision_encoder + embed_tokens +
+     encoder_model + decoder_model_merged; B*beams=24 KV cache;
+     measured via nvidia-smi during a 50-frame test batch on a 5090.
+     Multi-instance pool scales linearly: 2 captioners ≈ 3.2 GB peak.)
 
 The default speech lane is the multi-session ONNX path (see
 helpers/parakeet_onnx_lane.py / helpers/_onnx_pool.py) which auto-clamps
-its pool size to fit available VRAM.
+its pool size to fit available VRAM. The visual lane uses the same
+multi-session pattern via helpers/_florence_pool.py — also VRAM-clamped.
 
 Parallel-mode opt-in viability:
-the audio lane is back to a small CLAP encoder (~1.5 GB) so PARALLEL_3
-(speech + audio + visual) is viable again on any 8 GB+ card —
-Parakeet-pool ~6 GB + CLAP ~1.5 GB + Florence ~2.5 GB easily fits on a
-12 GB card with headroom. The 8 GB / 4 GB / 2 GB thresholds in
-`pick_schedule` are unchanged. The default schedule is still SEQUENTIAL
-for the unrelated multi-context CUDA allocator fragmentation issues
-called out below; users on multi-GPU rigs or datacenter cards opt into
-parallel via VIDEO_USE_PARALLEL_LANES=1.
+the audio lane uses a small CLAP encoder (~1.5 GB) and Florence is now
+on a leaner ONNX path (~1.8 GB), so PARALLEL_3 (speech + audio + visual)
+is viable on any 12 GB+ card — Parakeet-pool ~6 GB + CLAP ~1.5 GB +
+Florence ~1.8 GB fits with headroom. The 8 GB / 4 GB / 2 GB thresholds
+in `pick_schedule` are unchanged. The default schedule is still
+SEQUENTIAL for the unrelated multi-context CUDA allocator fragmentation
+issues called out below; users on multi-GPU rigs or datacenter cards
+opt into parallel via VIDEO_USE_PARALLEL_LANES=1.
 
 Detection strategy (in order):
 
-  1. torch.cuda.mem_get_info(device=0)      — fast, accurate, no subprocess
-  2. nvidia-smi --query-gpu=memory.free     — fallback when torch isn't built
-                                              with CUDA but smi is on PATH
-  3. None                                   — no GPU, fall through to CPU tier
+  1. pynvml.nvmlDeviceGetMemoryInfo()       — fastest path when the
+                                              `pynvml` package is on
+                                              the system (often a
+                                              transitive dep of various
+                                              CUDA toolkits / nvidia
+                                              ML stacks).  No subprocess
+                                              spawn, no PYTHONPATH stunts.
+  2. nvidia-smi --query-gpu=memory.free     — primary expectation now
+                                              that torch is no longer
+                                              guaranteed to be installed.
+                                              Works on any host with the
+                                              NVIDIA driver, no python
+                                              deps.  Subprocess cost is
+                                              ~50ms which is fine for a
+                                              one-shot probe at startup.
+  3. torch.cuda.mem_get_info(device=0)      — opportunistic fast-path,
+                                              only fires if torch was
+                                              installed alongside the
+                                              [diarize] extra.  Demoted
+                                              from primary because the
+                                              default preprocess install
+                                              is now torch-FREE thanks
+                                              to the Florence-2 ONNX port.
+  4. None                                   — no GPU, fall through to CPU tier
 
 Returning a `Schedule` enum keeps the orchestrator's branching readable and
 makes the schedule trivially loggable / overridable from the CLI.
@@ -87,33 +112,73 @@ class GpuInfo:
 # ---------------------------------------------------------------------------
 
 
-def _try_torch() -> GpuInfo | None:
-    """Use torch.cuda directly. Returns None if torch isn't installed or
-    CUDA isn't available — the caller will try the nvidia-smi path next.
+def _try_pynvml() -> GpuInfo | None:
+    """Use NVIDIA's NVML library directly via the ``pynvml`` Python wrapper.
+
+    Fastest path when available -- no subprocess spawn, no string
+    parsing, just two C calls into libnvidia-ml.so / nvml.dll.
+    Returns None when the package isn't installed (the common case on
+    a default install -- pynvml is not in our dependency list, only
+    occasionally pulled transitively by CUDA toolkits or other ML
+    libraries the user might have around).
+
+    Init/shutdown are paired in a try/finally so a partially-initialized
+    NVML state can't leak across processes -- the orchestrator calls
+    ``detect_gpu()`` repeatedly during its scheduling pass and we want
+    each call to be a pure function.
     """
     try:
-        import torch  # local import: torch is in [preprocess], not always there
+        import pynvml  # type: ignore  # optional dep; fail-soft on missing
     except ImportError:
         return None
 
-    if not torch.cuda.is_available():
+    # NVMLError can be raised by every nvml* call below if the driver
+    # isn't loaded or the GPU is in an inaccessible state (e.g. ECC
+    # error recovery). We catch broadly rather than enumerate every
+    # NVML error code -- the next probe in the chain handles fallback.
+    try:
+        pynvml.nvmlInit()
+    except Exception:
         return None
 
-    # device 0 is the convention; multi-GPU users can set CUDA_VISIBLE_DEVICES.
-    free_b, total_b = torch.cuda.mem_get_info(0)
-    props = torch.cuda.get_device_properties(0)
-    return GpuInfo(
-        available=True,
-        device_name=props.name,
-        total_gb=total_b / (1024 ** 3),
-        free_gb=free_b / (1024 ** 3),
-    )
+    try:
+        # Device 0 is the convention; multi-GPU users set CUDA_VISIBLE_DEVICES
+        # to limit which GPU we see (NVML respects the env var when set).
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        # nvmlDeviceGetName returns bytes on older bindings, str on newer.
+        # decode() on a str raises AttributeError; .decode if bytes else str.
+        raw_name = pynvml.nvmlDeviceGetName(handle)
+        name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+        return GpuInfo(
+            available=True,
+            device_name=name,
+            total_gb=mem.total / (1024 ** 3),
+            free_gb=mem.free / (1024 ** 3),
+        )
+    except Exception:
+        return None
+    finally:
+        # NVML init refcounts internally so this is cheap on every call;
+        # always shut down so the next probe has a clean state if it
+        # also wants to call NVML (currently only this probe does).
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 
 
 def _try_nvidia_smi() -> GpuInfo | None:
-    """Fallback for environments where torch wasn't built with CUDA but
-    nvidia-smi is on PATH (e.g. someone installed the CPU torch wheel by
-    accident). Returns None if smi can't tell us anything useful.
+    """Probe via the ``nvidia-smi`` CLI shipped with the NVIDIA driver.
+
+    Primary expectation now that the default preprocess install is
+    torch-FREE (Florence-2 ONNX port). Works on any host with the
+    NVIDIA driver -- doesn't require pynvml, doesn't require torch,
+    doesn't require any python-side CUDA package.
+
+    Subprocess cost is ~50 ms which is fine for a one-shot probe at
+    orchestrator startup. Returns None if nvidia-smi isn't on PATH or
+    its output can't be parsed.
     """
     smi = shutil.which("nvidia-smi")
     if smi is None:
@@ -150,11 +215,52 @@ def _try_nvidia_smi() -> GpuInfo | None:
     )
 
 
+def _try_torch() -> GpuInfo | None:
+    """Use torch.cuda directly. Opportunistic fast-path.
+
+    Demoted from primary detection because the default preprocess
+    install is now torch-FREE -- torch only appears when the user has
+    opted into the [diarize] extra (or installed it manually for some
+    other reason). Still kept in the chain because it's the lowest-
+    overhead probe when torch happens to be around: no subprocess, no
+    NVML init, just one C call into the cached CUDA driver handle.
+
+    Returns None if torch isn't installed or CUDA isn't available --
+    the caller will have already tried pynvml and nvidia-smi above.
+    """
+    try:
+        import torch  # local import: torch is opt-in via [diarize]
+    except ImportError:
+        return None
+
+    # torch.cuda probes can raise if libcudart resolution fails on a
+    # mismatched driver -- catch defensively so we can still fall
+    # through to None and let the caller handle CPU fallback.
+    try:
+        if not torch.cuda.is_available():
+            return None
+
+        # device 0 is the convention; multi-GPU users can set CUDA_VISIBLE_DEVICES.
+        free_b, total_b = torch.cuda.mem_get_info(0)
+        props = torch.cuda.get_device_properties(0)
+        return GpuInfo(
+            available=True,
+            device_name=props.name,
+            total_gb=total_b / (1024 ** 3),
+            free_gb=free_b / (1024 ** 3),
+        )
+    except Exception:
+        return None
+
+
 def detect_gpu() -> GpuInfo:
     """Single entry point for callers. Always returns a GpuInfo; callers
     should branch on `info.available` rather than handling None.
+
+    Probe order: pynvml -> nvidia-smi -> torch -> CPU fallback.
+    See module docstring for the rationale on each tier.
     """
-    for fn in (_try_torch, _try_nvidia_smi):
+    for fn in (_try_pynvml, _try_nvidia_smi, _try_torch):
         info = fn()
         if info is not None:
             return info
