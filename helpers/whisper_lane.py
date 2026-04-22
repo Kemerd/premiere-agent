@@ -59,13 +59,37 @@ from wealthy import WHISPER_BATCH, is_wealthy
 
 
 # ---------------------------------------------------------------------------
-# Tunables — picked from the IFW benchmark table for an A100 / 3060 sweet
-# spot. batch_size=24 is what IFW recommends for large-v3 + FA2; drop to 8
-# on smaller cards via the CLI flag.
+# Tunables — sized for `return_timestamps="word"`, NOT segment timestamps.
+#
+# Critical context: this lane runs the HF Whisper pipeline with
+# `return_timestamps="word"` (see `_transcribe_words` below) because the
+# downstream editor needs word-precise cut boundaries. Word timestamps
+# inflate VRAM 3-4x vs segment timestamps for the SAME batch size — see
+# https://github.com/huggingface/transformers/issues/27834 for the upstream
+# discussion. Concretely on whisper-large-v3 fp16:
+#
+#       batch=24, segment timestamps :  ~6.5 GB peak
+#       batch=24, word    timestamps : ~22.0 GB peak   <-- our path
+#       batch=48, word    timestamps : ~40+  GB peak   <-- OOMs a 5090
+#
+# So the IFW benchmark numbers (which assume segment timestamps + FA2)
+# are NOT a usable reference for our config. We pick batches that leave
+# headroom on the smallest card we actively support (RTX 3090 / 4090
+# 24 GB) AND don't tip the 32 GB Blackwell over the edge once you account
+# for the desktop compositor (~1 GB) plus PyTorch caching allocator
+# fragmentation across multiple per-clip pipeline invocations.
+#
+# Empirical safe-zone floors:
+#   * 24 GB card, word timestamps : batch <= 8   (~12 GB peak)
+#   * 32 GB card, word timestamps : batch <= 16  (~22 GB peak)
+#
+# Higher batches do work in synthetic single-shot benchmarks but tip into
+# OOM territory once a long batch (50+ chunks per video) fragments the
+# allocator and the next video's pipeline reload spike has nowhere to go.
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL_ID = "openai/whisper-large-v3"
-DEFAULT_BATCH_SIZE = 24
+DEFAULT_BATCH_SIZE = 8        # safe on 24 GB cards with word timestamps
 DEFAULT_CHUNK_LENGTH_S = 30   # Whisper's native receptive field
 TRANSCRIPTS_SUBDIR = "transcripts"
 
