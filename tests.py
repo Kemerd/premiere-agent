@@ -607,9 +607,12 @@ def test_parakeet_fallback(R: Results, tmp: Path) -> None:
             text = "Hello world. Again."
             timestamp = {
                 "word": [
+                    # Contiguous pair -> NO spacing entry between them.
+                    # (Converter mirrors whisper_lane: any positive gap
+                    # emits a spacing, so we keep these flush on purpose.)
                     {"word": "Hello",  "start": 1.0,  "end": 1.4},
-                    {"word": "world.", "start": 1.45, "end": 2.0},
-                    # 3-second silence gap -> spacing entry expected
+                    {"word": "world.", "start": 1.4,  "end": 2.0},
+                    # 3-second silence gap -> exactly one spacing entry expected
                     {"word": "Again.", "start": 5.0,  "end": 5.6},
                 ],
             }
