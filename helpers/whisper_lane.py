@@ -133,22 +133,67 @@ def _clear_whisper_blocked() -> None:
 def _is_cuda_oom(exc: BaseException) -> bool:
     """Return True if `exc` is a CUDA out-of-memory error.
 
-    torch >= 2.4 raises the dedicated `torch.cuda.OutOfMemoryError`
-    subclass; older builds raise plain `RuntimeError` with "out of memory"
-    somewhere in the message. We accept both so the retry logic works
-    regardless of which torch wheel the user installed.
+    torch ships the OOM exception under three different names depending
+    on version:
+        * torch 2.6+         : `torch.OutOfMemoryError` (top-level)
+        * torch 2.4 - 2.5    : `torch.cuda.OutOfMemoryError`
+        * torch < 2.4        : plain `RuntimeError` with "out of memory"
+                               in the message
 
-    Pure exception inspection — no torch state poked, safe to call from
-    any thread / context.
+    We accept all three so the retry logic works regardless of which
+    torch wheel the user has installed. Pure exception inspection — no
+    torch state poked, safe to call from any thread / context.
     """
     try:
         import torch
-        if isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())):
+        # torch 2.6+: top-level OutOfMemoryError class
+        oom_top = getattr(torch, "OutOfMemoryError", None)
+        if oom_top is not None and isinstance(exc, oom_top):
             return True
-    except (ImportError, AttributeError):
+        # torch 2.4 - 2.5: cuda-namespaced OutOfMemoryError
+        oom_cuda = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+        if oom_cuda is not None and isinstance(exc, oom_cuda):
+            return True
+    except ImportError:
         pass
+    # Fallback string match — covers torch < 2.4 and any wrapped/chained
+    # OOMs that didn't inherit cleanly. We check a few synonymous phrases
+    # because different CUDA layers (driver, runtime, allocator) word it
+    # slightly differently.
     msg = str(exc).lower()
-    return "out of memory" in msg or "cuda error: out of memory" in msg
+    return any(s in msg for s in (
+        "out of memory",
+        "cuda error: out of memory",
+        "cudnn error",  # CUDNN_STATUS_NOT_INITIALIZED is OOM-adjacent
+        "cublas",       # CUBLAS_STATUS_ALLOC_FAILED
+    )) and ("memory" in msg or "alloc" in msg)
+
+
+def _vram_snapshot() -> str:
+    """Return a one-line summary of current GPU memory state, or '' if
+    CUDA isn't available. Used to give OOM logs context — without this
+    every OOM looks identical, so a user can't tell whether they hit
+    fragmentation, model-too-big, or co-tenant pressure.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return ""
+        device = torch.cuda.current_device()
+        free_b, total_b = torch.cuda.mem_get_info(device)
+        # Caching allocator's view: how much torch *thinks* it owns vs.
+        # how much it's actively using right now. Big delta => fragmentation.
+        reserved_b = torch.cuda.memory_reserved(device)
+        allocated_b = torch.cuda.memory_allocated(device)
+        gb = lambda b: b / (1024 ** 3)
+        return (
+            f"VRAM dev{device}: free={gb(free_b):.2f} GB / "
+            f"total={gb(total_b):.2f} GB, "
+            f"torch_reserved={gb(reserved_b):.2f} GB, "
+            f"torch_allocated={gb(allocated_b):.2f} GB"
+        )
+    except Exception:
+        return ""
 
 
 def _release_cuda_cache() -> None:
@@ -163,6 +208,14 @@ def _release_cuda_cache() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            # ipc_collect releases shared-memory blocks held by other
+            # CUDA processes (the visual + audio lanes) that have
+            # exited. Without this, fragments stick around for the rest
+            # of the parent's lifetime.
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -547,23 +600,43 @@ def _process_one(
                 chunk_length_s=chunk_length_s,
             )
             break
-        except RuntimeError as exc:
+        # We catch BaseException (then filter via _is_cuda_oom) instead of
+        # RuntimeError because torch 2.6+ raises `torch.OutOfMemoryError`
+        # from the top-level torch namespace; depending on which call
+        # site allocates, it may or may not inherit from RuntimeError. The
+        # filter ensures we still re-raise unrelated errors immediately.
+        except Exception as exc:
             if not _is_cuda_oom(exc):
                 raise
+            # Snapshot memory BEFORE the cache flush so the log shows
+            # what the failure actually looked like, not the post-recovery
+            # state. Then flush, so the next attempt has clean allocator.
+            vram_at_fail = _vram_snapshot()
             _release_cuda_cache()
             new_batch = cur_batch // 2
             if new_batch < 1:
                 # Already at the floor — model is too big for this card
-                # in this lane configuration. Surface the real error.
-                print(f"  whisper: CUDA OOM at batch=1 — model does not "
-                      f"fit on this device with the current dtype/chunk. "
-                      f"Re-run with --skip-visual / --skip-audio to free "
-                      f"VRAM, or use --force-schedule sequential.",
-                      file=sys.stderr)
+                # in this lane configuration. Surface the real error
+                # plus the VRAM context so the user can act on it.
+                print(
+                    f"  whisper: CUDA OOM at batch=1 — model does not "
+                    f"fit on this device with the current dtype/chunk.\n"
+                    f"  whisper: at-fail snapshot: {vram_at_fail}\n"
+                    f"  whisper: actionable fixes:\n"
+                    f"    * re-run with --force-schedule sequential\n"
+                    f"      (loads lanes one-at-a-time, no co-tenancy)\n"
+                    f"    * re-run with --chunk-length-s 20 (smaller KV)\n"
+                    f"    * re-run with --skip-visual to free Florence\n"
+                    f"      (~5 GB) for Whisper",
+                    file=sys.stderr,
+                )
                 raise
-            print(f"  whisper: CUDA OOM at batch={cur_batch}, "
-                  f"retrying at batch={new_batch}",
-                  file=sys.stderr)
+            print(
+                f"  whisper: CUDA OOM at batch={cur_batch}, "
+                f"retrying at batch={new_batch}\n"
+                f"  whisper: at-fail snapshot: {vram_at_fail}",
+                file=sys.stderr,
+            )
             cur_batch = new_batch
     words = _to_canonical_words(hf_result)
 
@@ -680,9 +753,34 @@ def run_whisper_lane_batch(
             force=force,
         )
 
+    # Snapshot VRAM right before model load so the diff between this and
+    # the post-load snapshot makes whisper's footprint legible in the log.
+    vram_pre = _vram_snapshot()
+    if vram_pre:
+        print(f"  whisper: pre-load {vram_pre}")
     try:
         asr = _build_pipeline(model_id, device, dtype_name)
     except BaseException as exc:
+        # CUDA OOM during model load means the *static* model weights
+        # don't fit alongside whatever the visual/audio lanes are
+        # holding. The per-clip retry loop downstream can't help here —
+        # we never even got past `from_pretrained`. Give the user the
+        # same actionable fixes early, then re-raise.
+        if _is_cuda_oom(exc):
+            print(
+                f"  whisper: CUDA OOM during model load — Whisper weights "
+                f"could not be allocated alongside co-tenant lanes.\n"
+                f"  whisper: at-fail snapshot: {_vram_snapshot()}\n"
+                f"  whisper: actionable fixes:\n"
+                f"    * re-run with --force-schedule sequential\n"
+                f"      (loads lanes one-at-a-time, no co-tenancy)\n"
+                f"    * raise VIDEO_USE_LANE_STAGGER_S env var (currently "
+                f"~8s) so visual lane finishes loading first\n"
+                f"    * re-run with --skip-visual to free Florence\n"
+                f"      (~5 GB) for Whisper",
+                file=sys.stderr,
+            )
+            raise
         # We catch BaseException (not just Exception) because some HF
         # download failures bubble up as KeyboardInterrupt-adjacent
         # signal hijacking on Windows. Re-raise non-blocking ones so a
@@ -717,6 +815,15 @@ def run_whisper_lane_batch(
     # previous network state. Idempotent / safe if the sentinel doesn't
     # exist (most common case on a clean machine).
     _clear_whisper_blocked()
+    # Post-load VRAM snapshot — the diff against the pre-load line
+    # tells the user (and us, debugging) exactly how much weight memory
+    # Whisper claimed and how much headroom is left for KV cache growth
+    # during long-form generation. Roughly: if free < 6 GB after this
+    # line, the first 4-min clip at default batch will likely OOM and
+    # the retry loop will halve down to a working batch.
+    vram_post = _vram_snapshot()
+    if vram_post:
+        print(f"  whisper: post-load {vram_post}")
     out_paths: list[Path] = []
     # Outer bar: one tick per video. Each call to _process_one is opaque
     # work — Whisper's pipeline doesn't expose internal callbacks cheaply,

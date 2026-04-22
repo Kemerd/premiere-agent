@@ -267,6 +267,131 @@ def _install_legacy_pretrained_model_compat() -> None:
 
 
 # ---------------------------------------------------------------------------
+# transformers 5.x compatibility shim — fourth layer, tokenizer side.
+#
+# Florence-2's processor (the trust_remote_code `processing_florence2.py`)
+# directly reads `tokenizer.additional_special_tokens` as an instance
+# attribute during processor construction. In transformers 4.x this was
+# always present (a real attribute initialized to `[]` in
+# `PreTrainedTokenizerBase.__init__`). In transformers 5.x it was removed
+# from the slow tokenizer's instance dict; the canonical access is now via
+# `tokenizer.special_tokens_map.get("additional_special_tokens", [])`.
+#
+# Florence-2's processor was written before that move and crashes with:
+#
+#     AttributeError: RobertaTokenizer has no attribute
+#                     additional_special_tokens.
+#                     Did you mean: 'add_special_tokens'?
+#
+# We can't (and shouldn't) edit the trust_remote_code module — it lives in
+# the HF cache. So we add a `property` to the tokenizer base classes that
+# returns `[]` (or whatever's in `special_tokens_map`) when the underlying
+# attribute is missing. Plain `setattr(cls, "additional_special_tokens",
+# [])` would be wrong: the SETTER side of the same name still needs to
+# work for code that *does* register additional special tokens. A property
+# with both getter and setter preserves both contracts.
+#
+# Patch the bases (`PreTrainedTokenizerBase`, `PreTrainedTokenizer`,
+# `PreTrainedTokenizerFast`) — every concrete tokenizer (Roberta, BART,
+# T5, ...) inherits from one of those, so one shim covers them all.
+# ---------------------------------------------------------------------------
+
+def _install_legacy_tokenizer_compat() -> None:
+    """Backfill `additional_special_tokens` on tokenizer base classes when
+    transformers 5.x removed the legacy instance attribute that
+    Florence-2's remote-code processor still reads as a bare attribute.
+
+    Idempotent + best-effort: if transformers is uninstalled, if any of
+    the base classes can't be imported, or if the attribute is already a
+    real property/attr on the class, we leave the world alone. The check
+    `attr in cls.__dict__` is intentional — we want to detect whether the
+    *exact* class declares it, not whether some superclass does (which it
+    will, after our first patch — that's what makes this idempotent).
+    """
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    except ImportError:
+        return
+
+    # Build the (getter, setter) pair once. The getter falls back through
+    # three sources in priority order:
+    #   1. The instance dict — if downstream code wrote a real attribute,
+    #      respect it (transformers 4.x style code path).
+    #   2. `special_tokens_map["additional_special_tokens"]` — the
+    #      canonical transformers 5.x location.
+    #   3. Empty list — safe default; Florence's processor only reads the
+    #      attribute and never errors on `[]`.
+    def _get_additional_special_tokens(self):
+        # Instance attribute wins — preserves any explicit assignment.
+        # We poke __dict__ directly to avoid triggering this very property.
+        if "additional_special_tokens" in self.__dict__:
+            return self.__dict__["additional_special_tokens"]
+        # Fall back to the canonical 5.x location.
+        try:
+            stm = self.special_tokens_map
+        except AttributeError:
+            return []
+        return list(stm.get("additional_special_tokens", []))
+
+    def _set_additional_special_tokens(self, value):
+        # Stash on the instance so the getter above will return it next
+        # time, AND mirror it into the underlying tokenizer state via the
+        # public API when available (so HF internals stay consistent).
+        self.__dict__["additional_special_tokens"] = (
+            list(value) if value is not None else []
+        )
+        # Best-effort sync with the special_tokens_map. add_special_tokens
+        # exists on both fast and slow tokenizers across all versions, so
+        # this is safe to call. Wrapped in try/except because some
+        # subclasses lock the tokenizer state during init and would raise.
+        try:
+            self.add_special_tokens(
+                {"additional_special_tokens": list(value or [])}
+            )
+        except Exception:
+            pass
+
+    new_property = property(
+        _get_additional_special_tokens,
+        _set_additional_special_tokens,
+    )
+
+    # Walk every tokenizer base class transformers exposes and inject the
+    # shim where it's actually missing. We tolerate any of these imports
+    # failing — different transformers versions split the class hierarchy
+    # differently (PreTrainedTokenizerFast moved out of tokenization_utils
+    # into tokenization_utils_fast in 4.x, etc.).
+    base_classes: list[type] = [PreTrainedTokenizerBase]
+    try:
+        from transformers.tokenization_utils import PreTrainedTokenizer
+        base_classes.append(PreTrainedTokenizer)
+    except ImportError:
+        pass
+    try:
+        from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+        base_classes.append(PreTrainedTokenizerFast)
+    except ImportError:
+        pass
+
+    for cls in base_classes:
+        # Only patch if THIS class doesn't declare the attr — the inheritance
+        # chain will surface our patch from a base class to subclasses anyway.
+        # Without this guard we'd shadow a working property with our own.
+        if "additional_special_tokens" in cls.__dict__:
+            existing = cls.__dict__["additional_special_tokens"]
+            # If it's already a property (vanilla 4.x or working 5.x), leave
+            # it alone — our shim is for the "attribute went missing" case.
+            if isinstance(existing, property):
+                continue
+            # Plain class attr (rare) — also leave alone, it works.
+            continue
+        # Attr missing on this class. Patch it. Subclasses (RobertaTokenizer
+        # et al.) automatically inherit the property via Python's MRO, so a
+        # single setattr here covers every concrete tokenizer.
+        setattr(cls, "additional_special_tokens", new_property)
+
+
+# ---------------------------------------------------------------------------
 # transformers 5.x compatibility shim — third layer, Florence-2 specific.
 #
 # `Florence2PreTrainedModel` (loaded via trust_remote_code) declares
@@ -369,6 +494,12 @@ def _build_florence(model_id: str, device: str, dtype_name: str):
     # module first. This call also primes the trust_remote_code download
     # so the upcoming from_pretrained doesn't have to.
     _patch_florence_support_flag_properties(model_id)
+    # Fourth patch: tokenizer-side. Florence's processor reads
+    # `tokenizer.additional_special_tokens` as a bare attr; transformers
+    # 5.x removed that. Backfill the property on the tokenizer base
+    # classes so every concrete tokenizer (RobertaTokenizer in our case)
+    # picks it up via MRO before AutoProcessor.from_pretrained runs.
+    _install_legacy_tokenizer_compat()
 
     import torch
     from transformers import AutoModelForCausalLM, AutoProcessor
