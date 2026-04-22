@@ -2,9 +2,9 @@
 
 After preprocess[_batch].py finishes, every video has THREE JSON files:
 
-    <edit>/transcripts/<stem>.json   — whisper_lane (speech, word level)
-    <edit>/audio_tags/<stem>.json    — audio_lane   (CLAP vocab events)
-    <edit>/visual_caps/<stem>.json   — visual_lane  (Florence-2 captions)
+    <edit>/transcripts/<stem>.json   — parakeet_onnx_lane (speech, word level)
+    <edit>/audio_tags/<stem>.json    — audio_lane         (CLAP vocab events)
+    <edit>/visual_caps/<stem>.json   — visual_lane        (Florence-2 captions)
 
 This script fans those out into THREE markdown timelines that the SKILL
 points Claude at:
@@ -66,21 +66,23 @@ def format_duration(seconds: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Phrase grouper — walks a Whisper word stream and breaks into phrases on
-# any silence >= silence_threshold OR a speaker change. Word-boundary
-# precision falls out of word-level Whisper output (Hard Rule 8 + 6).
+# Phrase grouper — walks the canonical word stream and breaks into phrases
+# on any silence >= silence_threshold OR a speaker change. Word-boundary
+# precision falls out of the Parakeet TDT decoder's native per-token
+# timestamps (see helpers/parakeet_onnx_lane.py); Hard Rule 8 + 6 still
+# apply.
 # ---------------------------------------------------------------------------
 
 def group_into_phrases(
     words: list[dict],
     silence_threshold: float = 0.5,
 ) -> list[dict]:
-    """Walk a Whisper word list, break into phrases. Returns
+    """Walk the canonical word list, break into phrases. Returns
     [{start, end, text, speaker_id}, ...].
 
-    Whisper word entries have type 'word', 'spacing', or 'audio_event'.
-    We keep 'word' / 'audio_event' in phrase text; 'spacing' carries the
-    silence info via its start/end gap.
+    Word entries have type 'word', 'spacing', or 'audio_event'. We keep
+    'word' / 'audio_event' in phrase text; 'spacing' carries the silence
+    info via its start/end gap.
     """
     phrases: list[dict] = []
     current_words: list[dict] = []

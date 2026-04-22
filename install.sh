@@ -7,7 +7,7 @@
 #   TORCH_INDEX=https://download.pytorch.org/whl/rocm6.0 ./install.sh
 #
 # Default is CUDA 12.1 wheels which match the cuDNN bundled with the
-# faster-whisper / CTranslate2 wheel matrix as of late 2025.
+# ONNX Runtime CUDA EP shipped in the onnxruntime-gpu>=1.22 wheel matrix.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 

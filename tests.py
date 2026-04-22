@@ -264,7 +264,8 @@ def test_environment(R: Results) -> None:
 HELPER_MODULES = (
     "vram", "wealthy", "extract_audio", "progress",
     "pack_timelines", "preprocess", "preprocess_batch",
-    "whisper_lane", "parakeet_lane", "audio_lane", "visual_lane",
+    "diarize", "parakeet_onnx_lane", "parakeet_lane",
+    "audio_lane", "audio_vocab_default", "visual_lane",
     "render", "export_fcpxml",
 )
 
@@ -352,7 +353,7 @@ def test_wealthy(R: Results) -> None:
     try:
         from wealthy import (
             is_wealthy, propagate_to_env,
-            WHISPER_BATCH, FLORENCE_BATCH,
+            SPEECH_BATCH, FLORENCE_BATCH,
             CLAP_WINDOWS_PER_BATCH, CLAP_WINDOWS_PER_BATCH_WEALTHY,
             CLAP_MODEL_TIER_DEFAULT, CLAP_MODEL_TIER_WEALTHY,
         )
@@ -369,7 +370,7 @@ def test_wealthy(R: Results) -> None:
             R.ok("wealthy CLI flag → env propagation")
 
             print(
-                f"  wealthy knobs:    whisper={WHISPER_BATCH}  "
+                f"  wealthy knobs:    speech={SPEECH_BATCH}  "
                 f"florence={FLORENCE_BATCH}  "
                 f"clap={CLAP_WINDOWS_PER_BATCH}->{CLAP_WINDOWS_PER_BATCH_WEALTHY} windows/batch  "
                 f"clap_tier={CLAP_MODEL_TIER_DEFAULT}->{CLAP_MODEL_TIER_WEALTHY}"
@@ -419,7 +420,7 @@ def test_pack_timelines(R: Results, tmp: Path) -> None:
         (edit / "audio_tags").mkdir(parents=True)
         (edit / "visual_caps").mkdir(parents=True)
 
-        # Synthetic Whisper output — three words, one silence break
+        # Synthetic speech-lane output — three words, one silence break
         (edit / "transcripts" / "C0001.json").write_text(json.dumps({
             "source_path": "/tmp/C0001.mp4",
             "duration": 10.0,
@@ -644,8 +645,8 @@ def test_parakeet_fallback(R: Results, tmp: Path) -> None:
         R.fail("_lazy_nemo helpers", f"{type(e).__name__}: {e}")
 
     # Converter contract: a synthetic hypothesis mimicking NeMo's
-    # `output[0].timestamp['word']` shape must produce the same canonical
-    # word list whisper_lane._to_canonical_words would have produced.
+    # `output[0].timestamp['word']` shape must produce the canonical
+    # word list every speech lane in this project emits.
     try:
         # Plain object with .timestamp attribute (NeMo Hypothesis shape)
         class _FakeHyp:
@@ -653,8 +654,8 @@ def test_parakeet_fallback(R: Results, tmp: Path) -> None:
             timestamp = {
                 "word": [
                     # Contiguous pair -> NO spacing entry between them.
-                    # (Converter mirrors whisper_lane: any positive gap
-                    # emits a spacing, so we keep these flush on purpose.)
+                    # The converter contract: any positive gap emits a
+                    # spacing, so we keep these flush on purpose.
                     {"word": "Hello",  "start": 1.0,  "end": 1.4},
                     {"word": "world.", "start": 1.4,  "end": 2.0},
                     # 3-second silence gap -> exactly one spacing entry expected
@@ -672,7 +673,7 @@ def test_parakeet_fallback(R: Results, tmp: Path) -> None:
         assert len(spacing_entries) == 1, \
             f"expected 1 spacing (3s gap), got {len(spacing_entries)}"
 
-        # Field-shape check matches whisper_lane._to_canonical_words output.
+        # Field-shape check — canonical schema shared across speech lanes.
         for w in word_entries:
             assert "text" in w and "start" in w and "end" in w
             assert "speaker_id" in w and w["speaker_id"] is None
@@ -699,61 +700,18 @@ def test_parakeet_fallback(R: Results, tmp: Path) -> None:
     except Exception as e:
         R.fail("converter empty hyp", f"{type(e).__name__}: {e}")
 
-    # Blocked-exception classifier — verify it correctly identifies the
-    # exception families that mean "HF is firewalled" without false-
-    # positiving on real bugs (CUDA OOM, missing file, etc.).
+    # Diarize module contract — load_hf_token must be importable and
+    # must not raise even when no .env / HF_TOKEN is present.
     try:
-        from whisper_lane import _is_blocked_exception
-
-        # Network errors → must be classified as blocked
-        assert _is_blocked_exception(ConnectionError("connection refused"))
-        assert _is_blocked_exception(TimeoutError("timed out"))
-        assert _is_blocked_exception(
-            OSError("We couldn't connect to 'https://huggingface.co'")
-        )
-        assert _is_blocked_exception(OSError("HTTPError 407 Proxy Auth"))
-        R.ok("blocked classifier: true positives")
-
-        # Real bugs → must NOT be classified as blocked (else we'd
-        # silently downgrade users to Parakeet on a CUDA OOM, and
-        # they'd never know their GPU is broken).
-        assert not _is_blocked_exception(ValueError("bad shape"))
-        assert not _is_blocked_exception(
-            RuntimeError("CUDA out of memory")
-        )
-        assert not _is_blocked_exception(
-            OSError("[Errno 2] No such file or directory: 'foo.wav'")
-        )
-        R.ok("blocked classifier: rejects unrelated errors")
-    except Exception as e:
-        traceback.print_exc()
-        R.fail("blocked classifier", f"{type(e).__name__}: {e}")
-
-    # Sentinel write / read / clear contract — uses a tmp path override
-    # to avoid touching the user's real ~/.video-use-premiere/.
-    try:
-        import whisper_lane as wl
-
-        # Redirect the sentinel to our tmp dir for the duration of the
-        # test. monkeypatching a module-level constant is a standard
-        # Python testing idiom; we restore the original after.
-        original_sentinel = wl.BLOCKED_SENTINEL
-        try:
-            wl.BLOCKED_SENTINEL = tmp / "whisper_blocked_test"
-            assert not wl._whisper_blocked_recently()
-            R.ok("sentinel: absent -> not blocked")
-
-            wl._mark_whisper_blocked("test reason: synthetic")
-            assert wl.BLOCKED_SENTINEL.exists()
-            assert wl._whisper_blocked_recently()
-            R.ok("sentinel: write + recent detection")
-
-            wl._clear_whisper_blocked()
-            assert not wl.BLOCKED_SENTINEL.exists()
-            assert not wl._whisper_blocked_recently()
-            R.ok("sentinel: clear")
-        finally:
-            wl.BLOCKED_SENTINEL = original_sentinel
+        from diarize import load_hf_token, diarize_and_assign
+        # Both should be callable; we don't actually run diarize_and_assign
+        # here (it would pull in pyannote.audio + a 600 MB model).
+        assert callable(load_hf_token)
+        assert callable(diarize_and_assign)
+        # load_hf_token returns None | str. Either is fine.
+        tok = load_hf_token()
+        assert tok is None or isinstance(tok, str)
+        R.ok("diarize module: load_hf_token + diarize_and_assign exposed")
     except Exception as e:
         traceback.print_exc()
         R.fail("sentinel lifecycle", f"{type(e).__name__}: {e}")

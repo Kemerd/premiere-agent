@@ -11,8 +11,7 @@ Approximate steady-state model footprints with conservative settings:
   - parakeet-tdt-0.6b-v2 ONNX, fp16, 4-session pool: ~6.4 GB peak
   - parakeet-tdt-0.6b-v2 ONNX, fp16, 8-session pool: ~12.8 GB peak
   - parakeet-tdt-0.6b-v2 ONNX, int8, 4-session pool: ~3.2 GB peak
-  - whisper-large-v3-turbo HF, fp16, batch=16:      ~26-30 GB peak (HF #27834)
-  - parakeet-tdt-0.6b NeMo torch, fp16:             ~3-4 GB
+  - parakeet-tdt-0.6b NeMo torch, fp16 (fallback):  ~3-4 GB
 
   ── Other lanes ──
   - CLAP audio lane (Xenova/clap-htsat-unfused, ONNX):     ~1.5 GB peak
@@ -27,7 +26,7 @@ its pool size to fit available VRAM.
 
 Parallel-mode opt-in viability:
 the audio lane is back to a small CLAP encoder (~1.5 GB) so PARALLEL_3
-(whisper + audio + visual) is viable again on any 8 GB+ card —
+(speech + audio + visual) is viable again on any 8 GB+ card —
 Parakeet-pool ~6 GB + CLAP ~1.5 GB + Florence ~2.5 GB easily fits on a
 12 GB card with headroom. The 8 GB / 4 GB / 2 GB thresholds in
 `pick_schedule` are unchanged. The default schedule is still SEQUENTIAL
@@ -63,7 +62,7 @@ class Schedule(enum.Enum):
     """
 
     PARALLEL_3 = "parallel"        # all three lanes concurrent
-    PARALLEL_2_SEQ_1 = "mixed"     # whisper || audio, then florence solo
+    PARALLEL_2_SEQ_1 = "mixed"     # speech || audio, then florence solo
     SEQUENTIAL = "sequential"      # one lane at a time, GPU
     CPU_FALLBACK = "cpu"           # no CUDA — int8 speech, CLAP CPU EP, Florence CPU
 
@@ -180,7 +179,7 @@ _SEQUENTIAL_MIN_GB = 2.0
 # Why: real-world testing on a Blackwell RTX 5090 (32 GB) showed that
 # even with comfortable VRAM headroom, multi-process CUDA on a single
 # GPU produces hard-to-diagnose OOMs and context corruption when three
-# heavy ML lanes (Whisper, CLAP, Florence-2) load and infer concurrently.
+# heavy ML lanes (Parakeet ONNX pool, CLAP, Florence-2) load and infer concurrently.
 # Each lane is its own subprocess with its own CUDA context; the
 # driver-level allocator fragments badly across contexts, and one lane's
 # transient inference spike can starve another's resident weights
@@ -205,7 +204,7 @@ _SEQUENTIAL_MIN_GB = 2.0
 # Activate via:
 #
 #    --force-schedule parallel        (CLI flag, single run)
-#    --force-schedule mixed           (whisper||audio then florence solo)
+#    --force-schedule mixed           (speech||audio then florence solo)
 #    VIDEO_USE_PARALLEL_LANES=1       (env var, persists across runs)
 #
 # When opt-in is set, we still apply the historical VRAM-driven tier
@@ -252,7 +251,8 @@ def pick_schedule(info: GpuInfo) -> Schedule:
         # we won't run parallel under the 4 GB threshold.
 
     # Default path: sequential on any GPU with enough VRAM for the
-    # smallest single lane (Whisper-large-v3 fp16 weights ~3 GB).
+    # smallest single lane (Parakeet 1-session ~1.6 GB or Florence-2
+    # ~2.5 GB; we keep the historical 3 GB lower bound for headroom).
     if info.free_gb >= _SEQUENTIAL_MIN_GB:
         return Schedule.SEQUENTIAL
     return Schedule.CPU_FALLBACK

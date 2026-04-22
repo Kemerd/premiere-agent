@@ -64,7 +64,7 @@ from pathlib import Path
 # or as a script directly (helpers/ is on sys.path either way).
 from extract_audio import SAMPLE_RATE, extract_audio_for
 from progress import install_lane_prefix, lane_progress
-from wealthy import WHISPER_BATCH, is_wealthy
+from wealthy import SPEECH_BATCH, is_wealthy
 
 # Diarizer lives in `helpers/diarize.py` — single source of truth that
 # operates on the canonical word list and has zero acoustic-model
@@ -76,12 +76,12 @@ from diarize import load_hf_token as _load_hf_token
 
 # ---------------------------------------------------------------------------
 # Defaults — tuned for an RTX 3060+ baseline. Wealthy mode (24 GB+) uses
-# WHISPER_BATCH (currently 32, see helpers/wealthy.py) which Parakeet
-# absorbs comfortably; the RNNT decoder is small relative to
-# Whisper-large-v3-turbo so batch headroom is plentiful. We re-use the
-# same constant so the user's --wealthy flag means the same thing across
-# the fallback chain — Parakeet COULD safely run higher batches, but
-# matching Whisper's number keeps logs / VRAM expectations consistent.
+# SPEECH_BATCH (currently 32, see helpers/wealthy.py) which Parakeet
+# absorbs comfortably; the RNNT decoder is small so batch headroom is
+# plentiful. The user's --wealthy flag means the same thing across the
+# whole speech-lane chain — Parakeet COULD safely run higher batches,
+# but matching the shared knob keeps logs / VRAM expectations
+# consistent across the primary ONNX lane and this NeMo fallback.
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
@@ -574,7 +574,7 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=None,
                     help=f"Inference batch size "
                          f"(default: {DEFAULT_BATCH_SIZE}, "
-                         f"or {WHISPER_BATCH} with --wealthy)")
+                         f"or {SPEECH_BATCH} with --wealthy)")
     ap.add_argument("--wealthy", action="store_true",
                     help="Speed knob for 24GB+ cards. Same model, identical "
                          "outputs, just bigger batches.")
@@ -598,12 +598,12 @@ def main() -> None:
     edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
 
     # Resolve batch size — explicit CLI value wins; otherwise wealthy
-    # mode bumps to WHISPER_BATCH (Parakeet absorbs it easily); else the
+    # mode bumps to SPEECH_BATCH (Parakeet absorbs it easily); else the
     # conservative default that fits on a 3060.
     if args.batch_size is not None:
         batch_size = args.batch_size
     elif is_wealthy(args.wealthy):
-        batch_size = WHISPER_BATCH
+        batch_size = SPEECH_BATCH
     else:
         batch_size = DEFAULT_BATCH_SIZE
 

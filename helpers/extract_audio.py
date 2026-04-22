@@ -1,6 +1,6 @@
 """Extract a 16 kHz mono PCM WAV from a source video, exactly once.
 
-Whisper / Parakeet both want 16 kHz mono PCM, and the CLAP audio lane
+Parakeet wants 16 kHz mono PCM, and the CLAP audio lane
 upsamples the same cache to 48 kHz on the fly. Decoding the source video
 twice is wasteful — a 4K H.265 master can take longer to demux than the
 actual inference. So we extract once, cache the WAV under

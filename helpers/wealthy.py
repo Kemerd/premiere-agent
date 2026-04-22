@@ -7,11 +7,19 @@ bit-for-bit identical to the default tier, just faster.
 
 Per-lane wealthy overrides:
 
-    Whisper :  batch_size 16 →  32
-               (Turbo + word-timestamp DTW. With turbo's 4-layer decoder
-                the cross-attn map cost dropped 8x vs large-v3, so batch
-                32 fits comfortably in 32 GB while staying inside 24 GB
-                if the user runs --wealthy on a 4090 with no other lane.)
+    Speech (Parakeet ONNX) : pool size scales via parakeet_pool_size().
+                Default tier picks 4 sessions on consumer cards, 8 on
+                wealthy / datacenter cards. Pool size dominates
+                throughput here, not a "batch_size" knob — each
+                session runs one clip at a time and the orchestrator
+                fans clips across the pool.
+
+    Speech (Parakeet NeMo) : batch_size 16 → 32 via SPEECH_BATCH.
+                Only consulted by the NeMo torch fallback in
+                `parakeet_lane.py`; the primary ONNX lane does not
+                read this constant. Parakeet's RNNT decoder is small
+                relative to encoder-decoder ASR stacks so batch=32
+                fits comfortably in 24 GB+ envelopes.
 
     Florence:  batch_size 8  →  32   (caption batch)
 
@@ -29,37 +37,18 @@ Per-lane wealthy overrides:
                 cold-start time and ~2x audio-encoder steady-state
                 throughput.)
 
-Whisper sizing rationale:
-    The HF Whisper pipeline with `return_timestamps="word"` runs DTW
-    over the decoder's cross-attention weights — a memory cost that
-    scales LINEARLY with decoder layer count. We default to
-    whisper-large-v3-turbo (4 decoder layers) instead of large-v3
-    (32 decoder layers); that single swap collapses the DTW working
-    set by ~8x at the same batch size for ~equivalent English quality.
-    See https://github.com/huggingface/transformers/issues/27834 for
-    the upstream discussion of the word-timestamp memory profile.
-
-    On turbo + fp16 + word timestamps + sdpa attention:
-        * 24 GB card (4090) wealthy : batch=32 → ~11 GB peak
-        * 32 GB card (5090) wealthy : batch=32 → ~11 GB peak (same number,
-          headroom is for per-video allocator fragmentation across long
-          batches; pushing to 48 occasionally OOMs the 5th video in a
-          24-clip run as fragments accumulate).
-
-    Wall-clock impact: ~2x faster than default tier on the same hardware.
-
 Env var resolution lives here so the orchestrator can set it once and
 every subprocess inherits it without plumbing flags through every call.
 
 Usage:
     from wealthy import (
         is_wealthy,
-        WHISPER_BATCH, FLORENCE_BATCH,
+        SPEECH_BATCH, FLORENCE_BATCH,
         CLAP_WINDOWS_PER_BATCH, CLAP_WINDOWS_PER_BATCH_WEALTHY,
         CLAP_MODEL_TIER_DEFAULT, CLAP_MODEL_TIER_WEALTHY,
     )
 
-    bs = WHISPER_BATCH if is_wealthy(cli_flag) else DEFAULT_BATCH_SIZE
+    bs = SPEECH_BATCH if is_wealthy(cli_flag) else DEFAULT_BATCH_SIZE
 """
 
 from __future__ import annotations
@@ -75,10 +64,13 @@ _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
 # Per-lane wealthy batch knobs. Tuned for a 32 GB Blackwell (RTX 5090)
 # with headroom for the desktop compositor and per-video pipeline reload
-# fragmentation. Whisper sized assuming the turbo model (4 decoder
-# layers, ~8x less DTW cross-attn cost than large-v3) — see the module
-# docstring above. Florence is unchanged because its memory profile
-# is dominated by the vision encoder, not the captioning batch.
+# fragmentation. Florence is unchanged because its memory profile is
+# dominated by the vision encoder, not the captioning batch.
+#
+# Speech (Parakeet) knob:
+#   - SPEECH_BATCH               : NeMo fallback batch size at --wealthy.
+#                                  The primary ONNX lane scales via
+#                                  parakeet_pool_size() instead.
 #
 # CLAP audio lane knobs:
 #   - CLAP_WINDOWS_PER_BATCH     : audio-encoder batch size (default tier)
@@ -90,13 +82,18 @@ _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 # at batch=16 that's 4 audio-encoder forward passes per video, at batch=64
 # it's 1 pass. The batch-size choice is bounded by the encoder's transient
 # activation footprint (~70 MB per window at fp32 for HTSAT) — 64 is well
-# inside a 24 GB envelope even with Whisper + Florence co-resident.
-WHISPER_BATCH = 32
+# inside a 24 GB envelope even with Parakeet + Florence co-resident.
+SPEECH_BATCH = 32
 FLORENCE_BATCH = 32
 CLAP_WINDOWS_PER_BATCH = 16
 CLAP_WINDOWS_PER_BATCH_WEALTHY = 64
 CLAP_MODEL_TIER_DEFAULT = "base"
 CLAP_MODEL_TIER_WEALTHY = "large"
+
+# Backwards-compat alias for in-flight call sites that still import
+# the old name. New code should use SPEECH_BATCH; this can be removed
+# once all references are migrated.
+WHISPER_BATCH = SPEECH_BATCH
 
 
 # ---------------------------------------------------------------------------

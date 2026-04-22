@@ -20,7 +20,7 @@ Public API — both modes share the same shape so call sites are identical:
 
     from progress import lane_progress
 
-    with lane_progress("whisper", total=12, unit="video", desc="speech lane") as bar:
+    with lane_progress("speech", total=12, unit="video", desc="speech lane") as bar:
         for video in videos:
             bar.start_item(video.name)
             ... do work ...
@@ -35,7 +35,7 @@ Public API — both modes share the same shape so call sites are identical:
 
 The structured "line" output is designed to be greppable. Format:
 
-    [PROGRESS lane=whisper status=tick item="footage_03.mp4"
+    [PROGRESS lane=speech status=tick item="footage_03.mp4"
               done=120 total=240 pct=50.0 eta_s=134 elapsed_s=87]
 
 So Claude can `tail -f` it and reason about progress without parsing
@@ -119,7 +119,7 @@ class _BarState:
 class _LineBar:
     """Emits structured status lines on stderr at controlled cadence.
 
-    Designed to play nicely with the orchestrator's `[whisper] ...`
+    Designed to play nicely with the orchestrator's `[speech] ...`
     prefix tagging — every emit is one complete line, no carriage
     returns or cursor games.
     """

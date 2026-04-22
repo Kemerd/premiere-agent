@@ -7,7 +7,7 @@ REM   set TORCH_INDEX=https://download.pytorch.org/whl/cpu
 REM   install.bat
 REM
 REM Default is CUDA 12.1 wheels which match the cuDNN bundled with the
-REM faster-whisper / CTranslate2 wheel matrix as of late 2025.
+REM ONNX Runtime CUDA EP shipped in the onnxruntime-gpu>=1.22 wheel matrix.
 REM ---------------------------------------------------------------------------
 setlocal EnableExtensions EnableDelayedExpansion
 
