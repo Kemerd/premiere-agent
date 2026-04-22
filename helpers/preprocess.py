@@ -47,7 +47,7 @@ from progress import child_env
 from vram import (
     GpuInfo, Schedule, detect_gpu, parse_force_schedule, pick_schedule,
 )
-from wealthy import is_wealthy, propagate_to_env
+from wealthy import FLORENCE_BATCH, is_wealthy, propagate_to_env
 
 
 HELPERS_DIR = Path(__file__).resolve().parent
@@ -539,6 +539,20 @@ def run_preprocess(
         vargs = ["--device", device_arg]
         if force:
             vargs += ["--force"]
+        # ── Wealthy → Florence batch propagation ─────────────────────
+        # Speech (Parakeet pool) and CLAP both read VIDEO_USE_WEALTHY
+        # straight from the env inside their own run_*_lane_batch
+        # entrypoints, so propagate_to_env() above is enough for them.
+        # Florence is the odd one out: visual_lane.run_visual_lane_batch
+        # takes batch_size as an explicit kwarg with a conservative
+        # `DEFAULT_BATCH_SIZE = 8` default, and the wealthy → 32 bump
+        # only happens inside visual_lane.main()'s CLI argparse path —
+        # which we bypass entirely via the -c shim in _run_lane().
+        # Without this branch, --wealthy was silently a no-op for the
+        # visual lane in the orchestrated pipeline (the standalone CLI
+        # path was fine). Forwarding --batch-size here closes the gap.
+        if is_wealthy(wealthy):
+            vargs += ["--batch-size", str(FLORENCE_BATCH)]
         jobs.append(LaneJob("visual", "visual_lane.py", videos, edit_dir, vargs))
 
     if not jobs:
