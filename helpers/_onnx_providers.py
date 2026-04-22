@@ -62,6 +62,155 @@ _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
 
 # ---------------------------------------------------------------------------
+# NVIDIA DLL bootstrap (Windows only)
+#
+# The `tensorrt-cu12-libs` and `nvidia-cudnn-cu12` pip packages ship the
+# native runtime DLLs (nvinfer_10.dll, cudnn64_9.dll, etc.) inside their
+# site-packages folders, but they do NOT register those folders with the
+# OS loader. Result: when `onnxruntime`'s provider bridge calls
+# `LoadLibraryW("onnxruntime_providers_cuda.dll")`, the OS looks for its
+# transitive deps (`cudnn64_9.dll`, `nvinfer_10.dll`) on PATH and the
+# Python-visible DLL search dirs — neither of which contains them — and
+# fails with WinError 126 ("specified module could not be found"). ORT
+# silently falls back to CPU EP, so users get ~20x RTFx instead of the
+# 200-300x the CUDA/TRT EP would have delivered.
+#
+# Two-pronged fix is required, learned the hard way:
+#
+#   1. `os.add_dll_directory()` — covers DLLs the Python interpreter
+#      itself loads. Necessary but not sufficient: ORT's provider
+#      bridge uses `LoadLibraryW` with the default search path which
+#      bypasses DLL directories added via the `AddDllDirectory` API on
+#      some Windows builds (depends on whether the EP DLL is loaded
+#      with `LOAD_LIBRARY_SEARCH_*` flags or default semantics).
+#
+#   2. PATH prepend — guarantees the OS loader sees the directories no
+#      matter how the EP DLL was loaded. The classic workaround that
+#      every Windows-based ORT user eventually rediscovers.
+#
+# Both pip packages need to be visible:
+#   * tensorrt_libs/                 (nvinfer_10.dll + plugin DLLs)
+#   * nvidia/cudnn/bin/              (cudnn64_9.dll + cnn/ops DLLs)
+#
+# We do this at module import time so any caller of `resolve_providers`
+# is guaranteed to get a working EP. Idempotent — repeated import is a
+# no-op via a module-level "done" flag.
+# ---------------------------------------------------------------------------
+
+_NVIDIA_DLL_BOOTSTRAP_DONE = False
+
+
+def _bootstrap_nvidia_dlls() -> None:
+    """Make pip-shipped NVIDIA runtime DLLs visible to the OS loader.
+
+    Without this, ORT's CUDA/TensorRT EPs silently fail to load on
+    Windows installs that rely on the `tensorrt-cu12-libs` and
+    `nvidia-cudnn-cu12` pip wheels (the recommended install path —
+    no system-wide CUDA / cuDNN required).
+
+    Idempotent. Safe to call before or after `import onnxruntime` —
+    ORT only loads the EP-specific DLLs at `InferenceSession()` time,
+    not at module import.
+    """
+    global _NVIDIA_DLL_BOOTSTRAP_DONE
+    if _NVIDIA_DLL_BOOTSTRAP_DONE:
+        return
+
+    # Non-Windows: POSIX dynamic linker uses LD_LIBRARY_PATH /
+    # rpath semantics that the wheels handle correctly via auditwheel.
+    # Nothing for us to do — bail early so we don't pollute env on
+    # Linux/macOS containers where the same code might run.
+    if sys.platform != "win32":
+        _NVIDIA_DLL_BOOTSTRAP_DONE = True
+        return
+
+    # Walk a list of (probe_module, sub_path) candidates. Each probe is
+    # an importable module whose __file__ tells us where pip extracted
+    # the wheel; sub_path is the directory under it where the actual
+    # DLLs live (some wheels nest under bin/, some don't).
+    #
+    # We probe lazily — a missing wheel is not an error here, it just
+    # means that EP won't be available. resolve_providers() handles
+    # the "EP not available" path gracefully by falling through.
+    candidates: list[tuple[str, str]] = [
+        # TensorRT runtime — nvinfer_10.dll lives at the package root.
+        ("tensorrt_libs", ""),
+        # cuDNN — cudnn64_9.dll lives under the bin/ subfolder.
+        ("nvidia.cudnn", "bin"),
+        # CUDA runtime (cudart64_12.dll) — newer ORT builds want this
+        # too for arena allocator init. Some installs get it via the
+        # `nvidia-cuda-runtime-cu12` wheel; others bundle it inside
+        # cuDNN's bin/. Probe both names so we don't miss it.
+        ("nvidia.cuda_runtime", "bin"),
+        ("nvidia.cublas", "bin"),
+    ]
+
+    found_dirs: list[str] = []
+    for mod_name, sub_path in candidates:
+        try:
+            mod = __import__(mod_name, fromlist=["__file__"])
+        except ImportError:
+            # Wheel not installed — skip silently. Each EP that needed
+            # it will fall through to the next tier in resolve_providers.
+            continue
+        mod_file = getattr(mod, "__file__", None)
+        if not mod_file:
+            continue
+        base_dir = os.path.dirname(mod_file)
+        target = os.path.join(base_dir, sub_path) if sub_path else base_dir
+        if os.path.isdir(target):
+            found_dirs.append(target)
+
+    if not found_dirs:
+        # No NVIDIA wheels installed — user is presumably on a machine
+        # with system-wide CUDA / cuDNN, or running CPU-only. Either
+        # way we have nothing to add and resolve_providers() is fine.
+        _NVIDIA_DLL_BOOTSTRAP_DONE = True
+        return
+
+    # Prong 1: prepend to PATH so the OS loader finds the DLLs no
+    # matter which LoadLibrary variant ORT's bridge ends up using.
+    # Prepend (not append) so our DLLs win against any conflicting
+    # system-wide install of an older cuDNN / CUDA.
+    current_path = os.environ.get("PATH", "")
+    new_path_parts = found_dirs + ([current_path] if current_path else [])
+    os.environ["PATH"] = os.pathsep.join(new_path_parts)
+
+    # Prong 2: register with the Python DLL search list. Belt-and-
+    # suspenders — covers the case where ORT loads a DLL via the
+    # `LOAD_LIBRARY_SEARCH_USER_DIRS` flag set, which ignores PATH
+    # entirely and only consults `AddDllDirectory` registrations.
+    for d in found_dirs:
+        try:
+            os.add_dll_directory(d)
+        except (OSError, AttributeError):
+            # add_dll_directory missing on Python <3.8 (we require 3.10
+            # so this won't fire) or the directory already registered.
+            # Either way, the PATH prepend above is the load-bearing
+            # mechanism — the add_dll_directory call is just insurance.
+            pass
+
+    _NVIDIA_DLL_BOOTSTRAP_DONE = True
+    # One-line debug breadcrumb so users grepping for `[providers]` see
+    # what got bound. Kept to a single short line — the EP ladder log
+    # below is the primary signal anyway.
+    print(
+        f"  [providers] bootstrapped NVIDIA DLL dirs: "
+        f"{', '.join(os.path.basename(d) or d for d in found_dirs)}"
+    )
+
+
+# Run the bootstrap at module import time. Every code path into the
+# EP ladder goes through `resolve_providers()` defined below, which is
+# in this same module — so by the time anything constructs an
+# `InferenceSession` the DLL search has already been fixed up. We do
+# this at import (rather than inside `resolve_providers`) because some
+# adapters (notably onnx-asr's) construct a session before they touch
+# our resolver, e.g. for the bundled VAD model.
+_bootstrap_nvidia_dlls()
+
+
+# ---------------------------------------------------------------------------
 # Per-EP option builders.
 #
 # Each builder returns a (name, options-dict) tuple in the exact shape

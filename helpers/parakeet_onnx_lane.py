@@ -240,21 +240,41 @@ def _resolve_model_for_language(
 # ---------------------------------------------------------------------------
 # onnx-asr result → canonical word list
 #
-# onnx_asr's `with_timestamps()` adapter returns a result object whose
-# exact attribute layout has shifted across releases. We handle multiple
-# shapes defensively so we don't break on a minor version bump:
+# onnx_asr ships TWO completely different result shapes depending on
+# which adapters were chained at load time:
 #
-#   * 0.10-0.11: result.timestamps -> list[Segment]
-#                where Segment has .word/.text + .start + .end
-#   * Some adapters: result.tokens -> list[(text, start, end)] tuples
-#   * Some adapters: result.words  -> list of dicts
+#   1) `.with_timestamps()` alone
+#        Returns a single `TimestampedResult` with PARALLEL flat lists:
+#            res.tokens     = [' L', 'et', "'", 's', ' just', ' sh', ...]
+#            res.timestamps = [0.24, 0.32, 0.32, 0.4, 0.72, 1.68, ...]
+#            res.text       = "Let's just shave down ..."
+#        Each `tokens[i]` is a sub-word (BPE) piece — a leading space
+#        marks a NEW WORD, no leading space means continuation. Each
+#        `timestamps[i]` is the START time of that token; END time is
+#        implicit (= next token's start, or audio duration for the
+#        last token). Word-level timing is reconstructed by grouping
+#        adjacent sub-words that share a word boundary.
 #
-# When all attribute probes fail, we fall back to text-only mode (the
-# transcript still gets written, just without word-level timing).
+#   2) `.with_timestamps().with_vad(vad)`
+#        Returns a GENERATOR yielding `SegmentResult` objects:
+#            seg.start = 0.034
+#            seg.end   = 0.862
+#            seg.text  = "Let's just"
+#        Word-level timing is GONE — we only know the segment's
+#        bounding [start, end]. The fallback path approximates word
+#        timing by distributing each segment's text across its
+#        duration proportionally to character count. Lossy, but
+#        unavoidable when the pool is forced to use VAD chunking
+#        (TRT EP requirement).
+#
+# `uses_vad` lets callers tell us up front which shape to expect — we
+# fall back to runtime probes if the flag isn't passed (defensive
+# against any future adapter that returns one shape via the other
+# load path).
 # ---------------------------------------------------------------------------
 
-def _onnx_to_canonical_words(result, *, fallback_text: str = "") -> list[dict]:
-    """Convert an onnx-asr timestamped result to the canonical list.
+def _onnx_to_canonical_words(result, *, uses_vad: bool = False) -> list[dict]:
+    """Convert an onnx-asr result to the canonical word/spacing list.
 
     Output format matches `parakeet_lane._parakeet_to_canonical_words`
     AND `whisper_lane._words_from_chunks` exactly:
@@ -273,125 +293,278 @@ def _onnx_to_canonical_words(result, *, fallback_text: str = "") -> list[dict]:
     whenever there's a gap in the timestamps — Hard Rule 7 padding
     math (in pack_timelines.py) depends on these existing.
     """
+    # ── Path A: VAD-segmented generator ───────────────────────────────
+    # The pool sets uses_vad=True when TRT is at the head of the EP
+    # ladder. We materialise the generator into a list of segments
+    # then approximate per-word timing by splitting each segment's
+    # text on whitespace and distributing the segment's duration
+    # proportionally to character length (so "longer" words eat
+    # more of the segment, which is a decent zero-info prior).
+    if uses_vad or _looks_like_vad_generator(result):
+        return _segments_to_canonical(result)
+
+    # ── Path B: TimestampedResult (parallel tokens + timestamps) ──────
+    tokens = getattr(result, "tokens", None)
+    timestamps = getattr(result, "timestamps", None)
+    if tokens is not None and timestamps is not None:
+        return _tokens_to_canonical(list(tokens), list(timestamps))
+
+    # ── Path C: legacy/dict shapes ────────────────────────────────────
+    # Older onnx-asr versions and any future adapter that returns a
+    # plain dict end up here. Best-effort, never crashes.
+    if isinstance(result, dict):
+        toks = result.get("tokens")
+        ts = result.get("timestamps")
+        if toks is not None and ts is not None:
+            return _tokens_to_canonical(list(toks), list(ts))
+
+    return []
+
+
+def _looks_like_vad_generator(result) -> bool:
+    """Heuristic: is `result` the iterator-of-segments shape?
+
+    Returns True for generator / iterator types AND for plain lists
+    whose first element is a SegmentResult-shaped object (start/end/text
+    but no timestamps attr). Used as a fallback when the caller
+    forgot to pass uses_vad=True.
+    """
+    import types
+    if isinstance(result, types.GeneratorType):
+        return True
+    # Plain list of segments — check first element's shape.
+    if isinstance(result, list) and result:
+        first = result[0]
+        if (
+            hasattr(first, "start")
+            and hasattr(first, "end")
+            and hasattr(first, "text")
+            and not hasattr(first, "timestamps")
+        ):
+            return True
+    return False
+
+
+def _tokens_to_canonical(tokens: list, timestamps: list) -> list[dict]:
+    """Group BPE tokens into words, emitting word + spacing entries.
+
+    Algorithm (single forward pass, O(N) tokens):
+
+        For each token i:
+            * If token starts with ' ' (or i == 0) → it begins a new word.
+              Emit the previous word (if any) with end = current start.
+              Start accumulating the new word's text + remember its start.
+            * Otherwise → it continues the current word.
+              Append text (after stripping the boundary marker if any).
+
+        After the loop:
+            Emit the final word with end = last_start + epsilon
+            (we don't know the true end of the last token; the audio
+            duration would be a better estimate but the caller doesn't
+            always have it here, so we use a small epsilon).
+
+    Spacing entries are inserted between word i and word i+1 whenever
+    word_i.end < word_(i+1).start (which is always, since end == start
+    of next word before the spacing tweak below). Following the
+    convention in whisper_lane: spacing covers the gap exactly so the
+    timeline has zero overlap and no gaps.
+    """
     out: list[dict] = []
-
-    # Probe the result shape. We accept the first one that yields
-    # iterable timestamp entries with start/end/text — order matters,
-    # `.timestamps` is the documented public attribute on current
-    # onnx-asr releases so we try it first.
-    raw_entries = None
-    for attr in ("timestamps", "tokens", "words"):
-        candidate = getattr(result, attr, None)
-        if candidate:
-            raw_entries = candidate
-            break
-
-    # Last-ditch: result might be a dict (old adapter), or a tuple
-    # of (text, segments). Walk the few known shapes.
-    if raw_entries is None and isinstance(result, dict):
-        raw_entries = (
-            result.get("timestamps")
-            or result.get("tokens")
-            or result.get("words")
-        )
-
-    if not raw_entries:
-        # No timestamps available — return empty list. The caller
-        # writes the JSON with text-only and an empty words[] which
-        # downstream code tolerates (the phrase grouper just skips
-        # empty videos).
+    if not tokens or not timestamps:
         return out
 
-    # Walk the entries in order, emitting word + spacing pairs.
-    prev_end: float | None = None
-    for entry in raw_entries:
-        # Each entry can be: a dict, a dataclass, or a 3-tuple
-        # (text, start, end). Handle all three with one helper.
-        text, start, end = _extract_entry_fields(entry)
-        if text is None or start is None or end is None:
+    # We may receive numpy arrays from older adapters; normalise.
+    tokens = [str(t) for t in tokens]
+    try:
+        timestamps = [float(t) for t in timestamps]
+    except (TypeError, ValueError):
+        # Garbage timestamps — bail to text-only.
+        return out
+
+    # ── Pass 1: collapse sub-words into word-level (text, start) pairs ──
+    # We don't know word ends yet — they're filled in pass 2 from the
+    # NEXT word's start (the standard trick used by every TDT decoder
+    # post-processor since the model was published).
+    raw_words: list[tuple[str, float]] = []
+    cur_text = ""
+    cur_start: float | None = None
+
+    for i, tok in enumerate(tokens):
+        # A sub-word starting with ' ' marks a new word boundary in
+        # SentencePiece-style tokenisers (which is what NeMo Parakeet
+        # uses). The very first token also kicks off a word even if
+        # it doesn't have the leading space.
+        starts_word = tok.startswith(" ") or i == 0
+        clean = tok.lstrip(" ") if tok.startswith(" ") else tok
+
+        if starts_word and cur_text:
+            # Flush the in-progress word before starting the next one.
+            raw_words.append((cur_text, cur_start if cur_start is not None else 0.0))
+            cur_text = ""
+            cur_start = None
+
+        if cur_start is None:
+            cur_start = timestamps[i]
+        cur_text += clean
+
+    # Flush the trailing word.
+    if cur_text:
+        raw_words.append((cur_text, cur_start if cur_start is not None else 0.0))
+
+    if not raw_words:
+        return out
+
+    # ── Pass 2: assign each word an end time + emit spacing entries ──
+    # Final word's end is unknown from token timing alone. We use the
+    # last token's start time + a small per-character estimate so the
+    # JSON validates and downstream rendering doesn't barf on a
+    # zero-length word.
+    AVG_CHAR_S = 0.06  # ~16 chars/sec ≈ typical TTS rate at 1x speed
+    LAST_WORD_PAD_S = 0.20  # minimum hold for a single-char trailing word
+
+    for i, (text, start) in enumerate(raw_words):
+        text_stripped = text.strip()
+        if not text_stripped:
             continue
 
-        text = text.strip()
-        if not text:
-            continue
-
-        try:
-            start_f = float(start)
-            end_f = float(end)
-        except (TypeError, ValueError):
-            continue
-
-        # Synthesize a spacing entry covering any gap since the last
-        # word. Mirrors what whisper_lane and parakeet_lane both do —
-        # the phrase grouper uses these to detect long pauses for
-        # cut candidate suggestions.
-        if prev_end is not None and start_f > prev_end:
-            out.append({
-                "type": "spacing",
-                "text": " ",
-                "start": float(prev_end),
-                "end": float(start_f),
-            })
+        if i + 1 < len(raw_words):
+            end = raw_words[i + 1][1]
+            # Guard against zero-length / negative-duration words —
+            # back-to-back tokens with identical timestamps happen on
+            # very fast speech. Give them a tiny minimum hold.
+            if end <= start:
+                end = start + 0.01
+        else:
+            # Final word — no next-word start to anchor against.
+            est = max(LAST_WORD_PAD_S, len(text_stripped) * AVG_CHAR_S)
+            end = start + est
 
         out.append({
             "type": "word",
-            "text": text,
-            "start": start_f,
-            "end": end_f,
-            # Diarizer fills this in later; phrase grouper tolerates None.
+            "text": text_stripped,
+            "start": float(start),
+            "end": float(end),
             "speaker_id": None,
         })
-        prev_end = end_f
+
+    # ── Pass 3: insert spacing entries between non-adjacent words ─────
+    # In the token-based path each word's end is the next word's start
+    # by construction, so spacings are mostly zero-width. We still
+    # emit them where there's a measurable gap, because pack_timelines
+    # uses non-zero spacing as a cut-candidate signal.
+    spaced: list[dict] = []
+    for i, w in enumerate(out):
+        spaced.append(w)
+        if i + 1 < len(out):
+            nxt = out[i + 1]
+            gap = nxt["start"] - w["end"]
+            if gap > 0.0:
+                spaced.append({
+                    "type": "spacing",
+                    "text": " ",
+                    "start": w["end"],
+                    "end": nxt["start"],
+                })
+    return spaced
+
+
+def _segments_to_canonical(result) -> list[dict]:
+    """Distribute each VAD segment's text across its duration.
+
+    Lossy but functional. Used when the pool was forced to enable
+    VAD chunking (TRT EP path). For each segment:
+
+        words = seg.text.split()
+        per_char_s = (seg.end - seg.start) / max(1, len(seg.text.replace(" ", "")))
+        cursor = seg.start
+        for word in words:
+            end = cursor + per_char_s * len(word)
+            emit word(cursor, end)
+            cursor = end (with a tiny inter-word gap as spacing)
+
+    The inter-word distribution is uniform-by-character — a known
+    approximation but it preserves total segment timing exactly,
+    which is what downstream pack_timelines actually needs (it cuts
+    on phrase boundaries, not individual words, in the VAD path).
+    """
+    out: list[dict] = []
+    # Materialise generator into a list — we need to walk twice
+    # (once for inter-segment spacing, once for word emission).
+    try:
+        segments = list(result)
+    except TypeError:
+        # Not iterable — shouldn't happen but be safe.
+        return out
+
+    prev_end: float | None = None
+    for seg in segments:
+        seg_start = float(getattr(seg, "start", 0.0))
+        seg_end = float(getattr(seg, "end", seg_start))
+        seg_text = str(getattr(seg, "text", "") or "").strip()
+        if not seg_text or seg_end <= seg_start:
+            continue
+
+        # Inter-segment gap → emit a spacing entry. Same convention as
+        # the token path: zero-width spacings are skipped.
+        if prev_end is not None and seg_start > prev_end:
+            out.append({
+                "type": "spacing",
+                "text": " ",
+                "start": prev_end,
+                "end": seg_start,
+            })
+
+        words = seg_text.split()
+        if not words:
+            prev_end = seg_end
+            continue
+
+        # Total non-space chars drives the per-char duration. Adding
+        # 1 to the divisor avoids div-by-zero on a one-char segment.
+        total_chars = sum(len(w) for w in words)
+        seg_dur = seg_end - seg_start
+        per_char = seg_dur / max(1, total_chars)
+
+        cursor = seg_start
+        for wi, w in enumerate(words):
+            wend = cursor + per_char * len(w)
+            # Clamp the last word to the segment end exactly so we
+            # don't drift due to floating-point accumulation.
+            if wi == len(words) - 1:
+                wend = seg_end
+            out.append({
+                "type": "word",
+                "text": w,
+                "start": float(cursor),
+                "end": float(wend),
+                "speaker_id": None,
+            })
+            cursor = wend
+
+        prev_end = seg_end
 
     return out
 
 
-def _extract_entry_fields(entry) -> tuple[str | None, float | None, float | None]:
-    """Pull (text, start, end) from a single timestamp entry.
-
-    Defensive against the four shapes onnx-asr has shipped across
-    minor versions:
-        * dataclass with .text/.word + .start + .end
-        * dict with the same keys (or "start_time"/"end_time")
-        * 3-tuple (text, start, end)
-        * 4-tuple (text, start, end, score)  -- score ignored
-    """
-    # Tuple/list shape — common when adapters return raw decoder output.
-    if isinstance(entry, (tuple, list)):
-        if len(entry) >= 3:
-            return str(entry[0]), entry[1], entry[2]
-        return None, None, None
-
-    # Object/dict shape — pull each field by trying multiple names.
-    def _get(obj, *names):
-        for n in names:
-            v = getattr(obj, n, None) if not isinstance(obj, dict) else obj.get(n)
-            if v is not None:
-                return v
-        return None
-
-    text = _get(entry, "text", "word", "token")
-    start = _get(entry, "start", "start_time", "begin")
-    end = _get(entry, "end", "end_time", "stop")
-    return (str(text) if text is not None else None, start, end)
-
-
-def _result_text(result) -> str:
+def _result_text(result, *, uses_vad: bool = False) -> str:
     """Pull the plain-text transcript out of an onnx-asr result.
 
-    Defensive against attribute name drift; falls back to joining the
-    timestamp entries' text if `.text` is missing entirely.
+    For VAD generators the result is consumed once (by
+    `_onnx_to_canonical_words`); we reconstruct text from the
+    canonical word list to keep both code paths consistent.
     """
+    if uses_vad or _looks_like_vad_generator(result):
+        # The canonical extractor already walked the segments — we
+        # rebuild text from words. Only safe if called AFTER the
+        # canonical walk, but the caller in _process_one does
+        # exactly that, so this stays consistent.
+        return ""  # reconstructed by caller from the word list
     txt = getattr(result, "text", None)
     if txt is None and isinstance(result, dict):
         txt = result.get("text") or result.get("transcript")
     if txt:
         return str(txt).strip()
-
-    # Fallback — stitch words from the timestamp list. Less ideal
-    # (we lose punctuation reconstruction) but keeps the JSON valid.
-    canon = _onnx_to_canonical_words(result)
-    return " ".join(w["text"] for w in canon if w.get("type") == "word")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +609,7 @@ def _process_one(
 
     # Pull the 16 kHz mono WAV out of the source video. extract_audio
     # itself caches under <edit>/audio_16k/<stem>.wav so this is a
-    # no-op when running side-by-side with the audio (PANNs) lane.
+    # no-op when running side-by-side with the audio (CLAP) lane.
     wav_path = extract_audio_for(video_path, edit_dir, verbose=True)
 
     t0 = time.time()
@@ -459,8 +632,19 @@ def _process_one(
     if isinstance(result, BaseException):
         raise result
 
-    words = _onnx_to_canonical_words(result)
-    text = _result_text(result)
+    # uses_vad tells the extractor whether to expect a parallel
+    # tokens+timestamps result (False) or a generator of segments
+    # (True). The pool is the source of truth — we always pass its
+    # opinion through rather than re-probing the result shape.
+    uses_vad = getattr(pool, "uses_vad", False)
+    words = _onnx_to_canonical_words(result, uses_vad=uses_vad)
+    if uses_vad:
+        # The VAD-segmented result is a single-pass generator that
+        # the canonical extractor just consumed. Rebuild plain text
+        # from the canonical word list so both code paths agree.
+        text = " ".join(w["text"] for w in words if w.get("type") == "word")
+    else:
+        text = _result_text(result, uses_vad=uses_vad)
 
     # ── Optional diarization ──────────────────────────────────────────
     # We re-use whisper_lane's diarizer verbatim. It reads the WAV,
@@ -846,8 +1030,12 @@ def _smoke_test(
             return 1
 
         result = results[0]
-        words = _onnx_to_canonical_words(result)
-        text = _result_text(result)
+        uses_vad = getattr(pool, "uses_vad", False)
+        words = _onnx_to_canonical_words(result, uses_vad=uses_vad)
+        if uses_vad:
+            text = " ".join(w["text"] for w in words if w.get("type") == "word")
+        else:
+            text = _result_text(result, uses_vad=uses_vad)
         n_words = sum(1 for w in words if w.get("type") == "word")
         rtfx = (audio_dur / wall) if wall > 0 else 0.0
 

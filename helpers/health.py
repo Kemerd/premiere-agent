@@ -149,8 +149,8 @@ ADVICE_RULES: list[tuple[str, str]] = [
      "network issue, your proxy may also block NGC. Manual install: "
      "`pip install -e .[parakeet]`."),
     ("import audio_lane",
-     "Audio lane import failed — install PANNs: "
-     "`pip install -e \".[preprocess]\"` (pulls panns-inference + torchlibrosa)."),
+     "Audio lane import failed — install CLAP deps: "
+     "`pip install -e \".[preprocess]\"` (pulls onnxruntime-gpu + transformers + soxr)."),
     ("import visual_lane",
      "Visual lane import failed — install Florence-2 deps: "
      "`pip install -e \".[preprocess]\"` (transformers, einops, timm)."),

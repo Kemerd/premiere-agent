@@ -1,11 +1,12 @@
 """Extract a 16 kHz mono PCM WAV from a source video, exactly once.
 
-Whisper and PANNs both want 16 kHz mono PCM. Decoding the source video twice
-is wasteful — a 4K H.265 master can take longer to demux than the actual
-inference. So we extract once, cache the WAV under <edit>/audio_16k/, and
-both lanes read the same file.
+Whisper / Parakeet both want 16 kHz mono PCM, and the CLAP audio lane
+upsamples the same cache to 48 kHz on the fly. Decoding the source video
+twice is wasteful — a 4K H.265 master can take longer to demux than the
+actual inference. So we extract once, cache the WAV under
+<edit>/audio_16k/, and every audio-consuming lane reads the same file.
 
-Output spec is the IFW / PANNs canonical:
+Output spec is the canonical ASR-friendly format:
 
     -ar 16000      sample rate
     -ac 1          mono

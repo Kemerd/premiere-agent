@@ -14,9 +14,20 @@ Per-lane wealthy overrides:
                 if the user runs --wealthy on a 4090 with no other lane.)
 
     Florence:  batch_size 8  →  32   (caption batch)
-    PANNs   :  windows-per-call 1 → 64
-               (genuine speedup — CNN14 is fast per call but per-call
-                overhead dominates; batching collapses it.)
+
+    CLAP audio lane :  windows_per_batch 16 → 64   (audio encoder batch)
+               + model tier "base" → "large" (Xenova/larger_clap_general)
+               (CLAP's audio encoder is small (~150 MB base / ~600 MB
+                large) so batch size scales linearly with VRAM until
+                the encoder's intermediate activations crowd out other
+                lanes. 64 windows × 10s @ 48kHz = ~30 MB raw audio per
+                batch, comfortably inside any 24 GB+ card. The larger
+                CLAP variant (`larger_clap_general`) sharpens fine-grain
+                discrimination on environmental classes that the base
+                HTSAT-unfused encoder confuses (e.g. crow vs raven,
+                hammer vs mallet) at the cost of ~4x text-encoding
+                cold-start time and ~2x audio-encoder steady-state
+                throughput.)
 
 Whisper sizing rationale:
     The HF Whisper pipeline with `return_timestamps="word"` runs DTW
@@ -41,7 +52,12 @@ Env var resolution lives here so the orchestrator can set it once and
 every subprocess inherits it without plumbing flags through every call.
 
 Usage:
-    from wealthy import is_wealthy, WHISPER_BATCH, FLORENCE_BATCH, PANNS_WINDOWS_PER_BATCH
+    from wealthy import (
+        is_wealthy,
+        WHISPER_BATCH, FLORENCE_BATCH,
+        CLAP_WINDOWS_PER_BATCH, CLAP_WINDOWS_PER_BATCH_WEALTHY,
+        CLAP_MODEL_TIER_DEFAULT, CLAP_MODEL_TIER_WEALTHY,
+    )
 
     bs = WHISPER_BATCH if is_wealthy(cli_flag) else DEFAULT_BATCH_SIZE
 """
@@ -61,11 +77,26 @@ _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 # with headroom for the desktop compositor and per-video pipeline reload
 # fragmentation. Whisper sized assuming the turbo model (4 decoder
 # layers, ~8x less DTW cross-attn cost than large-v3) — see the module
-# docstring above. Florence and PANNs are unchanged because their memory
-# profile didn't shift.
+# docstring above. Florence is unchanged because its memory profile
+# is dominated by the vision encoder, not the captioning batch.
+#
+# CLAP audio lane knobs:
+#   - CLAP_WINDOWS_PER_BATCH     : audio-encoder batch size (default tier)
+#   - CLAP_WINDOWS_PER_BATCH_WEALTHY: same, larger when --wealthy
+#   - CLAP_MODEL_TIER_DEFAULT    : "base" (Xenova/clap-htsat-unfused, ~150 MB)
+#   - CLAP_MODEL_TIER_WEALTHY    : "large" (Xenova/larger_clap_general, ~600 MB)
+#
+# Sliding 10s windows at hop 5s over a 5-minute video produce ~60 windows;
+# at batch=16 that's 4 audio-encoder forward passes per video, at batch=64
+# it's 1 pass. The batch-size choice is bounded by the encoder's transient
+# activation footprint (~70 MB per window at fp32 for HTSAT) — 64 is well
+# inside a 24 GB envelope even with Whisper + Florence co-resident.
 WHISPER_BATCH = 32
 FLORENCE_BATCH = 32
-PANNS_WINDOWS_PER_BATCH = 64
+CLAP_WINDOWS_PER_BATCH = 16
+CLAP_WINDOWS_PER_BATCH_WEALTHY = 64
+CLAP_MODEL_TIER_DEFAULT = "base"
+CLAP_MODEL_TIER_WEALTHY = "large"
 
 
 # ---------------------------------------------------------------------------

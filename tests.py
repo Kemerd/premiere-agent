@@ -352,7 +352,9 @@ def test_wealthy(R: Results) -> None:
     try:
         from wealthy import (
             is_wealthy, propagate_to_env,
-            WHISPER_BATCH, FLORENCE_BATCH, PANNS_WINDOWS_PER_BATCH,
+            WHISPER_BATCH, FLORENCE_BATCH,
+            CLAP_WINDOWS_PER_BATCH, CLAP_WINDOWS_PER_BATCH_WEALTHY,
+            CLAP_MODEL_TIER_DEFAULT, CLAP_MODEL_TIER_WEALTHY,
         )
 
         # Save & isolate the env so we don't pollute the rest of the suite.
@@ -367,8 +369,10 @@ def test_wealthy(R: Results) -> None:
             R.ok("wealthy CLI flag → env propagation")
 
             print(
-                f"  wealthy batches:  whisper={WHISPER_BATCH}  "
-                f"florence={FLORENCE_BATCH}  panns={PANNS_WINDOWS_PER_BATCH} windows"
+                f"  wealthy knobs:    whisper={WHISPER_BATCH}  "
+                f"florence={FLORENCE_BATCH}  "
+                f"clap={CLAP_WINDOWS_PER_BATCH}->{CLAP_WINDOWS_PER_BATCH_WEALTHY} windows/batch  "
+                f"clap_tier={CLAP_MODEL_TIER_DEFAULT}->{CLAP_MODEL_TIER_WEALTHY}"
             )
             R.ok("wealthy batch constants exposed")
         finally:
@@ -427,15 +431,25 @@ def test_pack_timelines(R: Results, tmp: Path) -> None:
             ],
         }), encoding="utf-8")
 
-        # Synthetic PANNs output — flat one-event-per-label shape (matches
-        # the real `audio_lane.py` emit format, see lines 24-26 of that file).
+        # Synthetic CLAP audio_lane output — (label, score) events per
+        # sliding window. Matches the canonical shape produced by the
+        # real `helpers/audio_lane.py` (see its module docstring + the
+        # _process_one writer). Two events at different start times so
+        # the renderer exercises the per-range grouping path.
         (edit / "audio_tags" / "C0001.json").write_text(json.dumps({
             "source_path": "/tmp/C0001.mp4",
+            "model": "Xenova/clap-htsat-unfused",
+            "vocab_sha": "deadbeefcafef00d",
+            "vocab_size": 247,
+            "window_s": 10.0,
+            "hop_s": 5.0,
+            "threshold": 0.10,
+            "top_k": 5,
             "duration": 10.0,
             "events": [
-                {"start": 3.0, "end": 4.5, "label": "drill",      "score": 0.87},
-                {"start": 3.0, "end": 4.5, "label": "power_tool", "score": 0.71},
-                {"start": 7.0, "end": 7.5, "label": "laughter",   "score": 0.55},
+                {"start": 0.0, "end": 10.0, "label": "cordless drill",  "score": 0.42},
+                {"start": 0.0, "end": 10.0, "label": "drill press",     "score": 0.31},
+                {"start": 5.0, "end": 10.0, "label": "laughter",        "score": 0.27},
             ],
         }), encoding="utf-8")
 
@@ -794,9 +808,9 @@ def test_heavy(R: Results, tmp: Path) -> None:
     _status(
         "HEAVY mode is loading three real models. First run downloads:"
     )
-    print("           - openai/whisper-large-v3-turbo (~1.6 GB)")
-    print("           - microsoft/Florence-2-base     (~1.0 GB)")
-    print("           - PANNs CNN14 (panns-inference) (~340 MB)")
+    print("           - openai/whisper-large-v3-turbo  (~1.6 GB)")
+    print("           - florence-community/Florence-2-base (~1.0 GB)")
+    print("           - Xenova/clap-htsat-unfused      (~150 MB ONNX)")
     print("           Subsequent runs hit the HF cache and start in ~5s each.")
     print("           HF transformers prints its own download bars to stderr.")
 
@@ -842,22 +856,45 @@ def test_heavy(R: Results, tmp: Path) -> None:
         traceback.print_exc()
         R.fail("whisper lane", f"{type(e).__name__}: {e}")
 
-    # ── PANNs ─────────────────────────────────────────────────────────
+    # ── CLAP audio lane ───────────────────────────────────────────────
+    # CLAP is a small dual-encoder model (~150 MB ONNX for the base
+    # tier) — first run downloads the audio + text ONNX graphs and the
+    # processor configs, both quantized. The 2s synthetic sine clip
+    # gets zero-padded to one full 10s window inside the lane so this
+    # exercises the slide_and_score + text-embed cache + per-window
+    # scoring path end-to-end against the baked-in default vocab.
     try:
-        _status("Audio lane: importing audio_lane + loading PANNs CNN14 ...")
+        _status("Audio lane: importing audio_lane + loading CLAP HTSAT ...")
         from audio_lane import run_audio_lane_batch
         t0 = time.monotonic()
         out = run_audio_lane_batch(
             [clip], edit,
-            threshold=0.30, top_k=5, windows_per_batch=64,
+            # Pin the base tier so the smoke test doesn't accidentally
+            # download the larger ~600 MB variant on a wealthy machine.
+            model_tier="base",
+            # Keep the per-batch window count tiny so the test runs
+            # cleanly on a 4 GB card too.
+            windows_per_batch=4,
             force=False,
         )
         _status(f"Audio lane: done in {time.monotonic()-t0:.1f}s")
         if out and out[0].exists():
             data = json.loads(out[0].read_text(encoding="utf-8"))
-            n_events = len(data.get("events", []))
-            print(f"  panns:     {n_events} event window(s) (440 Hz sine — likely 'tone' / 'sine_wave')")
-            R.ok("audio lane ran")
+            model = data.get("model", "")
+            events = data.get("events") or []
+            top_label = events[0].get("label") if events else "(none above threshold)"
+            top_score = events[0].get("score") if events else None
+            print(
+                f"  clap:      model={model}  events={len(events)} on a 2s sine; "
+                f"top: {top_label!r} score={top_score}"
+            )
+            if model != "Xenova/clap-htsat-unfused":
+                R.fail(
+                    "audio lane model id",
+                    f"expected 'Xenova/clap-htsat-unfused', got {model!r}",
+                )
+            else:
+                R.ok("audio lane ran (CLAP)")
         else:
             R.fail("audio lane", "no output file")
     except Exception as e:

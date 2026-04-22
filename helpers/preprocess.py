@@ -17,8 +17,8 @@ that:
     through unchanged, so a downstream Claude / TUI / CI dashboard can
     aggregate them across all three lanes
 
-The orchestrator itself does NOT import torch / transformers / panns —
-those are heavy and we want `python helpers/preprocess.py --help` to
+The orchestrator itself does NOT import torch / transformers / onnxruntime
+— those are heavy and we want `python helpers/preprocess.py --help` to
 return in <100ms. All ML is in child processes.
 
 CLI:
@@ -71,11 +71,13 @@ PYTHON = sys.executable
 # settle its initial weight allocation before the next one fires.
 #
 # Why 8 seconds:
-#   - Whisper-large-v3 weight load: ~3-5s on a fast NVMe + cu128 wheel
-#   - Florence-2-base   weight load: ~2-3s
-#   - PANNs CNN14       weight load: ~1-2s
-#   - 8s gives comfortable headroom for the slowest lane to commit its
-#     weights to VRAM before the next allocator hits the device
+#   - Whisper-large-v3       weight load: ~3-5s on a fast NVMe + cu128 wheel
+#   - Parakeet ONNX pool     weight load: ~2-4s for 4-8 sessions
+#   - Florence-2-base        weight load: ~2-3s
+#   - CLAP ONNX (audio+text) weight load: ~1-2s (small graphs, fast)
+#   - 8s gives comfortable headroom for any single lane to commit its
+#     weights before the next allocator hits the device, with margin
+#     for cold model downloads on the first run of each lane.
 #   - Cost on the wall clock: 2 gaps × 8s = 16s extra at the start of a
 #     3-15 minute preprocess run. Negligible vs. the OOM-and-retry path.
 #
@@ -289,7 +291,9 @@ def _shared_audio_extraction(videos: list[Path], edit_dir: Path) -> None:
     Doing this up front (instead of inside whisper_lane / audio_lane)
     means we get a clean progress bar over the ffmpeg work AND we avoid
     a race when whisper + audio lanes run in parallel and both try to
-    extract the same WAV at the same time.
+    extract the same WAV at the same time. The CLAP audio lane reads
+    the same 16kHz mono PCM cache and resamples to 48kHz on the fly
+    (CLAP's native rate) — no second WAV cache on disk.
     """
     from progress import lane_progress
 
@@ -389,9 +393,15 @@ def _dispatch(jobs: list[LaneJob], schedule: Schedule) -> list[LaneJob]:
         _spawn_parallel(present)
 
     elif schedule == Schedule.PARALLEL_2_SEQ_1:
-        # Whisper + PANNs share the audio WAV and have a small combined
-        # footprint (~3 GB) — pair them. Florence is the memory hog so
-        # it gets the GPU to itself.
+        # Pairing: Whisper + the small CLAP audio lane share the WAV
+        # cache with a tiny combined footprint (~6 GB Parakeet pool +
+        # ~1.5 GB CLAP ≈ 7.5 GB), while Florence (~2.5 GB) gets the
+        # GPU solo afterward. Comfortably fits an 8 GB card. The
+        # default SEQUENTIAL schedule is still recommended on
+        # single-GPU rigs because of the multi-context CUDA allocator
+        # fragmentation issue documented in vram.py — but PARALLEL_2
+        # is now genuinely viable again on consumer hardware after
+        # the CLAP migration.
         pair = [j for j in (whisper, audio) if j is not None]
         if pair:
             print(f"[orchestrator] PARALLEL_2: dispatching {[j.name for j in pair]}")

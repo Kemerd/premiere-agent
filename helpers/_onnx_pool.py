@@ -175,54 +175,61 @@ class OnnxSessionPool:
         # logging happens inside resolve_providers on first call.
         providers = resolve_providers(prefer_tensorrt=prefer_tensorrt)
 
-        # ── Build the N sessions ──────────────────────────────────────
-        # We chain TWO adapters at load time, in order:
+        # ── Decide whether we need VAD chunking ──────────────────────
+        # VAD is a TRT-only requirement. Quick recap:
         #
-        #   .with_timestamps()  ─ enables word-level timestamp emission
-        #                         from the TDT decoder. Returns a different
-        #                         adapter type than bare load_model(), so
-        #                         we lock it in early and worker code can
-        #                         just call .recognize() agnostically.
+        #   * The TensorRT EP compiles the Parakeet encoder with a
+        #     fixed optimization profile (typically ≤30s @ 16 kHz =
+        #     480000 samples). Long audio violates the profile and
+        #     ORT-TRT raises EP_FAIL at Run() time.
+        #   * silero VAD splits the waveform into speech-bounded
+        #     windows that always fit the profile.
         #
-        #   .with_vad()         ─ wraps recognize() with silero VAD-based
-        #                         chunking. THIS IS LOAD-BEARING for the
-        #                         TensorRT EP: TRT compiles the encoder
-        #                         with a fixed optimization profile shape
-        #                         range (typically up to ~30s of audio at
-        #                         16 kHz, i.e. 480000 samples). Audio
-        #                         longer than that violates the profile
-        #                         and ORT-TRT raises EP_FAIL at runtime.
-        #                         silero VAD splits the waveform into
-        #                         speech-bounded windows (≤30s by default)
-        #                         that always satisfy the profile.
-        #                         For CUDA / CPU EPs (dynamic shapes) it
-        #                         is a near no-op for short audio and a
-        #                         pure win for long-form content (we skip
-        #                         re-encoding silence).
+        # The catch: onnx-asr's `.with_vad()` adapter chains AFTER
+        # `.with_timestamps()` and CHANGES the result shape. Instead
+        # of a single `TimestampedResult` (with token + timestamp
+        # parallel lists for true word-level timing), it returns a
+        # generator of `SegmentResult` objects that ONLY carry
+        # segment-level (start, end, text). All word timing is lost —
+        # which is unacceptable for the editor's cut/phrase logic
+        # downstream.
+        #
+        # Therefore: only enable VAD when TRT is actually at the head
+        # of the ladder. CUDA / CPU EPs handle dynamic shapes natively
+        # and prefer the richer per-token timing path. This was the
+        # silent root cause of the long-standing "transcripts come
+        # back empty" bug — every CUDA-EP run was being fed through
+        # the VAD generator path, then the canonical extractor (which
+        # walks `result.timestamps`) saw `None` because the result
+        # was a generator and dropped everything.
+        head_provider = providers[0] if providers else None
+        head_name = (
+            head_provider[0] if isinstance(head_provider, tuple)
+            else head_provider
+        )
+        use_vad = head_name == "TensorrtExecutionProvider"
+        self._uses_vad = use_vad  # exposed for the lane's extractor
+
         print(
             f"  [pool] loading {target_n} session(s) of "
-            f"{model_id} (quant={quantization or 'fp16'})"
+            f"{model_id} (quant={quantization or 'fp16'}, "
+            f"vad={'on' if use_vad else 'off'})"
         )
 
-        # Pre-load a single shared silero VAD instance. onnx-asr's
-        # `.with_vad(vad)` adapter requires a concrete VAD model object
-        # (it doesn't lazily fetch one). We share the same instance
-        # across every session in the pool because:
-        #
-        #   • silero VAD is tiny (~2 MB ONNX, runs on CPU by default).
-        #   • Its inference is stateless w.r.t. the calling thread —
-        #     no internal mutable buffers across recognize() calls.
-        #   • Sharing avoids N copies of the VAD weights in RAM and
-        #     N redundant HF Hub round-trips at startup.
-        #
-        # If the install is missing the silero VAD asset, `load_vad`
-        # raises clearly enough that we don't try to mask it.
-        vad = onnx_asr.load_vad("silero")
+        # Pre-load a single shared silero VAD instance — only when we
+        # actually need it. Loading the VAD adds ~2 MB and one HF
+        # round-trip; skipping it on CUDA/CPU runs is a small but
+        # honest startup-time win.
+        vad = onnx_asr.load_vad("silero") if use_vad else None
 
         t0 = time.time()
         self._sessions: list[Any] = []
         for i in range(target_n):
             try:
+                # Build the recognition pipeline. `.with_timestamps()`
+                # is always on — it's how we get word-level data
+                # (or segment-level when VAD is also on). `.with_vad()`
+                # is conditional per the comment block above.
                 model = (
                     onnx_asr.load_model(
                         model_id,
@@ -230,8 +237,9 @@ class OnnxSessionPool:
                         providers=providers,
                     )
                     .with_timestamps()
-                    .with_vad(vad)
                 )
+                if vad is not None:
+                    model = model.with_vad(vad)
             except Exception as e:
                 # If we got at least one session built, run with what
                 # we have rather than failing the whole pool — partial
@@ -396,6 +404,18 @@ class OnnxSessionPool:
     def model_id(self) -> str:
         """The model identifier this pool was built for."""
         return self._model_id
+
+    @property
+    def uses_vad(self) -> bool:
+        """True if the pool wraps recognize() in silero VAD chunking.
+
+        Toggled on automatically when the TensorRT EP is at the head
+        of the ladder (TRT needs fixed-shape inputs). The lane's
+        result extractor uses this to pick between the per-token
+        path (rich word timestamps) and the per-segment path
+        (segment-level start/end only).
+        """
+        return self._uses_vad
 
     # ------------------------------------------------------------------
     # Public: shutdown

@@ -3,27 +3,33 @@
 After preprocess[_batch].py finishes, every video has THREE JSON files:
 
     <edit>/transcripts/<stem>.json   — whisper_lane (speech, word level)
-    <edit>/audio_tags/<stem>.json    — audio_lane   (PANNs events)
+    <edit>/audio_tags/<stem>.json    — audio_lane   (CLAP vocab events)
     <edit>/visual_caps/<stem>.json   — visual_lane  (Florence-2 captions)
 
 This script fans those out into THREE markdown timelines that the SKILL
 points Claude at:
 
     <edit>/speech_timeline.md   — phrase-grouped transcripts (per file)
-    <edit>/audio_timeline.md    — coalesced PANNs events (per file)
+    <edit>/audio_timeline.md    — vocab-scored sound events  (per file)
     <edit>/visual_timeline.md   — 1-second captions, dedup'd (per file)
 
 And, optionally with --merge, a unified merged_timeline.md that
 interleaves all three by timestamp:
 
     [00:12:04] "okay now we're going to drill the pilot holes"
-    [00:12:09] (audio: drill, power_tool)
+    [00:12:09] (audio: cordless drill 0.42, drill press 0.31)
     [00:12:09] visual: a person holding a cordless drill above a metal panel
     [00:12:18] "good, pass me the deburring tool"
 
 The phrase-grouping logic for speech_timeline.md is reused verbatim from
 the old pack_transcripts.py so existing prompts that reference packed
 transcripts continue to work — only the filename changed.
+
+The audio lane emits PANNs-shape (label, score) events scored by a CLAP
+encoder against a vocabulary list (see helpers/audio_lane.py). For
+backward compatibility with caches still on disk from the abandoned
+Audio Flamingo 3 migration, a separate caption-shape renderer is kept
+behind a `model` sniff and removed once those caches age out.
 
 CLI:
     python helpers/pack_timelines.py --edit-dir <dir> [--merge]
@@ -219,17 +225,82 @@ def _pack_speech(transcripts_dir: Path, silence_threshold: float) -> str:
 
 # ---------------------------------------------------------------------------
 # Lane 2 — Audio events timeline
+#
+# Canonical CLAP audio_lane JSON shape:
+#   {
+#     model:      "Xenova/clap-htsat-unfused",
+#     vocab_sha:  "<hex>",
+#     vocab_size: <int>,
+#     window_s:   10.0,
+#     hop_s:      5.0,
+#     threshold:  0.10,
+#     top_k:      5,
+#     duration:   <seconds>,
+#     events: [{start, end, label, score}, ...]
+#   }
+#
+# Legacy AF3 caption shape (`captions` key, free-form text per chunk) is
+# detected via the `model` field and rendered through a fallback path so
+# stale caches don't blow up the packer. Once those caches age out the
+# fallback can be deleted.
 # ---------------------------------------------------------------------------
+
+def _render_audio_events(events: list[dict], lines: list[str]) -> None:
+    """Render CLAP (label, score) events grouped by (start, end) range.
+
+    Co-occurring labels in the same window collapse onto one line so a
+    busy 10s window with 4 simultaneous tags reads as
+        [start-end] (drill 0.42, hammer 0.31, sandpaper 0.28, ...)
+    rather than 4 separate rows. Within each row labels are sorted by
+    descending score so the strongest match leads.
+    """
+    by_range: dict[tuple[float, float], list[tuple[float, str]]] = {}
+    for ev in events:
+        key = (round(float(ev["start"]), 2), round(float(ev["end"]), 2))
+        by_range.setdefault(key, []).append(
+            (float(ev.get("score", 0.0)), str(ev.get("label", "?")))
+        )
+    for (s, e) in sorted(by_range.keys()):
+        labels = sorted(by_range[(s, e)], key=lambda x: -x[0])
+        label_str = ", ".join(
+            f"{lab} {sc:.2f}" for sc, lab in labels[:5]
+        )
+        lines.append(
+            f"  [{format_time(s)}-{format_time(e)}] ({label_str})"
+        )
+
+
+def _render_audio_captions_legacy(captions: list[dict], lines: list[str]) -> None:
+    """Render free-form per-chunk captions from a stale AF3 cache.
+
+    Tagged `[legacy AF3]` so the agent can tell at a glance the cache
+    is from the abandoned Audio Flamingo 3 migration and re-running
+    the audio lane will refresh it into the canonical CLAP shape.
+    """
+    for c in sorted(captions, key=lambda x: float(x.get("start", 0.0))):
+        s = float(c.get("start", 0.0))
+        e = float(c.get("end", s))
+        text = (c.get("text") or "").strip().replace("\n", " ")
+        if not text:
+            text = "_(no caption)_"
+        lines.append(f"  [{format_time(s)}-{format_time(e)}] {text} [legacy AF3]")
+
 
 def _pack_audio(audio_tags_dir: Path) -> str:
     """Render audio_timeline.md content from <edit>/audio_tags/*.json."""
     json_files = sorted(audio_tags_dir.glob("*.json"))
     lines: list[str] = []
-    lines.append("# Audio timeline (PANNs CNN14)")
+    lines.append("# Audio timeline (CLAP zero-shot events)")
     lines.append("")
     lines.append(
-        "Non-speech audio events, coalesced over time. Each line: "
-        "`[start-end] (label1, label2, ...)`. Top scoring labels first."
+        "Per-window sound events scored by LAION CLAP against a vocabulary "
+        "list. Each line: `[start-end] (label score, label score, ...)`. "
+        "Scores are cosine similarities (typically 0.10-0.45 — higher is "
+        "more confident). CLAP is much sharper than the abandoned PANNs "
+        "ontology but still noisy on edge classes; if labels look wrong "
+        "for THIS video, write a curated `<edit>/audio_vocab.txt` and "
+        "re-run `python helpers/audio_lane.py <video> --vocab "
+        "<edit>/audio_vocab.txt --force` for sharper, content-aware tags."
     )
     lines.append("")
 
@@ -239,34 +310,46 @@ def _pack_audio(audio_tags_dir: Path) -> str:
 
     for p in json_files:
         data = json.loads(p.read_text(encoding="utf-8"))
-        events = data.get("events", [])
         duration = data.get("duration", 0.0)
+        model = str(data.get("model", ""))
+
+        # Shape detection by `model` field. The CLAP lane writes
+        # `Xenova/clap-htsat-unfused` or `Xenova/larger_clap_general`;
+        # the abandoned AF3 lane wrote `nvidia/audio-flamingo-3-hf`.
+        # Anything else with a `captions` key gets the legacy renderer
+        # too (defensive: third-party forks may have other captioning
+        # writers).
+        if "captions" in data and isinstance(data["captions"], list) and not data.get("events"):
+            captions = data["captions"]
+            n = len(captions)
+            lines.append(
+                f"## {p.stem}  (duration: {format_duration(duration)}, "
+                f"{n} legacy AF3 caption{'s' if n != 1 else ''} — "
+                f"re-run audio_lane to refresh)"
+            )
+            if not captions:
+                lines.append("  _no captions emitted_")
+                lines.append("")
+                continue
+            _render_audio_captions_legacy(captions, lines)
+            lines.append("")
+            continue
+
+        events = data.get("events", [])
+        vocab_size = data.get("vocab_size")
+        header_extra = (
+            f", vocab={vocab_size}" if isinstance(vocab_size, int) else ""
+        )
         lines.append(
             f"## {p.stem}  (duration: {format_duration(duration)}, "
-            f"{len(events)} events)"
+            f"{len(events)} event{'s' if len(events) != 1 else ''}"
+            f"{header_extra})"
         )
         if not events:
             lines.append("  _no audio events above threshold_")
             lines.append("")
             continue
-
-        # Group events by their (start, end) range so labels co-occurring
-        # in the same window render on one line. We sort by start then by
-        # -score so the highest-confidence label leads each line.
-        by_range: dict[tuple[float, float], list[tuple[float, str]]] = {}
-        for ev in events:
-            key = (round(float(ev["start"]), 2), round(float(ev["end"]), 2))
-            by_range.setdefault(key, []).append(
-                (float(ev.get("score", 0.0)), str(ev.get("label", "?")))
-            )
-        for (s, e) in sorted(by_range.keys()):
-            labels = sorted(by_range[(s, e)], key=lambda x: -x[0])
-            label_str = ", ".join(
-                f"{lab} {sc:.2f}" for sc, lab in labels[:5]
-            )
-            lines.append(
-                f"  [{format_time(s)}-{format_time(e)}] ({label_str})"
-            )
+        _render_audio_events(events, lines)
         lines.append("")
     return "\n".join(lines)
 
@@ -368,23 +451,40 @@ def _build_merged(edit_dir: Path) -> str:
                     f"[{_hms(ph['start'])}] \"{ph['text']}\"",
                 ))
 
-        # ── Audio: one line per coalesced event range ──
+        # ── Audio: one line per merged CLAP event range. Co-occurring   ──
+        # labels in the same window collapse to one comma-separated tag  ──
+        # so the merged stream stays scannable.                          ──
         ap = audio_tags / f"{stem}.json"
         if ap.exists():
             data = json.loads(ap.read_text(encoding="utf-8"))
-            by_range: dict[tuple[float, float], list[tuple[float, str]]] = {}
-            for ev in data.get("events", []):
-                key = (round(float(ev["start"]), 2),
-                       round(float(ev["end"]), 2))
-                by_range.setdefault(key, []).append(
-                    (float(ev.get("score", 0.0)), str(ev.get("label", "?")))
-                )
-            for (s, _e), labels in by_range.items():
-                labels.sort(key=lambda x: -x[0])
-                label_str = ", ".join(lab for _sc, lab in labels[:5])
-                events.append((
-                    s, f"[{_hms(s)}] (audio: {label_str})",
-                ))
+            audio_events = data.get("events")
+            if isinstance(audio_events, list) and audio_events:
+                by_range: dict[tuple[float, float], list[tuple[float, str]]] = {}
+                for ev in audio_events:
+                    key = (round(float(ev["start"]), 2),
+                           round(float(ev["end"]), 2))
+                    by_range.setdefault(key, []).append(
+                        (float(ev.get("score", 0.0)), str(ev.get("label", "?")))
+                    )
+                for (s, _e), labels in by_range.items():
+                    labels.sort(key=lambda x: -x[0])
+                    label_str = ", ".join(lab for _sc, lab in labels[:5])
+                    events.append((
+                        s, f"[{_hms(s)}] (audio: {label_str})",
+                    ))
+            else:
+                # Legacy AF3 cache fallback — render free-form chunk
+                # captions inline so a half-migrated edit folder stays
+                # readable. Once caches age out this branch can be
+                # removed alongside the legacy renderer in _pack_audio.
+                for c in data.get("captions", []) or []:
+                    s = float(c.get("start", 0.0))
+                    text = (c.get("text") or "").strip().replace("\n", " ")
+                    if not text:
+                        continue
+                    events.append((
+                        s, f"[{_hms(s)}] (audio: {text})",
+                    ))
 
         # ── Visual: dedup'd captions ──
         vp = visual_caps / f"{stem}.json"
