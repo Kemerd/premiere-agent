@@ -1,19 +1,31 @@
 """VRAM detection + lane scheduling.
 
-The three-lane preprocessor wants to run faster-whisper, PANNs CNN14, and
-Florence-2-base in parallel when there's room — and gracefully fall back when
+The three-lane preprocessor wants to run the speech / audio / visual
+lanes in parallel when there's room — and gracefully fall back when
 there isn't. This module owns that decision.
 
-Approximate steady-state model footprints with conservative batch sizes:
+Approximate steady-state model footprints with conservative settings:
 
-  - faster-whisper large-v3-turbo, fp16:        ~2.5 GB
-  - PANNs CNN14:                                ~0.6 GB
-  - Florence-2-base, fp16, batch 8:             ~2.5 GB
+  ── Speech lanes (one runs at a time per orchestrator dispatch) ──
+  - parakeet-tdt-0.6b-v2 ONNX, fp16, 1 session:     ~1.6 GB peak
+  - parakeet-tdt-0.6b-v2 ONNX, fp16, 4-session pool: ~6.4 GB peak
+  - parakeet-tdt-0.6b-v2 ONNX, fp16, 8-session pool: ~12.8 GB peak
+  - parakeet-tdt-0.6b-v2 ONNX, int8, 4-session pool: ~3.2 GB peak
+  - whisper-large-v3-turbo HF, fp16, batch=16:      ~26-30 GB peak (HF #27834)
+  - parakeet-tdt-0.6b NeMo torch, fp16:             ~3-4 GB
 
-A single all-three-parallel run peaks around 5.6 GB in steady state, plus a
-~1.5 GB transient spike when each model loads its weights. The 8 GB threshold
-in `pick_schedule` leaves headroom for that spike + display compositor + any
-background processes the user has running.
+  ── Other lanes ──
+  - PANNs CNN14:                                    ~0.6 GB
+  - Florence-2-base, fp16, batch 8:                 ~2.5 GB
+
+The default speech lane is the multi-session ONNX path (see
+helpers/parakeet_onnx_lane.py / helpers/_onnx_pool.py) which auto-clamps
+its pool size to fit available VRAM. A single all-three-parallel run on
+the default tier (4-session ONNX pool) peaks around 9.5 GB; on the
+wealthy tier (8-session pool) around 16 GB. The 8 GB / 4 GB / 2 GB
+thresholds in `pick_schedule` are unchanged because the legacy paths
+(NeMo Parakeet, HF Whisper) still need them when the user opts out of
+the ONNX default via `VIDEO_USE_SPEECH_LANE={nemo,whisper}`.
 
 Detection strategy (in order):
 
