@@ -56,6 +56,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "helpers"))
 
+# CRITICAL: install the HF backend guards BEFORE any code path here can
+# probe `transformers` (we do `__import__("transformers")` in
+# `env_fingerprint` to read its version string, which triggers the
+# eager TF/JAX import path in 4.x). Must come AFTER the sys.path setup
+# above so the helpers/ folder is actually importable.
+from _hf_env import HF_ENV_GUARDS_INSTALLED  # noqa: F401  - import for side effect
+
 
 CACHE_VERSION = 1
 DEFAULT_TTL_DAYS = 7
