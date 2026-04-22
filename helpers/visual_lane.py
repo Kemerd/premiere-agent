@@ -42,6 +42,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -616,15 +617,22 @@ def _build_florence(
 
     compile_enabled : bool
         When True (and the device is CUDA), wrap the model in
-        `torch.compile(mode="reduce-overhead", fullgraph=False)` after
-        construction. This fuses kernels and skips PyTorch's eager
-        per-op overhead, typically buying 20-30% on Blackwell after a
-        ~30-60s first-batch warmup. Any failure during compile is
-        caught and the eager model is used instead — no compile bug
-        should ever break a run. The orchestrator enables this when
-        len(videos) > 1 because the warmup amortizes nicely across
-        many clips; the standalone CLI disables it by default to keep
-        single-clip invocations snappy.
+        `torch.compile(mode=<resolved>, fullgraph=False)` after
+        construction. The mode string is resolved by
+        `_resolve_compile_mode` from the
+        `VIDEO_USE_FLORENCE_COMPILE_MODE` env var and defaults to
+        "default" — see that resolver's docstring for the full
+        rationale on why "reduce-overhead" is opt-in (CUDA-Graph
+        capture deadlocks on autoregressive decode with variable
+        sequence lengths). "default" still buys ~10-20% on Blackwell
+        from Inductor kernel fusion, without the CUDA-Graph memory
+        pinning that wedges long batches.
+
+        Any failure during compile is caught and the eager model is
+        used instead — no compile bug should ever break a run. The
+        orchestrator enables compile when len(videos) > 1 because the
+        warmup amortizes nicely across many clips; the standalone CLI
+        disables it by default to keep single-clip invocations snappy.
     """
     import torch
     from transformers import AutoProcessor
@@ -692,14 +700,23 @@ def _build_florence(
     # ------------------------------------------------------------------
     # torch.compile wrapping (Blackwell / Ada / Ampere kernel fusion).
     #
-    # `mode="reduce-overhead"` picks the CUDAGraphs-backed scheduler
-    # which fuses the per-op launch overhead into one kernel-graph
-    # replay per shape. Critical caveat: it CAN cause graph breaks on
-    # dynamic-shape workloads (variable-length text decode), but with
-    # greedy decode (num_beams=1) and the fixed 768x768 vision input
-    # the graph stays stable enough that the overhead reduction wins.
-    # `fullgraph=False` is mandatory — generate() has a Python control
-    # flow loop and Dynamo will refuse to compile it as one graph.
+    # The compile MODE is resolved through `_resolve_compile_mode` so
+    # the env-var override surface stays in one place. Defaults to
+    # "default" (Inductor kernel fusion, no CUDA Graphs) because
+    # Florence-2's autoregressive decode produces variable KV-cache
+    # shapes per frame, which makes the CUDA-Graphs-backed
+    # "reduce-overhead" mode thrash Dynamo's per-shape cache and
+    # eventually deadlock on long batches (47-clip / 4700-frame runs
+    # observed wedging at GPU=0% with VRAM held). "default" mode keeps
+    # ~10-20% of the speedup with none of the deadlock risk.
+    #
+    # Power users with stable-shape footage can opt back into
+    # "reduce-overhead" or "max-autotune" with:
+    #   VIDEO_USE_FLORENCE_COMPILE_MODE=reduce-overhead
+    #
+    # `fullgraph=False` is mandatory regardless of mode — generate()
+    # has a Python control flow loop and Dynamo will refuse to compile
+    # it as one graph.
     #
     # Failure handling: any exception during compile (Dynamo crash,
     # backend init failure, OOM during specialization) is caught and
@@ -708,15 +725,24 @@ def _build_florence(
     # on first forward, so even the FAILED-compile path doesn't cost
     # warmup time, just the print statement.
     #
-    # Override knob: `VIDEO_USE_FLORENCE_COMPILE=off` at the call-site
-    # level (resolved in run_visual_lane_batch) lets users disable
-    # compile entirely if they hit a regression on their setup.
+    # Override knobs:
+    #   VIDEO_USE_FLORENCE_COMPILE=off       — disable compile entirely
+    #   VIDEO_USE_FLORENCE_COMPILE_MODE=...  — pick scheduler mode
     # ------------------------------------------------------------------
     if compile_enabled and device.startswith("cuda"):
+        compile_mode = _resolve_compile_mode()
+        # Mode-specific warmup-cost messaging so the user knows whether
+        # to expect a fast first batch ("default") or a long one
+        # ("reduce-overhead" / "max-autotune" both capture CUDA Graphs).
+        warmup_hint = (
+            "~5-15s first-batch warmup"
+            if compile_mode == "default"
+            else "~30-60s first-batch warmup"
+        )
         try:
-            model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
-            print("  florence: torch.compile enabled "
-                  "(mode=reduce-overhead, ~30-60s first-batch warmup)")
+            model = torch.compile(model, mode=compile_mode, fullgraph=False)
+            print(f"  florence: torch.compile enabled "
+                  f"(mode={compile_mode}, {warmup_hint})")
         except Exception as _e:
             print(f"  florence: torch.compile failed "
                   f"({type(_e).__name__}: {_e}); falling back to eager mode")
@@ -727,6 +753,56 @@ def _build_florence(
 # ---------------------------------------------------------------------------
 # Batched inference
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Florence-2 special-token leakage cleanup.
+#
+# `post_process_generation(<MORE_DETAILED_CAPTION>)` is supposed to peel the
+# task header / control tokens off the decoded sequence and hand back a
+# clean caption string. In practice — at least on the florence-community
+# port we ship — it consistently leaves the autoregressive decoder's
+# trailing pad run untouched whenever the actual caption finished short
+# of `max_new_tokens=128`. The result is captions like
+#
+#   "a person holding a drill above a metal panel.<pad><pad><pad><pad>...
+#    <pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad><pad>"
+#
+# where the first 5-7 sentences are real content and the back half is
+# pure tokenizer noise. On a 6500-frame timeline that ballooned the
+# merged_timeline.md file by ~30-40% and pushed it past the editor
+# sub-agent's reasonable single-read budget. We strip them at decode
+# (so new caches stay clean) AND defensively in pack_timelines.py
+# (so legacy caches that still carry the leakage pack cleanly without
+# a forced re-preprocess).
+#
+# The regex is broad on purpose — anything that looks like an HF-shape
+# special token (`<pad>` / `<s>` / `</s>` / `<unk>` / `<mask>` / `<bos>`
+# / `<eos>` / `<sep>` / `<cls>`) gets nuked. Florence's real caption
+# text never legitimately contains those substrings.
+# ---------------------------------------------------------------------------
+
+_FLORENCE_SPECIAL_TOKEN_RE = re.compile(
+    r"<\s*/?\s*(?:pad|s|unk|mask|bos|eos|sep|cls)\s*>",
+    flags=re.IGNORECASE,
+)
+# Whitespace collapser used after the strip — repeated ` ` runs would
+# otherwise survive where the deleted tokens used to live.
+_WS_RUN_RE = re.compile(r"\s{2,}")
+
+
+def _strip_florence_special_tokens(text: str) -> str:
+    """Strip leftover Florence-2 special tokens from a decoded caption.
+
+    Idempotent and cheap (~0.3 us per caption on a typical CPU). Safe to
+    apply both at decode time inside this module and as a defensive pass
+    inside pack_timelines.py for legacy caches.
+    """
+    if not text:
+        return ""
+    text = _FLORENCE_SPECIAL_TOKEN_RE.sub("", text)
+    text = _WS_RUN_RE.sub(" ", text).strip()
+    return text
+
 
 def _caption_batch(model, processor, images, *, device: str, torch_dtype, task: str) -> list[str]:
     """Run Florence-2 on a list of PIL images, return parsed captions."""
@@ -789,7 +865,12 @@ def _caption_batch(model, processor, images, *, device: str, torch_dtype, task: 
         )
         # post_process_generation returns {task: caption_str} for caption tasks.
         text = parsed.get(task, "") if isinstance(parsed, dict) else str(parsed)
-        out.append(str(text).strip())
+        # Strip any trailing <pad>... run (and stray <s> / </s> markers)
+        # that the post-processor failed to clean up — see the long
+        # comment on _strip_florence_special_tokens above for why this
+        # is necessary on the florence-community port.
+        text = _strip_florence_special_tokens(str(text).strip())
+        out.append(text)
     return out
 
 
@@ -1094,6 +1175,76 @@ def _resolve_compile_enabled(num_videos: int) -> bool:
     if raw in {"off", "0", "false", "no", "n", "f"}:
         return False
     return num_videos > 1
+
+
+# Valid torch.compile mode strings. Kept in one place so both the
+# resolver below and any future help-text generation stay in sync with
+# the upstream PyTorch API. "default" is intentionally first — it's the
+# safe pick for autoregressive models with variable decode lengths.
+_VALID_COMPILE_MODES: tuple[str, ...] = (
+    "default",
+    "reduce-overhead",
+    "max-autotune",
+    "max-autotune-no-cudagraphs",
+)
+
+
+def _resolve_compile_mode() -> str:
+    """Resolve the torch.compile *mode* string from an env var.
+
+    Why this exists as its own resolver:
+        `_resolve_compile_enabled` answers "should we compile at all";
+        this one answers "if we DO compile, with which scheduler".
+        Splitting the two knobs lets users force a mode without also
+        having to think about the on/off question, and keeps the
+        env-var surface symmetric (one var per decision).
+
+    Resolution order:
+        1. VIDEO_USE_FLORENCE_COMPILE_MODE env var, normalised to lower.
+           Hyphens / underscores are interchangeable so users don't
+           have to remember which separator the upstream API uses
+           (Inductor accepts "reduce-overhead", `torch.compile` accepts
+           "reduce_overhead" — we feed the canonical hyphenated form).
+        2. Default: "default".
+
+    Why "default" is the safe default (changed from "reduce-overhead"):
+        `reduce-overhead` uses CUDA Graphs which capture memory
+        addresses statically. Florence-2's autoregressive decode
+        produces a different output sequence length per frame, which
+        means a different KV-cache shape per generate() call, which
+        means Dynamo treats every novel shape as a fresh
+        specialization. Each specialization needs a fresh CUDA Graph
+        capture (~1-3 min) AND pins ~50-200 MB of VRAM. On long batches
+        (47-clip / 4700-frame runs) this thrashes Dynamo's per-code-
+        object cache (default size 8) and eventually wedges the
+        process: GPU at 0%, VRAM held, no log output, no progress.
+        See the long-form root-cause notes in `_resolve_compile_enabled`.
+
+        `default` mode keeps Inductor's kernel fusion (still a real
+        speedup, ~10-20%) but skips the CUDA-Graph capture step, so
+        recompiles are 5-10× faster, no memory pinning, no Case-C
+        deadlocks. Net: slightly less peak speed, dramatically more
+        reliable on real-world variable-content batches.
+
+    Power users with uniform shape footage (e.g. all-talking-head, one
+    resolution, narrow caption length distribution) can opt back into
+    `reduce-overhead` for the extra 10-15% with:
+
+        VIDEO_USE_FLORENCE_COMPILE_MODE=reduce-overhead
+    """
+    raw = os.environ.get("VIDEO_USE_FLORENCE_COMPILE_MODE", "").strip().lower()
+    if not raw:
+        return "default"
+    # Accept both hyphen and underscore separators for ergonomics.
+    canon = raw.replace("_", "-")
+    if canon in _VALID_COMPILE_MODES:
+        return canon
+    # Unknown mode → fall back to the safe default rather than crashing
+    # late inside torch.compile with a less-helpful error. Print so the
+    # user sees their typo got silently corrected.
+    print(f"  florence: unknown VIDEO_USE_FLORENCE_COMPILE_MODE='{raw}'; "
+          f"valid={list(_VALID_COMPILE_MODES)}; falling back to 'default'")
+    return "default"
 
 
 def run_visual_lane_batch(
