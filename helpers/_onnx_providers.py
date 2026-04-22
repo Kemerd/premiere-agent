@@ -212,6 +212,71 @@ def _bootstrap_nvidia_dlls() -> None:
 
     _CAPS["added_dirs"] = list(candidate_dirs)
 
+    # ── Phase 2.5: pin cuDNN + TRT sub-libs to ONE directory ────────────
+    #
+    # Why this exists (the ONNXRuntime / cuDNN 9 split-library trap):
+    #
+    #   cuDNN 9.x is no longer a monolithic `cudnn64_9.dll`. The vendor
+    #   shipped it as a tiny dispatcher (`cudnn64_9.dll`) plus a fleet of
+    #   per-domain sub-libs that the dispatcher loads on first use:
+    #
+    #     cudnn_cnn64_9.dll                       ← BatchNorm/Conv kernels
+    #     cudnn_ops64_9.dll                       ← reductions, softmax
+    #     cudnn_adv64_9.dll                       ← attention, RNN
+    #     cudnn_graph64_9.dll                     ← graph API runtime
+    #     cudnn_engines_precompiled64_9.dll       ← shipped engine cache
+    #     cudnn_engines_runtime_compiled64_9.dll  ← JIT engine builder
+    #     cudnn_heuristic64_9.dll                 ← engine picker
+    #
+    #   Each sub-lib carries a build-version tag and the dispatcher will
+    #   reject sub-libs whose tag does not match its own with the
+    #   error the user actually saw on the CLAP audio encoder:
+    #
+    #     CUDNN failure 1002: CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH
+    #     expr=cudnnCreateTensorDescriptor(&tensor_)
+    #
+    #   This crash is non-deterministic across models because different
+    #   ops route to different sub-libs — Parakeet + Florence happened
+    #   not to hit BatchNormalization, CLAP's audio encoder does on its
+    #   first node. Any op that touches `cudnn_cnn64_9.dll` will trip.
+    #
+    # Why "just prepend PATH" was not enough:
+    #
+    #   Prepending PATH only steers the FIRST `LoadLibraryW("cudnn64_9.dll")`
+    #   call. cuDNN's dispatcher then loads each sub-lib via its OWN
+    #   `LoadLibrary` call which uses default search semantics — those
+    #   may resolve from:
+    #     * a DIFFERENT cuDNN install bundled with PyTorch
+    #       (`site-packages/torch/lib/`) whose dir is on PATH because the
+    #       user `import torch`'d earlier in the session,
+    #     * an older system-wide CUDA Toolkit cuDNN under
+    #       `%CUDA_PATH%\bin\`,
+    #     * Windows' module-search-cache for any sub-lib already mapped
+    #       into the process (NeMo, TF, OnnxRuntime-DirectML all ship
+    #       partial cuDNN copies).
+    #   Result: dispatcher is wheel-version 9.x.A, sub-lib loaded is
+    #   torch-bundled 9.x.B → mismatch → crash mid-inference.
+    #
+    # The fix that actually holds:
+    #
+    #   Walk our chosen cuDNN bin dir, find EVERY `cudnn*64_9.dll` in it,
+    #   and `LoadLibraryW` each one BY ABSOLUTE PATH at bootstrap. Once
+    #   a DLL is mapped into the process by absolute path, the OS loader
+    #   short-circuits any subsequent `LoadLibrary("cudnn_cnn64_9.dll")`
+    #   call (regardless of how the caller searches) to our pre-mapped
+    #   handle. Every sub-lib is now guaranteed to come from the same
+    #   directory and therefore the same build tag.
+    #
+    #   We do the same for TRT plugin DLLs so a future CLAP-on-TRT user
+    #   doesn't get bitten by the equivalent split-plugin trap.
+    #
+    # Cost: one ctypes.WinDLL per sub-lib at import time. Total < 50ms
+    # on a warm filesystem; the libs would have been mapped within the
+    # first inference call anyway, we're just doing it deterministically
+    # and from the right directory. Idempotent — Windows refcounts
+    # module loads, so re-loading is a no-op handle-bump.
+    _pin_split_libraries()
+
     # ── Phase 3: probe each EP's required DLLs against the live loader ─
     # We only mark an EP capable if EVERY DLL it needs at runtime is
     # reachable. This is what stops the "looks fine, then crashes at
@@ -327,6 +392,150 @@ def _system_cuda_roots() -> list[str]:
     return [r for r in roots if os.path.isfile(
         os.path.join(r, "bin", "cudart64_12.dll")
     )]
+
+
+def _pin_split_libraries() -> None:
+    """Pre-map cuDNN + TRT split-libraries from a single dir by abs path.
+
+    See the long-form rationale at the call-site in
+    `_bootstrap_nvidia_dlls()` Phase 2.5. tl;dr: cuDNN 9.x's dispatcher
+    DLL (`cudnn64_9.dll`) loads sub-libraries (`cudnn_cnn64_9.dll`,
+    `cudnn_ops64_9.dll`, ...) lazily via its own LoadLibrary calls.
+    Without this preload step those calls can resolve to torch-bundled
+    or CUDA-Toolkit-shipped copies whose build tags don't match the
+    dispatcher we picked, crashing with
+    `CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH` mid-inference.
+
+    Strategy:
+        1. Locate the wheel's cuDNN dir (`nvidia/cudnn/bin/`).
+        2. `ctypes.WinDLL(absolute_path)` every `cudnn*64_9.dll` in it.
+           Loading by absolute path bypasses the search order entirely
+           and pins that exact file into the process module table.
+        3. Repeat for tensorrt_libs/ (nvinfer + plugin DLLs). Same
+           failure mode would bite us on multi-graph TRT runs.
+        4. Repeat for the `nvidia/cublas/bin/` dir — cuBLAS also ships
+           a few sub-libs (cublasLt, cublasLt-internal) that benefit
+           from the same pinning strategy.
+
+    Failures are non-fatal: a single sub-lib that fails to load gets a
+    one-line diagnostic and we keep going. Worst case we revert to the
+    pre-fix behavior (sometimes works, sometimes mismatches).
+
+    Module loads are refcounted on Windows — calling this twice (or
+    re-entering after a downstream module preloads cuDNN itself) is a
+    no-op beyond bumping the handle count.
+    """
+    if sys.platform != "win32":
+        # POSIX uses RTLD_GLOBAL + rpath which avoids this class of
+        # mix-and-match because the dispatcher's RUNPATH points at its
+        # own bundle dir. Nothing to pin.
+        return
+
+    import ctypes
+    import glob as _glob
+
+    # Each (wheel-import, sub-path, glob-pattern) triple maps a wheel
+    # we care about to the DLLs we want pinned from it. We keep the
+    # patterns tight (cudnn*64_9, nvinfer*_10, cublas*64_12) so we don't
+    # accidentally preload unrelated DLLs that happen to live in the
+    # same dir (e.g. PDB symbol files or vendor-tool helpers).
+    pin_targets: list[tuple[str, str, str]] = [
+        ("nvidia.cudnn",   "bin", "cudnn*64_9.dll"),       # cuDNN 9 split-libs
+        ("tensorrt_libs",  "",    "nvinfer*_10.dll"),      # TRT runtime + plugins
+        ("nvidia.cublas",  "bin", "cublas*64_12.dll"),     # cuBLAS sub-libs
+    ]
+
+    # Resolve the dirs we'll pin from. We prefer the pip wheels (single
+    # known version, no mix-and-match risk) but fall back to system CUDA
+    # Toolkit bin dirs when a wheel isn't installed — gives users with
+    # only the toolkit installed the same crash protection.
+    #
+    # Mapped as (basename_to_source_dir): we pick exactly ONE dir per
+    # DLL family so no two cuDNN versions can ever co-exist in the
+    # process module table.
+    family_dirs: dict[str, str] = {}
+
+    # Aggregate counters for the one-line summary at the end. Per-DLL
+    # logs are too noisy for production; summary is enough to confirm
+    # the pinning ran.
+    total_pinned = 0
+    total_failed: list[str] = []
+
+    for mod_name, sub_path, pattern in pin_targets:
+        wheel_dir = _wheel_dir(mod_name, sub_path)
+        chosen_dir: str | None = wheel_dir
+
+        # Wheel-less fallback: only cuDNN ships in the CUDA Toolkit
+        # installer bin dir (TRT and cuBLAS would mismatch the toolkit's
+        # version anyway, so we don't try to pin them from there).
+        # We walk system CUDA roots highest-version-first and pick the
+        # FIRST root that has a complete cuDNN bundle (dispatcher +
+        # at least one sub-lib in the same dir).
+        if chosen_dir is None and mod_name == "nvidia.cudnn":
+            for root in _system_cuda_roots():
+                bin_dir = os.path.join(root, "bin")
+                has_dispatcher = os.path.isfile(os.path.join(bin_dir, "cudnn64_9.dll"))
+                has_sub = bool(_glob.glob(os.path.join(bin_dir, "cudnn_*64_9.dll")))
+                if has_dispatcher and has_sub:
+                    chosen_dir = bin_dir
+                    break
+
+        if chosen_dir is None:
+            # No source for this family on the system. The Phase 3 cap
+            # probe will mark the corresponding EP unavailable so the
+            # ladder skips it cleanly instead of crashing at session
+            # construction.
+            continue
+
+        family_dirs[pattern] = chosen_dir
+
+        # Collect candidate DLLs. Sort so the dispatcher loads first;
+        # this matters for cuDNN where `cudnn64_9.dll` is the entry
+        # point that defines the build tag the sub-libs are checked
+        # against.
+        dll_paths = sorted(_glob.glob(os.path.join(chosen_dir, pattern)))
+        if not dll_paths:
+            continue
+
+        # Bubble the dispatcher (cudnn64_9.dll, nvinfer_10.dll) to the
+        # front of the list so it gets loaded BEFORE its sub-libs.
+        # Order shouldn't matter once everything is mapped, but cuDNN's
+        # dispatcher reads a build-tag from sub-libs at load time and
+        # we want the dispatcher's tag to be the reference value.
+        dispatcher_basenames = {"cudnn64_9.dll", "nvinfer_10.dll"}
+        dll_paths.sort(
+            key=lambda p: 0 if os.path.basename(p).lower() in dispatcher_basenames else 1
+        )
+
+        for dll_path in dll_paths:
+            try:
+                # winmode=0 = LOAD_WITH_ALTERED_SEARCH_PATH semantics
+                # via absolute path. ctypes.WinDLL with a full path
+                # loads exactly that file and skips the standard DLL
+                # search order — which is the entire point of this
+                # function. Once mapped, any subsequent LoadLibrary
+                # call (by short name) for the same module returns
+                # this handle.
+                ctypes.WinDLL(dll_path, winmode=0)
+                total_pinned += 1
+            except OSError as exc:
+                # A failure here usually means an unrelated transitive
+                # dep of this DLL isn't reachable yet (e.g. cuDNN trying
+                # to find a CUDA runtime that's added later in the
+                # phase). We record but don't bail — the EP probe in
+                # Phase 3 will catch any actually-broken EP.
+                total_failed.append(f"{os.path.basename(dll_path)} ({exc.winerror if hasattr(exc, 'winerror') else 'OSError'})")
+
+    if total_pinned > 0 or total_failed:
+        msg = f"  [providers] pinned {total_pinned} split-library DLL(s) by absolute path"
+        if total_failed:
+            # Cap the failure list — if cuDNN truly can't find its CUDA
+            # deps you'll get 7+ failures in a row and we don't want to
+            # flood the lane log.
+            shown = total_failed[:3]
+            extra = f" (+{len(total_failed) - 3} more)" if len(total_failed) > 3 else ""
+            msg += f"; failed: {', '.join(shown)}{extra}"
+        print(msg)
 
 
 def _can_load_dll(name: str) -> bool:
