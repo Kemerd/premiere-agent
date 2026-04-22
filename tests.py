@@ -300,12 +300,43 @@ def test_vram_schedule(R: Results) -> None:
         print(f"  schedule:  {sched.name}")
         R.ok("vram.detect_gpu")
         R.ok("vram.pick_schedule")
-        # On a 32 GB 5090 with most of it free we expect PARALLEL_3.
-        if gpu.available and gpu.free_gb >= 16 and sched != Schedule.PARALLEL_3:
-            R.fail(
-                "schedule sanity",
-                f"32GB card got {sched.name}, expected PARALLEL_3",
-            )
+        # Sanity rules under the post-Florence-community refactor:
+        #   * Default policy is SEQUENTIAL on any single-GPU rig — see
+        #     vram.py module docstring for why parallel is opt-in now.
+        #   * Power users can re-enable parallel via either
+        #     VIDEO_USE_PARALLEL_LANES=1 (env var) or
+        #     --force-schedule parallel (CLI bypass).
+        # We test both the default and the opted-in branch so a future
+        # regression in either path is caught on a 32 GB box.
+        if gpu.available and gpu.free_gb >= 16:
+            if sched != Schedule.SEQUENTIAL:
+                R.fail(
+                    "schedule sanity (default)",
+                    f"32GB card got {sched.name}, expected SEQUENTIAL "
+                    f"(parallel is now opt-in via VIDEO_USE_PARALLEL_LANES)",
+                )
+            else:
+                R.ok("schedule sanity: SEQUENTIAL is the default on big cards")
+            # Probe the opt-in path too. Save / restore env to avoid
+            # leaking state into other tests in the same process.
+            import os as _os
+            _prev = _os.environ.get("VIDEO_USE_PARALLEL_LANES")
+            try:
+                _os.environ["VIDEO_USE_PARALLEL_LANES"] = "1"
+                opted = pick_schedule(gpu)
+                if opted != Schedule.PARALLEL_3:
+                    R.fail(
+                        "schedule sanity (opt-in)",
+                        f"with VIDEO_USE_PARALLEL_LANES=1 on a 32GB card we "
+                        f"got {opted.name}, expected PARALLEL_3",
+                    )
+                else:
+                    R.ok("schedule sanity: opt-in unlocks PARALLEL_3")
+            finally:
+                if _prev is None:
+                    _os.environ.pop("VIDEO_USE_PARALLEL_LANES", None)
+                else:
+                    _os.environ["VIDEO_USE_PARALLEL_LANES"] = _prev
         else:
             R.ok("schedule sanity (matches free VRAM tier)")
     except Exception as e:

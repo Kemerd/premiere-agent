@@ -410,11 +410,28 @@ def run_preprocess(
 
     # 1) GPU detection + schedule resolution
     info = detect_gpu()
-    if schedule is None:
+    auto_picked = schedule is None
+    if auto_picked:
         schedule = pick_schedule(info)
     print(f"[orchestrator] GPU      : {info}")
     print(f"[orchestrator] Schedule : {schedule.name}  "
           f"(--force-schedule {schedule.value})")
+    # When the auto-picker landed on SEQUENTIAL but the card has the
+    # VRAM headroom for parallel, surface the opt-in path once. This
+    # is the new default policy as of the post-Florence-community
+    # refactor — see vram.py module docstring for the rationale.
+    if (
+        auto_picked
+        and schedule == Schedule.SEQUENTIAL
+        and info.available
+        and info.free_gb >= 8.0
+        and not os.environ.get("VIDEO_USE_PARALLEL_LANES", "").strip()
+    ):
+        print(
+            "[orchestrator] (parallel lanes available — set "
+            "VIDEO_USE_PARALLEL_LANES=1 or pass --force-schedule parallel "
+            "to opt in; sequential is the safer default on single-GPU rigs)"
+        )
     print(f"[orchestrator] Wealthy  : {is_wealthy(False)}")
     print(f"[orchestrator] Videos   : {len(videos)}")
 

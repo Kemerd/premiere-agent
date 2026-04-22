@@ -155,127 +155,85 @@ _SEQUENTIAL_MIN_GB = 2.0
 
 
 # ---------------------------------------------------------------------------
-# Known-broken parallel combinations.
+# Default policy: SEQUENTIAL.
 #
-# Some hardware + library combos surface as "fake OOMs" when multiple
-# Python processes share a single CUDA device — the real failure is a
-# Blackwell driver / kernel selection bug, not memory pressure, but it
-# manifests as a `RuntimeError: CUDA error: out of memory` raised on a
-# tiny `inputs.to(device)` call with the "CUDA kernel errors might be
-# asynchronously reported" preamble. The retry-loop in the lanes can't
-# rescue this because every retry hits the same poisoned context.
+# Why: real-world testing on a Blackwell RTX 5090 (32 GB) showed that
+# even with comfortable VRAM headroom, multi-process CUDA on a single
+# GPU produces hard-to-diagnose OOMs and context corruption when three
+# heavy ML lanes (Whisper, PANNs, Florence-2) load and infer
+# concurrently. Each lane is its own subprocess with its own CUDA
+# context; the driver-level allocator fragments badly across contexts,
+# and one lane's transient inference spike can starve another's
+# resident weights mid-forward. nvidia-smi snapshots at the OOM moment
+# show 31 GB used across all procs in a 32 GB card — not because any
+# single lane needs that much, but because PyTorch's caching allocator
+# in three contexts simultaneously claims more than the sum of their
+# working sets.
 #
-# When we detect such a combo, we transparently downgrade PARALLEL_3 →
-# SEQUENTIAL so the lanes never co-tenant the device. Slower but
-# correct — and the lane-stagger feature stays intact for its other
-# benefit (smoother log interleaving).
+# Sequential schedule sidesteps the entire class of problems: each lane
+# loads, runs, releases, then the next lane starts. End-to-end wall
+# time is competitive with parallel in practice because the parallel
+# schedule's OOM-retry-backoff loop wastes more time than the
+# serialization saves.
 #
-# The user can opt out with `VIDEO_USE_FORCE_PARALLEL=1` if they've
-# verified their driver/torch/transformers stack is fixed.
+# We KEEP the PARALLEL_3 / PARALLEL_2_SEQ_1 code paths for power users
+# with multi-GPU rigs, datacenter cards (A100, H100, RTX PRO 6000) where
+# the driver allocator handles concurrent contexts cleanly, or anyone
+# who's measured their setup and knows parallel is faster for them.
+# Activate via:
+#
+#    --force-schedule parallel        (CLI flag, single run)
+#    --force-schedule mixed           (whisper||panns then florence solo)
+#    VIDEO_USE_PARALLEL_LANES=1       (env var, persists across runs)
+#
+# When opt-in is set, we still apply the historical VRAM-driven tier
+# selection (so a 4 GB card opting in still gets PARALLEL_2_SEQ_1
+# instead of crashing in PARALLEL_3).
 # ---------------------------------------------------------------------------
 
-def _is_known_broken_parallel_combo(device_name: str) -> tuple[bool, str]:
-    """Detect hardware + library combinations where multi-process GPU
-    sharing produces silent context corruption.
+# Truthy values for any boolean env var we read here. Centralized so
+# every check uses the same parse rules.
+_TRUTHY_ENV = ("1", "true", "yes", "on", "y", "t")
 
-    Returns (is_broken, reason) — `reason` is a human-readable string
-    we surface to the orchestrator log so the downgrade isn't
-    mysterious.
 
-    Currently flagged:
-        * NVIDIA Blackwell (RTX 50-series, sm_120) + transformers >= 5
-          when transformers is importable. The bug surfaces in
-          Whisper's pipeline path even with `attn_implementation="eager"`
-          set — the issue is not just sdpa, it's the *concurrent CUDA
-          context* interaction with Blackwell's kernel scheduler.
-          See https://github.com/huggingface/transformers/issues/38662
-          plus follow-ups for the underlying instability.
-
-    Best-effort: if we can't import transformers (no [preprocess]
-    extra installed) or can't probe the device, we return
-    (False, "unknown") rather than guess pessimistically.
+def _user_opted_into_parallel() -> bool:
+    """True if the user has explicitly opted into parallel scheduling
+    via the env var. CLI `--force-schedule` is handled separately by
+    `parse_force_schedule` and bypasses `pick_schedule` entirely, so
+    this only governs the auto-pick path.
     """
-    name_lower = device_name.lower()
-    is_blackwell = (
-        "rtx 50" in name_lower or
-        "rtx 51" in name_lower or
-        "blackwell" in name_lower or
-        "rtx pro 6000" in name_lower
-    )
-    if not is_blackwell:
-        return False, "not Blackwell"
-    try:
-        # Apply the HF backend guards before probing the version — this
-        # prevents the version probe itself from triggering the eager
-        # TensorFlow / JAX import path that crashes 4.x installs with
-        # mismatched protobuf. The guards are no-ops if already set
-        # (setdefault) so it's safe to import this anywhere.
-        from _hf_env import HF_ENV_GUARDS_INSTALLED  # noqa: F401
-        import transformers as _tf
-        major = int(_tf.__version__.split(".", 1)[0])
-    except (ImportError, ValueError):
-        # transformers not installed → no Whisper lane to break → fine
-        # to leave parallel scheduling on for whatever IS running.
-        return False, "transformers not importable"
-    if major < 5:
-        # Supported / pinned config — sdpa works on Blackwell here, no
-        # context corruption observed, parallel is fine. This is the
-        # path users SHOULD be on (see pyproject.toml).
-        return False, f"transformers {_tf.__version__} < 5 (supported config)"
-    return True, (
-        f"Blackwell ({device_name}) + transformers {_tf.__version__} — "
-        f"known to produce fake OOMs under multi-process CUDA contention "
-        f"(downgrade to transformers<5 for the supported parallel path)"
-    )
+    raw = os.environ.get("VIDEO_USE_PARALLEL_LANES", "").strip().lower()
+    return raw in _TRUTHY_ENV
 
 
 def pick_schedule(info: GpuInfo) -> Schedule:
-    """Map a GpuInfo to a Schedule. See module docstring for rationale.
+    """Pick a Schedule for the auto path (no `--force-schedule` flag).
 
-    Conservative — when in doubt, drop a tier. OOM during preprocessing
-    crashes the whole batch and forces the user to re-run; a slower
-    schedule that completes is strictly better than a fast one that doesn't.
-
-    On hardware + library combinations where we know multi-process GPU
-    sharing is broken (see `_is_known_broken_parallel_combo`), we
-    transparently downgrade the picked schedule to SEQUENTIAL. Override
-    via `VIDEO_USE_FORCE_PARALLEL=1` if you know better.
+    Default is SEQUENTIAL on any GPU — see the policy comment block
+    above for the full rationale. The historical VRAM-tiered parallel
+    path is preserved but only fires when the user opts in via the
+    `VIDEO_USE_PARALLEL_LANES` env var (or the CLI `--force-schedule`
+    flag, which bypasses this function entirely).
     """
     if not info.available:
         return Schedule.CPU_FALLBACK
 
-    # Pure VRAM-driven choice first — the historical behavior.
-    if info.free_gb >= _PARALLEL_3_MIN_GB:
-        chosen = Schedule.PARALLEL_3
-    elif info.free_gb >= _PARALLEL_2_MIN_GB:
-        chosen = Schedule.PARALLEL_2_SEQ_1
-    elif info.free_gb >= _SEQUENTIAL_MIN_GB:
-        chosen = Schedule.SEQUENTIAL
-    else:
-        chosen = Schedule.CPU_FALLBACK
+    # Power-user opt-in path: re-enable the original VRAM-driven tier
+    # selection. Same thresholds as the historical defaults — kept so
+    # multi-GPU / datacenter users aren't surprised.
+    if _user_opted_into_parallel():
+        if info.free_gb >= _PARALLEL_3_MIN_GB:
+            return Schedule.PARALLEL_3
+        if info.free_gb >= _PARALLEL_2_MIN_GB:
+            return Schedule.PARALLEL_2_SEQ_1
+        # Fallthrough to sequential below — even if the user opted in,
+        # we won't run parallel under the 4 GB threshold.
 
-    # Now apply the known-broken-combo override, but only if the user
-    # hasn't explicitly opted out. We don't touch SEQUENTIAL or
-    # CPU_FALLBACK choices — they're already non-parallel.
-    if chosen in (Schedule.PARALLEL_3, Schedule.PARALLEL_2_SEQ_1):
-        force_parallel = os.environ.get("VIDEO_USE_FORCE_PARALLEL", "").strip()
-        if force_parallel not in ("1", "true", "yes"):
-            broken, reason = _is_known_broken_parallel_combo(info.device_name)
-            if broken:
-                # Surface the downgrade reason via stderr so the
-                # orchestrator log explains why we didn't pick
-                # PARALLEL_3 even though VRAM permits it. Using stderr
-                # keeps the [PROGRESS] machine-readable lines on stdout
-                # uncontaminated for downstream parsing.
-                import sys as _sys
-                print(
-                    f"[scheduler] downgrading {chosen.name} -> SEQUENTIAL: "
-                    f"{reason}. Override with VIDEO_USE_FORCE_PARALLEL=1.",
-                    file=_sys.stderr,
-                )
-                return Schedule.SEQUENTIAL
-
-    return chosen
+    # Default path: sequential on any GPU with enough VRAM for the
+    # smallest single lane (Whisper-large-v3 fp16 weights ~3 GB).
+    if info.free_gb >= _SEQUENTIAL_MIN_GB:
+        return Schedule.SEQUENTIAL
+    return Schedule.CPU_FALLBACK
 
 
 def parse_force_schedule(value: str | None) -> Schedule | None:

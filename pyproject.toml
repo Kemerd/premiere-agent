@@ -33,22 +33,21 @@ preprocess = [
     # exact same underlying components (transformers pipeline + Whisper +
     # fp16 + batched chunking + optional FA2) directly, which lets us keep
     # the model resident across all source files in a batch.
-    # Whisper pipeline AND Florence-2 live here. Upper-bounded at <5
-    # because transformers 5.x broke at least four things we depend on:
-    #   - sdpa attention selection on Blackwell (sm_120) silently
-    #     corrupts CUDA context for whisper-large-v3 → fake OOMs.
-    #     Forcing `attn_implementation="eager"` avoids the corruption
-    #     but blows VRAM at any reasonable batch size because eager
-    #     materializes O(seq^2) attention matrices.
-    #   - Florence-2 remote code (`modeling_florence2.py`) was written
-    #     against the 4.x API and breaks on 5.x in multiple places:
-    #     `forced_bos_token_id` default, `_supports_sdpa` property,
-    #     `RobertaTokenizer.additional_special_tokens`, and the
-    #     `EncoderDecoderCache` indexing in `prepare_inputs_for_generation`.
-    # The visual_lane / whisper_lane code carries defensive monkey-patches
-    # for all of those so users *can* run on 5.x in a pinch — but the
-    # supported configuration is 4.x, so we pin it here.
-    "transformers>=4.45,<5",
+    # Whisper pipeline AND Florence-2 live here. Lower bound 4.55 is
+    # where the native `Florence2ForConditionalGeneration` class was
+    # added to transformers (we use the `florence-community/Florence-2-base`
+    # HF-format checkpoint, NOT the original `microsoft/Florence-2-base`
+    # which uses trust_remote_code and broke against the new attention
+    # dispatcher contract). Upper bound <6 leaves headroom for the
+    # entire 5.x line — the community checkpoint is maintained against
+    # both 4.55+ and 5.x cleanly.
+    #
+    # Whisper note: on transformers 5.x + Blackwell (sm_120), the sdpa
+    # attention path for whisper-large-v3 silently corrupts the CUDA
+    # context. `_resolve_whisper_attn` in whisper_lane.py picks `eager`
+    # automatically when it detects 5.x — slower but correct. On 4.x
+    # sdpa is selected and runs at full speed.
+    "transformers>=4.55,<6",
 
     "optimum>=1.20",           # BetterTransformer fast-path, IFW-recommended
     "accelerate>=0.30",        # device_map + dtype routing for the pipeline
