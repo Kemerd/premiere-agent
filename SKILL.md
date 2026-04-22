@@ -34,6 +34,13 @@ These are the things where deviation produces silent failures or broken output. 
 13. **Pacing preset is REQUIRED before strategy.** Every session must have a pacing preset confirmed by the user (Calm / Measured / Paced / Energetic / Jumpy — default Paced). The preset defines four numbers used by the editor sub-agent: `min_silence_to_remove`, `min_talk_to_keep`, `lead_margin`, and `trail_margin`. See "Pacing presets" below. Never skip the prompt; never invent ad-hoc values.
 14. **No split edits (J/L cuts) and no cross-dissolves until further notice.** The editor sub-agent MUST emit `audio_lead = video_tail = transition_in = 0` on every range. They are deferred because the OTIO single-track audio model + per-clip independent frame-snapping causes cumulative audio drift across long timelines (visible as the audio sliding further out of sync with each subsequent cut). Audio at cut boundaries is protected by the 30ms `afade` pair from Hard Rule 3 — that's the current "small crossfade" story. See "Split edits (DEFERRED)".
 15. **Editor sub-agent must read `merged_timeline.md` end-to-end before emitting a single EDL range.** The merged view interleaves all three lanes by timestamp — speech (the spine), visual captions (shot continuity / B-roll), and audio events (soundscape hints) — so a single full-file read gives the editor the same triangulated picture it would get from reading each lane separately, in one pass. Never edit from a single lane in isolation. A cut chosen blind to the other lanes will land mid-shot, mid-action, or on a CLAP mis-label. If something in the merged view is ambiguous (e.g. you need word-level timing detail not captured in the phrase grouping, or a denser CLAP scoring than the merged stream shows), drill into the corresponding per-lane file (`speech_timeline.md`, `visual_timeline.md`, `audio_timeline.md`) for that specific moment. The brief in "Editor sub-agent brief" enforces this with a mandatory PRE-FLIGHT block; do not strip it when spawning.
+16. **Read `merged_timeline.md` IN FULL. Do not try to be clever about tokens.** The file is caveman-compressed and sentence-delta-deduped at pack time precisely so it fits comfortably in context — typical projects land in the 200KB–1.5MB range, well under any modern model's window. **Forbidden behaviours**, all of which produce silently bad cuts:
+    - Reading only the first N lines / last N lines / "a representative sample."
+    - `grep`/`rg`-ing for keywords and editing from the matches alone (you lose the chronological structure that makes the merged view useful in the first place).
+    - Chunked reads that you abandon partway through ("I have enough…") because the file feels long. You don't have enough. Finish the file.
+    - Delegating the read to a sub-agent "to protect the parent context window." The editor IS the agent making the taste calls; outsourcing the read means outsourcing the judgement to something with strictly less context than you. Read it yourself, in full, in the parent agent.
+    - Skipping a `Read` chunk because the previous chunk "looked similar." The dedup pass already removed the genuinely similar frames; what's left is signal.
+    If the file is genuinely too large for one `Read` call (hits the per-call cap), issue *sequential* `Read` calls with `offset`/`limit` until you have covered every line — not a sample. Treat partial-read shortcuts as a Hard Rule 16 violation regardless of how good the resulting cut looks; the user will catch it and you will be slapped.
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
@@ -400,12 +407,26 @@ You are editing a <type> video. Pick the best take of each beat and
 assemble them chronologically by beat, not by source clip order.
 
 PRE-FLIGHT (mandatory — do this before writing a single range):
-  1. Read merged_timeline.md  END-TO-END.  This is your default reading
-     surface — speech phrases ("..."), audio events ((audio: ...)), and
-     visual captions (visual: ...) for every source, all interleaved
-     chronologically by timestamp. One file, one full read; you get the
-     same triangulated picture you would from reading the three per-lane
-     files separately, in a single pass.
+  1. Read merged_timeline.md  END-TO-END.  IN FULL.  EVERY LINE.  This is
+     your default reading surface — speech phrases ("..."), audio events
+     ((audio: ...)), and visual captions (visual: ...) for every source,
+     all interleaved chronologically by timestamp. One file, one full
+     read; you get the same triangulated picture you would from reading
+     the three per-lane files separately, in a single pass.
+
+     Do not try to be clever about tokens (Hard Rule 16). The file is
+     caveman-compressed and sentence-delta-deduped at pack time so it
+     fits in context — typical projects are 200KB–1.5MB, comfortably
+     within any modern window. Forbidden:
+       * Reading only the first/last N lines or a "representative sample"
+       * grep/rg-for-keywords and editing from the matches alone
+       * Stopping a chunked read early because "I have enough"
+       * Delegating the read to a SUB-sub-agent "to save context" — YOU
+         are the editor, you make the taste calls, you read the file
+       * Skipping a chunk because the prior chunk "looked similar"
+     If the file exceeds the per-Read cap, issue sequential Read calls
+     with offset/limit until every line is covered. Cover the WHOLE file.
+
   2. Internalize the priority order: speech is the spine (every cut
      start/end must land on a word boundary), visual is the second source
      of truth for shot continuity / what's on screen, audio events are
@@ -418,7 +439,8 @@ PRE-FLIGHT (mandatory — do this before writing a single range):
   If merged_timeline.md is missing from <edit>/, STOP and report — re-run
   `python helpers/pack_timelines.py --edit-dir <edit>` to regenerate it.
   Skipping the merged read and editing from a single per-lane file alone
-  is a Hard Rule violation (#15).
+  is a Hard Rule violation (#15). Partial-read shortcuts are a Hard Rule
+  16 violation regardless of how the resulting cut looks.
 
 INPUTS (in priority order — trust them in this order when they disagree):
   - merged_timeline.md  (DEFAULT reading surface; all 3 lanes interleaved
@@ -693,6 +715,7 @@ Things that consistently fail regardless of style:
 - **Re-running `helpers/preprocess_batch.py --force` reflexively.** The mtime-based cache is correct; bypass only when the source file actually changed or you've upgraded a model.
 - **Reading `transcripts/*.json` directly.** Use `merged_timeline.md` (or `speech_timeline.md` for a speech-only drill-down). Same data, 1/10 the tokens, phrase-aligned.
 - **Reading the three per-lane timelines separately when `merged_timeline.md` exists.** The merged view is the editor's default reading surface — one file, all three lanes interleaved by timestamp. Open the per-lane files only as drill-down references for ambiguous moments (Hard Rule 15).
+- **"Saving tokens" by partial-reading `merged_timeline.md`.** First-N-lines, last-N-lines, "representative sample," grep-and-edit-from-matches, abandoning a chunked read because "I have enough," delegating the full read to a sub-agent to "protect the parent context window" — all forbidden (Hard Rule 16). The file is compressed and dedup'd at pack time so it fits; if it exceeds one `Read` call, issue sequential `Read` calls with `offset`/`limit` until every line is covered. The editor IS the agent making the taste calls; outsourcing the read outsources the judgement.
 - **Burning subtitles into base before compositing overlays.** Overlays hide them. (Hard Rule 1.)
 - **Single-pass filtergraph when you have overlays.** Double re-encodes. Use per-segment extract → concat.
 - **Linear animation easing.** Looks robotic. Always cubic.
