@@ -64,7 +64,7 @@ from pathlib import Path
 # in each cached file and silently re-runs on mismatch.
 # ---------------------------------------------------------------------------
 
-CAVEMAN_VERSION = "1.0"
+CAVEMAN_VERSION = "1.1"
 
 # ---------------------------------------------------------------------------
 # Florence-2 special-token leakage cleanup. Mirror of the regex in
@@ -149,6 +149,149 @@ _KEEP_PUNCT = frozenset({"-", "/", ":", "%", "$", "€", "£"})
 
 
 # ---------------------------------------------------------------------------
+# Generic English shorthand pass.
+#
+# Applied AFTER the spaCy POS filter, as a final regex word-boundary pass
+# on the joined caveman string. Two operations:
+#
+#   1. _DROP_WORDS  — generic English filler that survives the POS filter
+#      because it's a plain noun/verb but carries zero editorial signal
+#      in a Florence-2 caption. Empirically derived from word-frequency
+#      analysis on a 6500-line `merged_timeline.md` from the reference
+#      project: "image" appeared 5648 times, "visible" 2334, "including"
+#      1283, "appearance" 653, etc. — every one is pure padding.
+#
+#   2. _SHORTHAND   — generic English nouns that occur frequently and
+#      have an unambiguous abbreviation an LLM can decode for free. The
+#      table below targets words that appear >= ~300 times in a
+#      typical project's merged timeline. Domain-specific vocabulary
+#      ("Garmin", "screwdriver", "drill") is intentionally NOT in this
+#      table because (a) it varies per project and (b) editorial
+#      signal-per-character is already high there.
+#
+# Both lists are case-insensitive and word-boundary anchored, so
+# "Background" / "BACKGROUND" / "background" all collapse to "bg" and
+# "person" inside "personality" stays untouched.
+#
+# Why a regex post-pass instead of mutating spaCy tokens in
+# _compress_doc? Three reasons:
+#   * Keeps the POS filter language-agnostic. The shorthand table is
+#     English-only; non-English models skip this pass cleanly via the
+#     `lang == "en"` guard in `compress_text` / `compress_batch`.
+#   * Avoids fighting spaCy's tokenizer about hyphenated compounds —
+#     "close-up" stays one token in the regex, but spaCy splits it
+#     into `close` / `-` / `up` which would foil per-token replacement.
+#   * Makes the table trivially user-extensible — anyone who hates
+#     "rect" can flip a single dict entry and re-run with --force-caveman.
+#
+# Apply order matters: _DROP_WORDS first (so we don't waste regex
+# cycles shortening words about to be dropped), then _SHORTHAND, then
+# whitespace / punctuation cleanup.
+# ---------------------------------------------------------------------------
+
+# Generic-English filler that survives the POS pass. These are usually
+# concrete nouns / verbs (so the POS filter keeps them) but in Florence
+# captions they're always either the universal opener ("Image shows...")
+# or hedge / connector noise ("X visible in background, including Y").
+_DROP_WORDS = frozenset({
+    "image", "images",          # Florence-2's universal opener
+    "visible",                  # "X visible in bg" -> "X bg" (implied)
+    "including",                # list connector — commas do this job
+    "appearance",               # "the appearance of the room is messy"
+    "likely",                   # hedge ("likely a workshop")
+    "possibly",                 # hedge
+    "approximately",            # hedge
+    "slightly",                 # vague modifier
+    "various",                  # defensive (also in caveman ADJ list)
+    "overall",                  # defensive (also in caveman ADV list)
+    "appears", "appear",        # defensive (also in caveman VERB list)
+    "seems", "seem",            # defensive (also in caveman VERB list)
+    "shows", "show", "showing", # defensive (also in caveman VERB list)
+})
+
+# Generic-English shorthands. Keys are matched case-insensitively at
+# word boundaries; values are emitted verbatim (lowercase by convention).
+# Token savings on the reference project (6500-line merged timeline):
+#
+#   person      -> prsn   :  3967 occ  *  3 chars saved =  ~12k chars
+#   background  -> bg     :  3670 occ  *  8           =  ~29k chars
+#   electrical  -> elec   :  2854 occ  *  6           =  ~17k chars
+#   components  -> comp   :  1107 occ  *  6           =   ~6k chars
+#   equipment   -> equip  :   957 occ  *  4           =   ~3k chars
+#   workshop    -> shop   :   752 occ  *  4           =   ~3k chars
+#   interior    -> int    :   472 occ  *  5           =  ~2k chars
+#
+# Combined with _DROP_WORDS this layer alone trims another ~10-15% of
+# merged_timeline.md token count on top of the spaCy POS pass.
+_SHORTHAND = {
+    "person":       "prsn",
+    "people":       "ppl",
+    "background":   "bg",
+    "foreground":   "fg",
+    "electrical":   "elec",
+    "electronic":   "elec",     # collapse near-synonym
+    "electronics":  "elec",
+    "components":   "comp",
+    "component":    "comp",
+    "equipment":    "equip",
+    "workshop":     "shop",
+    "interior":     "int",
+    "exterior":     "ext",
+    "horizontal":   "horiz",
+    "vertical":     "vert",
+    "rectangular":  "rect",
+    "rectangle":    "rect",
+    "cylindrical":  "cyl",
+    "approximate":  "~",
+}
+
+# Pre-compiled word-boundary regex patterns. Built once at import time
+# so the per-doc post-pass is a single sub() call per pattern, no
+# string parsing on the hot path.
+_DROP_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _DROP_WORDS) + r")\b",
+    flags=re.IGNORECASE,
+)
+_SHORTHAND_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _SHORTHAND) + r")\b",
+    flags=re.IGNORECASE,
+)
+# Cleanup pass for the empty slots left by _DROP_WORDS removals:
+#   "image of a person"  ->  " of a person"  ->  "of person" (after caveman)
+#   ", visible,"         ->  ", ,"           ->  ","         (this regex)
+_DOUBLE_PUNCT_RE = re.compile(r"\s*([,.;:])(?:\s*[,.;:])+")
+_LEADING_PUNCT_RE = re.compile(r"^[\s,;:.]+")
+
+
+def _apply_shorthand(text: str) -> str:
+    """Apply the generic-English shorthand + drop-words pass.
+
+    Idempotent (running twice yields the same output) so it's safe to
+    call from both the per-doc compression path and any defensive
+    re-pack scenario.
+    """
+    if not text:
+        return ""
+    # 1. Drop pure-filler words. Replace with a single space so we
+    #    don't accidentally weld two words together ("imagewires").
+    text = _DROP_RE.sub(" ", text)
+    # 2. Apply shorthand, preserving sentence-final punctuation by
+    #    using word boundaries (the regex doesn't touch trailing
+    #    periods because `\b` matches between a letter and a `.`).
+    text = _SHORTHAND_RE.sub(lambda m: _SHORTHAND[m.group(0).lower()], text)
+    # 3. Collapse the punctuation rubble left behind by drops:
+    #    " ,  ,  ." -> ","
+    text = _DOUBLE_PUNCT_RE.sub(r"\1", text)
+    # 4. Trim leading orphan punctuation per sentence (split, fix, rejoin).
+    parts = text.split(". ")
+    parts = [_LEADING_PUNCT_RE.sub("", p).lstrip() for p in parts]
+    text = ". ".join(p for p in parts if p)
+    # 5. Final whitespace collapse — the drop pass left runs of spaces.
+    text = _WS_RUN_RE.sub(" ", text).strip()
+    return text
+
+
+# ---------------------------------------------------------------------------
 # spaCy model loader — singleton with auto-download on first use.
 # ---------------------------------------------------------------------------
 
@@ -179,6 +322,62 @@ _MULTILINGUAL_FALLBACK = "xx_ent_wiki_sm"
 
 def _resolve_model_name(lang: str) -> str:
     return _LANG_TO_MODEL.get(lang, _MULTILINGUAL_FALLBACK)
+
+
+def _ensure_spacy_installed() -> None:
+    """Auto-install spaCy if it's missing from the current interpreter.
+
+    Caveman compression is a default step in the pack_timelines pipeline,
+    so a fresh checkout that hasn't done `pip install -e .[preprocess]`
+    would otherwise crash on the first `import spacy` and the user would
+    get a wall of stack trace instead of the timeline files they asked
+    for. Auto-installing on first use keeps the "just clone and run"
+    story working — the cost is one ~30s pip install on the very first
+    invocation, then nothing.
+
+    Same subprocess-vs-API choice as `_spacy_download` below: pip's
+    Python API isn't a stable public interface, so we shell out to the
+    documented entry point. `--quiet` so we don't drown the
+    `[caveman]` progress lines under pip's own resolver chatter.
+    """
+    try:
+        import spacy  # noqa: F401  (probing import — discarded immediately)
+        return
+    except ImportError:
+        pass
+
+    print(
+        "[caveman] spaCy not installed — auto-installing via "
+        "`pip install spacy>=3.7,<4` (one-time, ~30s)…",
+        file=sys.stderr,
+    )
+    try:
+        subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install", "--quiet",
+                "spacy>=3.7,<4",
+            ],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise RuntimeError(
+            "caveman_compress: failed to auto-install spaCy. Install "
+            "manually with `pip install spacy>=3.7,<4` and try again. "
+            f"Underlying error: {exc}"
+        ) from exc
+
+    # Sanity-check the install actually landed in the running interpreter
+    # (catches the rare case where pip writes to a different site-packages,
+    # e.g. when sys.executable is a venv but pip is the user's global pip).
+    try:
+        import spacy  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "caveman_compress: pip reported success but `import spacy` "
+            "still fails — your `pip` may be installing into a different "
+            "site-packages than `sys.executable`. Run "
+            f"`{sys.executable} -m pip install spacy>=3.7,<4` directly."
+        ) from exc
 
 
 def _spacy_download(model_name: str) -> bool:
@@ -224,6 +423,12 @@ def get_nlp(lang: str = "en"):
     """
     if lang in _NLP_CACHE:
         return _NLP_CACHE[lang]
+
+    # Auto-install spaCy on first use so a fresh checkout doesn't need
+    # the user to `pip install -e .[preprocess]` before pack_timelines
+    # can do its job. Idempotent — once installed, the probe in
+    # `_ensure_spacy_installed` returns immediately.
+    _ensure_spacy_installed()
 
     import spacy  # heavy import; deferred until first call
 
@@ -323,6 +528,17 @@ def _compress_doc(doc) -> str:
     return result
 
 
+def _maybe_shorten(text: str, lang: str) -> str:
+    """Apply the English shorthand pass when lang == 'en'; pass through
+    otherwise. Centralized here so both `compress_text` and
+    `compress_batch` get the same behaviour without duplicating the
+    language guard at every call site.
+    """
+    if lang != "en":
+        return text
+    return _apply_shorthand(text)
+
+
 def compress_text(text: str, lang: str = "en") -> str:
     """Compress a single string. Cheap convenience wrapper around the
     batch path — for >1 caption use `compress_batch` to avoid per-call
@@ -333,7 +549,7 @@ def compress_text(text: str, lang: str = "en") -> str:
         return ""
     nlp = get_nlp(lang)
     doc = nlp(text)
-    return _compress_doc(doc)
+    return _maybe_shorten(_compress_doc(doc), lang)
 
 
 def compress_batch(
@@ -364,8 +580,10 @@ def compress_batch(
 
     out: list[str] = []
     # nlp.pipe streams Docs in input order, so we can append directly.
+    # The shorthand pass runs after each doc so we don't pay the regex
+    # cost on docs that came back empty from the POS filter.
     for doc in nlp.pipe(cleaned, batch_size=batch_size):
-        out.append(_compress_doc(doc))
+        out.append(_maybe_shorten(_compress_doc(doc), lang))
     return out
 
 

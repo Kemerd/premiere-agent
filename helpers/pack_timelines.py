@@ -56,16 +56,46 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Time formatting helpers (inlined from the deprecated pack_transcripts.py)
+# Time formatting helpers
+#
+# Compact M:SS / H:MM:SS form across all four timeline files. The hour
+# slot is omitted whenever it would be zero (a 90-second clip reads as
+# `1:30`, not `0:01:30`) and the leading minute is unpadded so 1- and
+# 2-digit minute values both look natural (`5:42` not `05:42`,
+# `10:32` not `10:32`). Surrounding `[…]` brackets that the older
+# pack_timelines used are dropped on purpose now: every event line
+# already wears a type-disambiguating wrapper (`"…"` for speech,
+# `(…)` for audio, `[…]` for visual), so an extra bracket pair on the
+# timestamp would just be noise the editor sub-agent has to skip.
+#
+# All timeline writers below funnel through `_fmt_ts` for a single
+# event timestamp and `_fmt_range` for `start-end` spans. Use whole
+# seconds throughout — sub-second precision was used by the legacy
+# format but the editor works in whole-second cut planning anyway, and
+# whole seconds round-trip cleanly to the M:SS display without ugly
+# decimal padding.
 # ---------------------------------------------------------------------------
 
-def format_time(seconds: float) -> str:
-    """Format a time in seconds as "NNN.NN" with fixed 6-char width.
+def _fmt_ts(seconds: float) -> str:
+    """Compact `M:SS` or `H:MM:SS` (drops the hour when zero)."""
+    s = max(0, int(round(float(seconds))))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
 
-    The fixed width keeps `[start-end]` columns aligned in the markdown
-    so the editor sub-agent can scan vertically.
-    """
-    return f"{seconds:06.2f}"
+
+def _fmt_range(start: float, end: float) -> str:
+    """`M:SS-M:SS` span (or `H:MM:SS-H:MM:SS` once any side crosses 1h)."""
+    return f"{_fmt_ts(start)}-{_fmt_ts(end)}"
+
+
+# Legacy alias kept around for any external callers / scripts that
+# imported `format_time` from this module. Routes to the new compact
+# format so output stays consistent across all entry points.
+def format_time(seconds: float) -> str:  # pragma: no cover — back-compat shim
+    return _fmt_ts(seconds)
 
 
 def format_duration(seconds: float) -> str:
@@ -173,16 +203,15 @@ def group_into_phrases(
 
 
 # ---------------------------------------------------------------------------
-# Time format helper for merged_timeline (HH:MM:SS not seconds)
+# Time format helper for merged_timeline — alias to the shared compact
+# `M:SS` / `H:MM:SS` formatter above. Kept as a thin alias because the
+# merged-timeline call sites read more clearly with `_hms(t)` than with
+# `_fmt_ts(t)`, and renaming all of them would balloon the diff for no
+# semantic gain.
 # ---------------------------------------------------------------------------
 
 def _hms(seconds: float) -> str:
-    """Format seconds as HH:MM:SS for the merged timeline."""
-    s = max(0.0, float(seconds))
-    h = int(s // 3600)
-    m = int((s % 3600) // 60)
-    sec = int(s % 60)
-    return f"{h:02d}:{m:02d}:{sec:02d}"
+    return _fmt_ts(seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -354,11 +383,14 @@ def _pack_speech(transcripts_dir: Path, silence_threshold: float) -> str:
     """Render speech_timeline.md content from <edit>/transcripts/*.json."""
     json_files = sorted(transcripts_dir.glob("*.json"))
     lines: list[str] = []
-    lines.append("# Speech timeline (Whisper)")
+    lines.append("# Speech timeline (Parakeet ONNX)")
     lines.append("")
     lines.append(
         f"Phrase-level transcript, broken on silence ≥ {silence_threshold:.1f}s "
-        f"or speaker change. `[start-end]` ranges are seconds from clip start."
+        f"or speaker change. Each line: `M:SS-M:SS [Sn] \"phrase text\"`. "
+        f"The double quotes are the speech type marker (consistent with "
+        f"`merged_timeline.md`). `[Sn]` is the speaker tag if diarization "
+        f"emitted one, omitted otherwise."
     )
     lines.append("")
 
@@ -387,12 +419,14 @@ def _pack_speech(transcripts_dir: Path, silence_threshold: float) -> str:
                 spk_str = str(spk)
                 if spk_str.startswith("speaker_"):
                     spk_str = spk_str[len("speaker_"):]
-                spk_tag = f" S{spk_str}"
+                spk_tag = f" [S{spk_str}]"
             else:
                 spk_tag = ""
+            # Format: `M:SS-M:SS [Sn] "phrase text"` — quotes are the
+            # speech type marker, consistent with merged_timeline.md.
             lines.append(
-                f"  [{format_time(ph['start'])}-{format_time(ph['end'])}]"
-                f"{spk_tag} {ph['text']}"
+                f"  {_fmt_range(ph['start'], ph['end'])}"
+                f"{spk_tag} \"{ph['text']}\""
             )
         lines.append("")
     return "\n".join(lines)
@@ -423,9 +457,14 @@ def _pack_speech(transcripts_dir: Path, silence_threshold: float) -> str:
 def _render_audio_events(events: list[dict], lines: list[str]) -> None:
     """Render CLAP (label, score) events grouped by (start, end) range.
 
+    Format: `M:SS-M:SS (label score, label score, ...)`. The
+    surrounding parens identify this as audio across all timeline
+    files (matches the merged_timeline.md convention); the timestamp
+    is bare, no `[…]` wrapper.
+
     Co-occurring labels in the same window collapse onto one line so a
     busy 10s window with 4 simultaneous tags reads as
-        [start-end] (drill 0.42, hammer 0.31, sandpaper 0.28, ...)
+        0:00-0:10 (drill 0.42, hammer 0.31, sandpaper 0.28, ...)
     rather than 4 separate rows. Within each row labels are sorted by
     descending score so the strongest match leads.
     """
@@ -441,7 +480,7 @@ def _render_audio_events(events: list[dict], lines: list[str]) -> None:
             f"{lab} {sc:.2f}" for sc, lab in labels[:5]
         )
         lines.append(
-            f"  [{format_time(s)}-{format_time(e)}] ({label_str})"
+            f"  {_fmt_range(s, e)} ({label_str})"
         )
 
 
@@ -451,14 +490,16 @@ def _render_audio_captions_legacy(captions: list[dict], lines: list[str]) -> Non
     Tagged `[legacy AF3]` so the agent can tell at a glance the cache
     is from the abandoned Audio Flamingo 3 migration and re-running
     the audio lane will refresh it into the canonical CLAP shape.
+    Wraps the caption text in parens (audio type marker) for
+    consistency with the canonical CLAP renderer above.
     """
     for c in sorted(captions, key=lambda x: float(x.get("start", 0.0))):
         s = float(c.get("start", 0.0))
         e = float(c.get("end", s))
         text = (c.get("text") or "").strip().replace("\n", " ")
         if not text:
-            text = "_(no caption)_"
-        lines.append(f"  [{format_time(s)}-{format_time(e)}] {text} [legacy AF3]")
+            text = "no caption"
+        lines.append(f"  {_fmt_range(s, e)} ({text}) [legacy AF3]")
 
 
 def _pack_audio(audio_tags_dir: Path) -> str:
@@ -469,12 +510,14 @@ def _pack_audio(audio_tags_dir: Path) -> str:
     lines.append("")
     lines.append(
         "Per-window sound events scored by LAION CLAP against a vocabulary "
-        "list. Each line: `[start-end] (label score, label score, ...)`. "
-        "Scores are cosine similarities (typically 0.10-0.45 — higher is "
-        "more confident). CLAP is much sharper than the abandoned PANNs "
-        "ontology but still noisy on edge classes; if labels look wrong "
-        "for THIS video, write a curated `<edit>/audio_vocab.txt` and "
-        "re-run `python helpers/audio_lane.py <video> --vocab "
+        "list. Each line: `M:SS-M:SS (label score, label score, ...)` — "
+        "the parens are the audio type marker (consistent with "
+        "`merged_timeline.md`). Scores are cosine similarities "
+        "(typically 0.10-0.45 — higher is more confident). CLAP is "
+        "much sharper than the abandoned PANNs ontology but still "
+        "noisy on edge classes; if labels look wrong for THIS video, "
+        "write a curated `<edit>/audio_vocab.txt` and re-run "
+        "`python helpers/audio_lane.py <video> --vocab "
         "<edit>/audio_vocab.txt --force` for sharper, content-aware tags."
     )
     lines.append("")
@@ -575,13 +618,16 @@ def _pack_visual(visual_caps_dir: Path) -> str:
     lines.append("# Visual timeline (Florence-2 detailed captions @ 1 fps)")
     lines.append("")
     lines.append(
-        "One caption per second. Static/slow scenes collapse to `(same)`. "
-        "Slowly-evolving scenes emit only the NEW sentences with a `+ ` "
-        "prefix (think `git diff` additions) — the previously-seen "
-        "sentences are dropped to keep the timeline scannable. A line "
-        "shown WITHOUT `+ ` is a full re-description (treat as a likely "
-        "shot change). Use timestamps to find shots / B-roll candidates "
-        "/ match cuts."
+        "Format: `M:SS [caption]` per second (or `H:MM:SS [caption]` "
+        "once a clip exceeds 1h). Square brackets are the type marker "
+        "— consistent with `merged_timeline.md` so the editor can "
+        "scan both files with the same parser in its head. "
+        "Static/slow scenes collapse to `(same)`. Slowly-evolving "
+        "scenes emit only the NEW sentences with a `+ ` prefix "
+        "OUTSIDE the brackets (`M:SS + [delta sentences]`) — think "
+        "`git diff` additions. A line shown WITHOUT `+ ` is a full "
+        "re-description (treat as a likely shot change). Use "
+        "timestamps to find shots / B-roll candidates / match cuts."
     )
     lines.append("")
 
@@ -618,12 +664,20 @@ def _pack_visual(visual_caps_dir: Path) -> str:
             # caches: render verbatim and DON'T let them poison the
             # prev_norms baseline (we have no sentence content to track).
             if raw == "(same)":
-                lines.append(f"  [{format_time(t)}] (same)")
+                lines.append(f"  {_fmt_ts(t)} (same)")
                 continue
             mode, prev_norms, display = _delta_caption(raw, prev_norms)
             if mode == "empty":
                 continue
-            lines.append(f"  [{format_time(t)}] {display}")
+            # Wrap in `[]` (visual type marker) and pull the `+ `
+            # delta prefix outside the brackets so it sits at the
+            # left margin where the editor can scan it.
+            if mode == "same":
+                lines.append(f"  {_fmt_ts(t)} (same)")
+            elif mode == "delta" and display.startswith("+ "):
+                lines.append(f"  {_fmt_ts(t)} + [{display[2:]}]")
+            else:
+                lines.append(f"  {_fmt_ts(t)} [{display}]")
         lines.append("")
     return "\n".join(lines)
 
@@ -661,16 +715,22 @@ def _build_merged(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
     out.append("# Merged timeline")
     out.append("")
     out.append(
-        "All three lanes interleaved by timestamp (HH:MM:SS). "
-        "Speech lines are quoted; audio events use `(audio: ...)`; "
-        "visual captions use `visual:` prefix. A `visual:` line whose "
-        "text starts with `+ ` is a delta — only the sentences that "
-        "are NEW vs the prior caption are shown (sentences that didn't "
-        "change are dropped to keep the file scannable). A `visual:` "
-        "line WITHOUT `+ ` is a full re-description (treat as a likely "
-        "shot change). Frames whose caption fully overlaps the prior "
-        "frame are dropped from the merged view entirely — drill into "
-        "`visual_timeline.md` if you want the per-second `(same)` markers."
+        "All three lanes interleaved by timestamp. Each line is "
+        "`M:SS` (or `H:MM:SS` once a clip exceeds 1h) followed by "
+        "ONE of three event types, distinguishable by the bracket "
+        "style (no `visual:` / `audio:` prefixes — the brackets are "
+        "the type marker, save tokens):\n"
+        "  - `\"...\"`  speech (transcribed phrase, verbatim quote)\n"
+        "  - `(...)`  audio event(s) (CLAP zero-shot labels, comma-sep)\n"
+        "  - `[...]`  visual caption (Florence-2, caveman-compressed)\n"
+        "\n"
+        "A visual line prefixed with `+ ` is a delta — only the NEW "
+        "sentences vs the prior caption are shown (sentences that "
+        "didn't change are dropped to keep the file scannable). A "
+        "visual line WITHOUT `+ ` is a full re-description (treat as "
+        "a likely shot change). Visually identical frames are dropped "
+        "from this view entirely — drill into `visual_timeline.md` "
+        "for per-second `(same)` markers."
     )
     out.append("")
 
@@ -679,6 +739,8 @@ def _build_merged(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
         events: list[tuple[float, str]] = []  # (t, line)
 
         # ── Speech: take phrases (already grouped) at their start time ──
+        # Format: `M:SS "phrase text"` — the surrounding double quotes
+        # ARE the type marker, no `speech:` prefix needed.
         sp = transcripts / f"{stem}.json"
         if sp.exists():
             data = json.loads(sp.read_text(encoding="utf-8"))
@@ -686,7 +748,7 @@ def _build_merged(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
             for ph in phrases:
                 events.append((
                     float(ph["start"]),
-                    f"[{_hms(ph['start'])}] \"{ph['text']}\"",
+                    f"{_hms(ph['start'])} \"{ph['text']}\"",
                 ))
 
         # ── Audio: one line per merged CLAP event range. Co-occurring   ──
@@ -704,11 +766,15 @@ def _build_merged(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
                     by_range.setdefault(key, []).append(
                         (float(ev.get("score", 0.0)), str(ev.get("label", "?")))
                     )
+                # Format: `M:SS (label1, label2, ...)` — the parens are
+                # the type marker; no `audio:` prefix because the
+                # brackets already disambiguate vs visual `[...]` and
+                # speech `"..."`.
                 for (s, _e), labels in by_range.items():
                     labels.sort(key=lambda x: -x[0])
                     label_str = ", ".join(lab for _sc, lab in labels[:5])
                     events.append((
-                        s, f"[{_hms(s)}] (audio: {label_str})",
+                        s, f"{_hms(s)} ({label_str})",
                     ))
             else:
                 # Legacy AF3 cache fallback — render free-form chunk
@@ -721,7 +787,7 @@ def _build_merged(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
                     if not text:
                         continue
                     events.append((
-                        s, f"[{_hms(s)}] (audio: {text})",
+                        s, f"{_hms(s)} ({text})",
                     ))
 
         # ── Visual: raw captions, run through the sentence-level fuzzy ──
@@ -731,6 +797,15 @@ def _build_merged(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
         # caption are dropped entirely (mode == "same" / "empty"); deltas
         # carry a `+ ` prefix so the editor can see at a glance which
         # rows are partial vs full re-descriptions.
+        # Format: `M:SS [caption text]` for full re-descriptions, or
+        # `M:SS + [delta sentences]` when the caption is a partial
+        # delta against the prior frame. The square brackets are the
+        # type marker (no `visual:` prefix); the leading `+ ` lives
+        # OUTSIDE the brackets so the delta nature is visible at the
+        # left margin without the editor having to peek inside the
+        # bracket text. The `_delta_caption` helper emits its display
+        # text already prefixed with `+ ` in delta mode — strip that
+        # prefix so we can re-attach it cleanly outside the brackets.
         vp = visual_caps / f"{stem}.json"
         if vp.exists():
             data = json.loads(vp.read_text(encoding="utf-8"))
@@ -748,7 +823,12 @@ def _build_merged(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
                 mode, prev_norms, display = _delta_caption(raw, prev_norms)
                 if mode in ("same", "empty"):
                     continue
-                events.append((t, f"[{_hms(t)}] visual: {display}"))
+                if mode == "delta" and display.startswith("+ "):
+                    body = display[2:]
+                    line = f"{_hms(t)} + [{body}]"
+                else:
+                    line = f"{_hms(t)} [{display}]"
+                events.append((t, line))
 
         events.sort(key=lambda x: x[0])
         if not events:
