@@ -32,7 +32,9 @@ JSON shape:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -72,6 +74,93 @@ PANNS_CHECKPOINT_URL = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Atomic-rename retry helper (Windows Defender workaround)
+#
+# On Windows, `Path.replace()` can fail with PermissionError / WinError 32
+# ("being used by another process") moments after a large file is closed.
+# The culprit is almost never our code — the writer handle exits cleanly
+# via the `with open(...)` block. The real offender is a transient scan
+# handle held by:
+#   * Windows Defender real-time protection (scans newly-written files
+#     before any other process can rename/move them; this is its whole job)
+#   * Windows Search Indexer / SearchProtocolHost
+#   * Third-party AV (Kaspersky, McAfee, etc.)
+#
+# Defender's scan window for a ~340 MB binary is typically 200ms - 2s on a
+# modern NVMe. So we retry the rename a handful of times with exponential
+# backoff. Total worst-case wait ~3.1s — invisible next to the 5+ minute
+# download we just performed, but enough to outlast the scan handle.
+#
+# We only retry on errors that smell like a sharing violation:
+#   - EACCES (errno 13)
+#   - WinError 32 / 33 (sharing violation / lock violation), which Python
+#     surfaces as PermissionError with .winerror set
+# Any other OSError is a real problem (disk full, permission denied at the
+# directory level, etc.) and re-raises immediately so we don't mask bugs.
+# ---------------------------------------------------------------------------
+
+_WINERROR_SHARING_VIOLATION = 32  # ERROR_SHARING_VIOLATION
+_WINERROR_LOCK_VIOLATION = 33     # ERROR_LOCK_VIOLATION
+
+
+def _is_sharing_violation(exc: OSError) -> bool:
+    """True iff `exc` looks like a transient Windows file-lock conflict.
+
+    We deliberately accept both the cross-platform `errno.EACCES` and the
+    Windows-specific `winerror` codes — different Python versions surface
+    sharing violations through slightly different attributes.
+    """
+    if getattr(exc, "winerror", None) in (
+        _WINERROR_SHARING_VIOLATION,
+        _WINERROR_LOCK_VIOLATION,
+    ):
+        return True
+    if exc.errno == errno.EACCES:
+        return True
+    return False
+
+
+def _atomic_replace_with_retry(
+    tmp_path: Path,
+    final_path: Path,
+    *,
+    max_attempts: int = 6,
+    initial_delay_s: float = 0.1,
+) -> None:
+    """`tmp_path.replace(final_path)` with backoff for AV scan handles.
+
+    Backoff schedule (default): 0.1, 0.2, 0.4, 0.8, 1.6 s between attempts
+    — total ceiling ~3.1s of waiting. If the rename still fails after that,
+    something is genuinely wrong (file actually open by user, weird mount,
+    etc.) and the original error propagates so the caller can clean up.
+    """
+    delay = initial_delay_s
+    last_exc: OSError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            tmp_path.replace(final_path)
+            return
+        except OSError as exc:
+            # Re-raise non-transient errors immediately. Disk full, perm
+            # denied, etc. won't get better with sleep.
+            if not _is_sharing_violation(exc):
+                raise
+            last_exc = exc
+            if attempt == max_attempts:
+                break
+            print(
+                f"  panns: rename blocked (likely AV scan), "
+                f"retrying in {delay:.1f}s (attempt {attempt}/{max_attempts})",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            delay *= 2.0
+    # Out of retries — surface the last error with context.
+    assert last_exc is not None  # for type checkers; loop above guarantees
+    raise last_exc
+
+
 def _ensure_panns_data_csv() -> None:
     """Guarantee `~/panns_data/class_labels_indices.csv` exists before we
     import `panns_inference`. Idempotent: returns instantly when the file
@@ -94,7 +183,9 @@ def _ensure_panns_data_csv() -> None:
         with urllib.request.urlopen(PANNS_LABELS_URL, timeout=30) as resp:
             data = resp.read()
         tmp_path.write_bytes(data)
-        tmp_path.replace(PANNS_LABELS_CSV)
+        # Same Defender-aware rename used by the checkpoint download below;
+        # 10 KB rarely triggers the AV scan window but the cost is zero.
+        _atomic_replace_with_retry(tmp_path, PANNS_LABELS_CSV)
     except Exception as exc:
         try:
             if tmp_path.exists():
@@ -142,12 +233,44 @@ def _ensure_panns_data_checkpoint() -> None:
         return
 
     PANNS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Salvage path: a previous run may have completed the download but
+    # crashed during the .tmp -> .pth rename (Windows Defender holding a
+    # scan handle long enough to outlast our retry budget). In that case
+    # the .pth.tmp file is on disk, fully written, and just needs a
+    # rename. We use the heuristic "tmp exists and is at least 300 MB"
+    # to avoid mistakenly promoting a half-downloaded fragment from a
+    # genuine Ctrl-C scenario. Real checkpoint is ~340 MB.
+    tmp_path = PANNS_CHECKPOINT_PATH.with_suffix(".pth.tmp")
+    SALVAGE_MIN_BYTES = 300 * 1024 * 1024
+    if tmp_path.exists() and tmp_path.stat().st_size >= SALVAGE_MIN_BYTES:
+        print(
+            f"  panns: salvaging existing tmp ({tmp_path.stat().st_size // (1024*1024)} MB) "
+            f"from previous run -> {PANNS_CHECKPOINT_PATH.name}"
+        )
+        try:
+            _atomic_replace_with_retry(tmp_path, PANNS_CHECKPOINT_PATH)
+            return
+        except OSError as exc:
+            # Salvage failed too — fall through to a fresh download but
+            # warn the user so they understand why we're spending 5 min
+            # on bandwidth they already paid for.
+            print(
+                f"  panns: salvage rename failed ({exc}); re-downloading. "
+                f"You may want to add this folder to your AV scan exclusions: "
+                f"{PANNS_DATA_DIR}",
+                file=sys.stderr,
+            )
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
     print(f"  panns: bootstrapping CNN14 checkpoint -> {PANNS_CHECKPOINT_PATH}")
     print(f"  panns: ~340 MB one-time download from {PANNS_CHECKPOINT_URL}")
 
     # Atomic-write pattern matches the CSV helper above. Same reasoning:
     # an interrupted half-file would silently break later inference runs.
-    tmp_path = PANNS_CHECKPOINT_PATH.with_suffix(".pth.tmp")
     # 1 MB read chunks. Small enough to keep RAM flat, large enough that
     # the per-chunk Python overhead vanishes next to the network read.
     chunk_size = 1024 * 1024
@@ -181,6 +304,18 @@ def _ensure_panns_data_checkpoint() -> None:
                         else:
                             print(f"  panns: downloaded {done_mb:.0f} MB")
                         next_tick += progress_step
+                # Force the kernel buffer to disk *before* the file handle
+                # closes. This matters on Windows: as soon as the handle
+                # closes, Defender opens its own scan handle, and if the
+                # data is still in the page cache the scan takes longer
+                # (= longer rename block). fsync makes the scan deterministic.
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    # fsync can fail on some weird filesystems (network mounts,
+                    # tmpfs, etc.). Not fatal — the OS will flush eventually.
+                    pass
 
             # Final summary line so the user sees a clean "done" rather
             # than the loop just stopping mid-progress.
@@ -190,7 +325,10 @@ def _ensure_panns_data_checkpoint() -> None:
             else:
                 print(f"  panns: downloaded {done_mb:.0f} MB (complete)")
 
-        tmp_path.replace(PANNS_CHECKPOINT_PATH)
+        # Use the retry-aware helper instead of bare replace() — Defender
+        # holds a scan handle on the freshly-written 340 MB blob for a few
+        # hundred ms, which would otherwise crash us with WinError 32.
+        _atomic_replace_with_retry(tmp_path, PANNS_CHECKPOINT_PATH)
     except Exception as exc:
         try:
             if tmp_path.exists():
