@@ -176,23 +176,62 @@ class OnnxSessionPool:
         providers = resolve_providers(prefer_tensorrt=prefer_tensorrt)
 
         # ── Build the N sessions ──────────────────────────────────────
-        # We call .with_timestamps() up front because it returns a
-        # *different adapter type* than the bare load_model output;
-        # storing the timestamped adapter directly means worker code
-        # only ever calls .recognize().
+        # We chain TWO adapters at load time, in order:
+        #
+        #   .with_timestamps()  ─ enables word-level timestamp emission
+        #                         from the TDT decoder. Returns a different
+        #                         adapter type than bare load_model(), so
+        #                         we lock it in early and worker code can
+        #                         just call .recognize() agnostically.
+        #
+        #   .with_vad()         ─ wraps recognize() with silero VAD-based
+        #                         chunking. THIS IS LOAD-BEARING for the
+        #                         TensorRT EP: TRT compiles the encoder
+        #                         with a fixed optimization profile shape
+        #                         range (typically up to ~30s of audio at
+        #                         16 kHz, i.e. 480000 samples). Audio
+        #                         longer than that violates the profile
+        #                         and ORT-TRT raises EP_FAIL at runtime.
+        #                         silero VAD splits the waveform into
+        #                         speech-bounded windows (≤30s by default)
+        #                         that always satisfy the profile.
+        #                         For CUDA / CPU EPs (dynamic shapes) it
+        #                         is a near no-op for short audio and a
+        #                         pure win for long-form content (we skip
+        #                         re-encoding silence).
         print(
             f"  [pool] loading {target_n} session(s) of "
             f"{model_id} (quant={quantization or 'fp16'})"
         )
+
+        # Pre-load a single shared silero VAD instance. onnx-asr's
+        # `.with_vad(vad)` adapter requires a concrete VAD model object
+        # (it doesn't lazily fetch one). We share the same instance
+        # across every session in the pool because:
+        #
+        #   • silero VAD is tiny (~2 MB ONNX, runs on CPU by default).
+        #   • Its inference is stateless w.r.t. the calling thread —
+        #     no internal mutable buffers across recognize() calls.
+        #   • Sharing avoids N copies of the VAD weights in RAM and
+        #     N redundant HF Hub round-trips at startup.
+        #
+        # If the install is missing the silero VAD asset, `load_vad`
+        # raises clearly enough that we don't try to mask it.
+        vad = onnx_asr.load_vad("silero")
+
         t0 = time.time()
         self._sessions: list[Any] = []
         for i in range(target_n):
             try:
-                model = onnx_asr.load_model(
-                    model_id,
-                    quantization=quantization,
-                    providers=providers,
-                ).with_timestamps()
+                model = (
+                    onnx_asr.load_model(
+                        model_id,
+                        quantization=quantization,
+                        providers=providers,
+                    )
+                    .with_timestamps()
+                    .with_vad(vad)
+                )
             except Exception as e:
                 # If we got at least one session built, run with what
                 # we have rather than failing the whole pool — partial
