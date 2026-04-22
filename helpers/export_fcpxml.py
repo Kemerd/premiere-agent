@@ -62,16 +62,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Source-media probing — the FCPXML adapter requires every external media
-# reference to have an `available_range` so it can write the asset's full
-# duration into the FCPXML <asset>/<format> declaration. NLEs use this to
-# pre-allocate the timeline view and to reject obviously corrupt imports.
+# Source-media probing — the FCPXML / xmeml adapters require every external
+# media reference to have an `available_range` so they can write the asset's
+# full duration into the asset declaration. NLEs use this to pre-allocate
+# the timeline view and to reject obviously corrupt imports.
+#
+# We also need the AUDIO channel count + sample rate per source. Premiere
+# strict-validates "Cannot Link Media: file has N audio channel(s) and the
+# clip was created with M audio channel(s) with a different channel type."
+# when the asset declaration lies about the source's audio shape — so we
+# probe it and write the truth.
 #
 # We ffprobe each unique source ONCE and cache the result so a 60-clip EDL
 # referencing 4 source files only costs 4 ffprobe calls.
@@ -82,44 +90,180 @@ from pathlib import Path
 # and use that source's real duration at conform time.
 _FFPROBE_FALLBACK_DURATION_S = 24 * 60 * 60.0  # 24 h sentinel
 
-_PROBE_CACHE: dict[str, float] = {}
+# Sensible defaults when ffprobe can't read a stream (rare). Stereo 48kHz
+# is what 99% of camera/phone footage ships — guessing this matches more
+# reality than guessing mono, AND matches what Premiere bins assume by
+# default, so the relink dialog doesn't fire on the fallback path either.
+_DEFAULT_AUDIO_CHANNELS = 2
+_DEFAULT_AUDIO_SAMPLERATE = 48000
+_DEFAULT_VIDEO_WIDTH = 1920
+_DEFAULT_VIDEO_HEIGHT = 1080
 
 
-def _probe_source_duration_s(path: Path) -> float:
-    """Return the source media duration in seconds, ffprobe + cached.
+# SourceMeta cache — one entry per absolute source path. Values are the
+# probed shape of the source; see _probe_source_meta() for field semantics.
+_PROBE_CACHE: dict[str, dict] = {}
+
+
+def _probe_source_meta(path: Path) -> dict:
+    """Return source media shape dict, ffprobe + cached.
+
+    Keys:
+      duration_s     : float — full media duration in seconds
+      has_video      : bool  — at least one video stream present
+      has_audio      : bool  — at least one audio stream present
+      audio_channels : int   — channel count of the FIRST audio stream
+      audio_rate     : int   — sample rate (Hz) of the FIRST audio stream
+      video_width    : int   — pixel width of the first video stream
+      video_height   : int   — pixel height of the first video stream
 
     On any failure (missing ffprobe, unreadable file, malformed output)
-    return a 24h sentinel so the FCPXML still writes — Premiere will
-    reconcile against the real file at relink time.
+    we fall back to a stereo-48k / 1080p / 24h-duration shape so the
+    export still writes and Premiere/Resolve relinks against the real
+    file at conform time.
     """
     key = str(path)
     if key in _PROBE_CACHE:
         return _PROBE_CACHE[key]
+
+    # Single ffprobe call returns BOTH format-level (duration) and
+    # stream-level (audio channels, sample rate, video dims) data as
+    # JSON — cheaper than two probes and atomically consistent.
+    meta = {
+        "duration_s": _FFPROBE_FALLBACK_DURATION_S,
+        "has_video": True,
+        "has_audio": True,
+        "audio_channels": _DEFAULT_AUDIO_CHANNELS,
+        "audio_rate": _DEFAULT_AUDIO_SAMPLERATE,
+        "video_width": _DEFAULT_VIDEO_WIDTH,
+        "video_height": _DEFAULT_VIDEO_HEIGHT,
+    }
     try:
-        out = subprocess.run(
+        proc = subprocess.run(
             ["ffprobe", "-v", "error",
-             "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1",
+             "-show_format",
+             "-show_streams",
+             "-of", "json",
              str(path)],
             capture_output=True, text=True, check=True, timeout=10,
-        ).stdout.strip()
-        dur = float(out)
-        if dur <= 0:
-            raise ValueError("non-positive duration")
+        )
+        info = json.loads(proc.stdout or "{}")
+        # Format-level duration is the most reliable single number
+        # across containers (per-stream duration drifts on VFR sources).
+        fmt = info.get("format") or {}
+        try:
+            dur = float(fmt.get("duration", 0.0))
+            if dur > 0:
+                meta["duration_s"] = dur
+        except (TypeError, ValueError):
+            pass
+
+        # Walk streams once — first audio stream wins (NLEs only see
+        # one audio shape per file anyway), first video stream wins.
+        a_seen, v_seen = False, False
+        for s in info.get("streams") or []:
+            kind = s.get("codec_type")
+            if kind == "audio" and not a_seen:
+                a_seen = True
+                try:
+                    meta["audio_channels"] = int(s.get("channels") or
+                                                 _DEFAULT_AUDIO_CHANNELS)
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    meta["audio_rate"] = int(s.get("sample_rate") or
+                                             _DEFAULT_AUDIO_SAMPLERATE)
+                except (TypeError, ValueError):
+                    pass
+            elif kind == "video" and not v_seen:
+                v_seen = True
+                try:
+                    meta["video_width"] = int(s.get("width") or
+                                              _DEFAULT_VIDEO_WIDTH)
+                    meta["video_height"] = int(s.get("height") or
+                                               _DEFAULT_VIDEO_HEIGHT)
+                except (TypeError, ValueError):
+                    pass
+        meta["has_audio"] = a_seen
+        meta["has_video"] = v_seen
+        if not a_seen and not v_seen:
+            # File had no streams ffprobe could classify; treat as a
+            # failure for the warning path below but still write.
+            raise ValueError("no audio or video streams found")
     except Exception as e:
-        # Don't crash the export — the alternative is no FCPXML at all.
-        # Mention the fallback in stderr so the user can investigate if
-        # they care; most won't, the 24h sentinel works in every NLE
-        # we've tested.
         print(
             f"  warn: ffprobe failed for {path.name} ({type(e).__name__}: "
-            f"{e}); using {_FFPROBE_FALLBACK_DURATION_S/3600:.0f}h sentinel "
-            "available_range. NLE will relink to actual source duration.",
+            f"{e}); using stereo-48k/{_DEFAULT_VIDEO_WIDTH}x"
+            f"{_DEFAULT_VIDEO_HEIGHT}/{_FFPROBE_FALLBACK_DURATION_S/3600:.0f}h "
+            "sentinel asset shape. NLE will relink to the actual source.",
             file=sys.stderr,
         )
-        dur = _FFPROBE_FALLBACK_DURATION_S
-    _PROBE_CACHE[key] = dur
-    return dur
+
+    _PROBE_CACHE[key] = meta
+    return meta
+
+
+# Backward-compat shim for older callers (and tests) that only need the
+# duration. New code should prefer `_probe_source_meta()` directly.
+def _probe_source_duration_s(path: Path) -> float:
+    """Return only the source duration in seconds — convenience wrapper."""
+    return _probe_source_meta(path)["duration_s"]
+
+
+# ---------------------------------------------------------------------------
+# File-URL construction. Premiere Pro mis-parses RFC 8089 `file:///A:/...`
+# Windows URLs (the three-slash form) — it interprets the leading slash run
+# as a UNC share prefix and the imported clip ends up showing as
+# `\\\A:\YouTube\...` (three backslashes, can't relink).
+#
+# The `file://localhost/A:/...` form (explicit `localhost` host) is the
+# unambiguous variant Adobe's importer parses correctly. POSIX paths are
+# fine either way; we only special-case Windows drive-letter paths.
+#
+# Path.as_uri() alone is wrong for our use; this helper supersedes it for
+# every URL we hand to the OTIO adapters.
+# ---------------------------------------------------------------------------
+
+# Match Windows drive-letter paths in any flavor (forward or back slashes).
+_WIN_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/]")
+
+
+def _safe_file_url(path: Path) -> str:
+    """Return a file:// URL that Premiere AND Resolve AND FCP X parse correctly.
+
+    - Windows drive paths       -> file://localhost/A:/path/to/file.mp4
+    - Windows UNC paths         -> file://server/share/path/to/file.mp4
+    - POSIX absolute paths      -> file:///abs/path/to/file.mp4
+    - Anything else             -> Path.as_uri() (RFC 8089 default)
+
+    The localhost form is documented by Adobe for Premiere imports and
+    round-trips cleanly through XtoCC, FCP 7, FCP X, and Resolve.
+    """
+    s = str(path)
+    # UNC: "\\server\share\..." — keep server as the host segment.
+    if s.startswith("\\\\") or s.startswith("//"):
+        # Strip leading slashes and split server/share/rest.
+        rest = s.lstrip("\\/").replace("\\", "/")
+        # No percent-encoding here — NLEs are forgiving and our paths
+        # come from the EDL which was written by us / the user; spaces
+        # are the only realistic concern, and NLEs handle raw spaces
+        # in pathurl/src attributes fine in practice.
+        return f"file://{rest}"
+
+    # Windows drive letter: "A:\foo\bar" or "A:/foo/bar".
+    m = _WIN_DRIVE_RE.match(s)
+    if m:
+        # Normalize to forward slashes; the localhost host removes any
+        # ambiguity about how many leading slashes follow `file:`.
+        normalized = s.replace("\\", "/")
+        return f"file://localhost/{normalized}"
+
+    # POSIX / fallback — Path.as_uri() does the right thing here.
+    try:
+        return path.as_uri()
+    except ValueError:
+        # as_uri() rejects relative paths; resolve and retry.
+        return path.resolve().as_uri()
 
 
 # ---------------------------------------------------------------------------
@@ -252,25 +396,75 @@ def build_timeline(edl: dict, frame_rate: float):
         # they'll get the standard "missing media" relink dialog, same as
         # for any imported XML.
         #
-        # available_range is REQUIRED by the FCPXML adapter — it writes
-        # this into the <asset> declaration. We ffprobe the source once
-        # and cache. See _probe_source_duration_s().
+        # available_range is REQUIRED by both adapters — it writes into
+        # the asset declaration. We probe the source ONCE for duration +
+        # audio/video shape and cache it; see _probe_source_meta().
+        #
+        # The audio shape (channel count + sample rate) matters: Premiere
+        # validates "the clip was created with N audio channel(s)" against
+        # the actual file on link, and refuses if they disagree. We pre-
+        # populate the fcp_xml metadata so the FCP7 xmeml writer emits
+        # <channelcount>/<samplerate> matching the real source.
         src_path_resolved = Path(src_path).resolve()
-        media_dur_s = _probe_source_duration_s(src_path_resolved)
+        src_meta = _probe_source_meta(src_path_resolved)
+        media_dur_s = src_meta["duration_s"]
         media_avail_range = otio.opentime.TimeRange(
             start_time=otio.opentime.RationalTime(0, frame_rate),
             duration=_rt(media_dur_s, frame_rate),
         )
+
+        # Use a Premiere-safe file URL (file://localhost/... on Windows)
+        # in place of Path.as_uri()'s file:///A:/... which Premiere
+        # mis-parses as a UNC path and shows back as \\\A:\... .
+        safe_url = _safe_file_url(src_path_resolved)
+
+        # Build the per-source fcp_xml media descriptor ONCE — both the
+        # video and audio clip refs share the same source file, so they
+        # share the same shape. The dict layout mirrors the FCP7 xmeml
+        # element tree exactly (see otio_fcp_adapter._dict_to_xml_tree).
+        fcp_xml_media: dict = {}
+        if src_meta["has_video"]:
+            fcp_xml_media["video"] = {
+                "samplecharacteristics": {
+                    "width": src_meta["video_width"],
+                    "height": src_meta["video_height"],
+                },
+            }
+        if src_meta["has_audio"]:
+            fcp_xml_media["audio"] = {
+                "channelcount": src_meta["audio_channels"],
+                "samplecharacteristics": {
+                    "depth": 16,
+                    "samplerate": src_meta["audio_rate"],
+                },
+            }
 
         def _new_media_ref():
             """Each clip gets its own ExternalReference because the FCPXML
             adapter sometimes writes per-asset state; sharing one ref
             across clips has caused 'asset already declared' errors in
             past adapter versions. Cheap enough to construct per-clip."""
-            return otio.schema.ExternalReference(
-                target_url=src_path_resolved.as_uri(),
+            ref = otio.schema.ExternalReference(
+                target_url=safe_url,
                 available_range=media_avail_range,
             )
+            # The fcp_xml adapter reads media_reference.metadata['fcp_xml']
+            # and serializes it verbatim into the <file> element. Setting
+            # the `media` subtree pre-empts the adapter's empty-defaults
+            # fallback (no channelcount, no samplerate) which is what
+            # triggers Premiere's "Cannot Link Media" mismatch error.
+            if fcp_xml_media:
+                ref.metadata["fcp_xml"] = {"media": dict(fcp_xml_media)}
+            # Also stash on the canonical schema fields for any adapter
+            # that introspects them — and pass through to fcpx_xml's
+            # post-write step (see _patch_fcpxml_audio_shape).
+            ref.metadata["video-use-premiere"] = {
+                "audio_channels": src_meta["audio_channels"],
+                "audio_rate": src_meta["audio_rate"],
+                "has_audio": src_meta["has_audio"],
+                "has_video": src_meta["has_video"],
+            }
+            return ref
 
         # Video clip
         v_clip = otio.schema.Clip(
@@ -367,6 +561,118 @@ _TARGET_INFO = {
 }
 
 
+# ---------------------------------------------------------------------------
+# FCPXML 1.10+ post-write patch.
+#
+# The otio-fcpx-xml-adapter hardcodes `hasAudio="0"` / `hasVideo="0"` on
+# every asset and never emits `audioSources` / `audioChannels` / `audioRate`
+# attributes. Premiere Pro and DaVinci Resolve both reject the file with
+# "Cannot Link Media" or silently skip the audio track when those are
+# absent or wrong.
+#
+# We don't fork the adapter; we patch the file in place after write,
+# walking every <asset src="..."> and looking the source's true shape
+# back up via the same _probe_source_meta() cache that fed build_timeline.
+# That keeps the patch authoritative (always matches the actual file) and
+# adapter-version-agnostic (works regardless of how OTIO upgrades).
+# ---------------------------------------------------------------------------
+
+def _path_from_safe_url(url: str) -> Path | None:
+    """Inverse of _safe_file_url — recover the local Path for cache lookup.
+
+    Handles file://localhost/A:/..., file:///A:/..., file:///abs/...,
+    and bare paths. Returns None when nothing usable can be parsed.
+    """
+    if not url:
+        return None
+    s = url
+    # Strip the scheme + host segment in any of the documented forms.
+    for prefix in ("file://localhost/", "file:///", "file://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    # On Windows a leading / before the drive letter is a leftover from
+    # the file:// stripping and must go (`/A:/foo` -> `A:/foo`).
+    if len(s) >= 3 and s[0] == "/" and s[2] == ":":
+        s = s[1:]
+    try:
+        return Path(s).resolve()
+    except Exception:
+        return None
+
+
+def _patch_fcpxml_audio_shape(out_path: Path) -> int:
+    """Rewrite asset attributes in a freshly-written .fcpxml so each
+    asset declares the audio + video shape that matches its real source.
+
+    Returns the count of assets patched. Errors are non-fatal — if the
+    file isn't valid XML or no assets are found, we leave it alone and
+    let the user's NLE complain at import time (which is the same
+    behaviour they'd get without this patch).
+    """
+    try:
+        # Local import keeps cElementTree out of the cold-start path.
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(str(out_path))
+        root = tree.getroot()
+    except Exception as e:
+        print(f"  warn: could not parse {out_path.name} for audio-shape "
+              f"patch ({type(e).__name__}: {e}); leaving as-is.",
+              file=sys.stderr)
+        return 0
+
+    patched = 0
+    # FCPXML 1.10+ schema: <fcpxml><resources><asset src="..." .../></resources>
+    # Tolerate any nesting by walking the whole tree — costs nothing on
+    # the small XML files we generate.
+    for asset in root.iter("asset"):
+        src = asset.get("src")
+        local_path = _path_from_safe_url(src)
+        if local_path is None:
+            continue
+        meta = _PROBE_CACHE.get(str(local_path))
+        if meta is None:
+            # Not in cache (e.g. the user re-ran the patcher standalone).
+            # Probe on demand — the cache will absorb the cost.
+            try:
+                meta = _probe_source_meta(local_path)
+            except Exception:
+                continue
+
+        # hasVideo / hasAudio drive whether NLEs even attempt to link the
+        # respective track. Set them to match probed reality.
+        asset.set("hasVideo", "1" if meta["has_video"] else "0")
+        asset.set("hasAudio", "1" if meta["has_audio"] else "0")
+
+        if meta["has_audio"]:
+            # FCPXML's audio shape: 1 source with N channels at R Hz.
+            # Premiere validates these against the linked file at conform
+            # time; mismatched values trigger the "Cannot Link Media"
+            # dialog the user reported.
+            asset.set("audioSources", "1")
+            asset.set("audioChannels", str(int(meta["audio_channels"])))
+            asset.set("audioRate", str(int(meta["audio_rate"])))
+
+        patched += 1
+
+    if patched == 0:
+        return 0
+
+    try:
+        # Preserve the XML declaration the adapter emitted; ET writes a
+        # fresh one when xml_declaration=True. Resolve and Premiere both
+        # require the declaration, so we keep it.
+        tree.write(str(out_path), encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        print(f"  warn: audio-shape patch built but failed to write back "
+              f"to {out_path.name} ({type(e).__name__}: {e}); the file is "
+              "still valid FCPXML, just missing the audio attrs.",
+              file=sys.stderr)
+        return 0
+
+    return patched
+
+
 def write_fcpxml(timeline, out_path: Path) -> None:
     """Write the timeline as FCPXML 1.10+ (.fcpxml) — Resolve / FCP X path.
 
@@ -374,6 +680,11 @@ def write_fcpxml(timeline, out_path: Path) -> None:
     (declared in pyproject.toml's [fcpxml] extra). If it's missing we
     raise a clean install hint instead of letting OTIO's generic
     "no adapter for extension" message reach the user.
+
+    After the adapter writes the file we run _patch_fcpxml_audio_shape()
+    to inject `hasAudio` / `audioSources` / `audioChannels` / `audioRate`
+    attributes on each <asset> so Premiere and Resolve link the audio
+    track without complaining about a channel-count mismatch.
     """
     otio = _import_otio()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -386,6 +697,10 @@ def write_fcpxml(timeline, out_path: Path) -> None:
             "(this pulls in otio-fcpx-xml-adapter for Resolve / FCP X "
             "and otio-fcp-adapter for Premiere Pro)."
         )
+    # Best-effort audio-shape patch. _patch_fcpxml_audio_shape() never
+    # raises — it only prints warnings — so the .fcpxml is always left
+    # in a usable state even if the patch can't run.
+    _patch_fcpxml_audio_shape(out_path)
 
 
 def write_premiere_xml(timeline, out_path: Path) -> None:
