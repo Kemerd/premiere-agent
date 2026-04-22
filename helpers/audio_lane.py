@@ -35,11 +35,74 @@ import argparse
 import json
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 from extract_audio import SAMPLE_RATE, extract_audio_for
 from progress import install_lane_prefix, lane_progress
 from wealthy import PANNS_WINDOWS_PER_BATCH, is_wealthy
+
+
+# ---------------------------------------------------------------------------
+# PANNs data bootstrap
+#
+# `panns_inference` reads `~/panns_data/class_labels_indices.csv` at IMPORT
+# time (its config.py opens the file at module load), but the package does
+# NOT auto-fetch it. Fresh installs therefore explode with FileNotFoundError
+# before `AudioTagging` is even constructed — and the error message points
+# at panns internals so it looks like a packaging bug rather than a missing
+# data file.
+#
+# We fetch the canonical CSV from the upstream `audioset_tagging_cnn` repo
+# (same author as panns_inference) and drop it in panns's hardcoded location
+# the first time the lane runs on a machine. Cost: ~10 KB one-time download.
+# Co-located with the Cnn14 checkpoint that panns will fetch on first
+# inference, so the whole `~/panns_data/` dir stays self-contained.
+# ---------------------------------------------------------------------------
+
+PANNS_DATA_DIR = Path.home() / "panns_data"
+PANNS_LABELS_CSV = PANNS_DATA_DIR / "class_labels_indices.csv"
+PANNS_LABELS_URL = (
+    "https://raw.githubusercontent.com/qiuqiangkong/"
+    "audioset_tagging_cnn/master/metadata/class_labels_indices.csv"
+)
+
+
+def _ensure_panns_data_csv() -> None:
+    """Guarantee `~/panns_data/class_labels_indices.csv` exists before we
+    import `panns_inference`. Idempotent: returns instantly when the file
+    is already present and non-empty.
+
+    Raises RuntimeError with actionable advice when the network fetch
+    fails — better than the cryptic FileNotFoundError panns would emit.
+    """
+    if PANNS_LABELS_CSV.exists() and PANNS_LABELS_CSV.stat().st_size > 0:
+        return
+
+    PANNS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"  panns: bootstrapping label CSV -> {PANNS_LABELS_CSV}")
+
+    # Atomic-write pattern: fetch into .tmp, then rename. Avoids leaving a
+    # half-written CSV on Ctrl-C — panns would happily re-import it and
+    # silently produce wrong labels for half the AudioSet vocabulary.
+    tmp_path = PANNS_LABELS_CSV.with_suffix(".csv.tmp")
+    try:
+        with urllib.request.urlopen(PANNS_LABELS_URL, timeout=30) as resp:
+            data = resp.read()
+        tmp_path.write_bytes(data)
+        tmp_path.replace(PANNS_LABELS_CSV)
+    except Exception as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"could not download PANNs labels CSV from {PANNS_LABELS_URL} "
+            f"to {PANNS_LABELS_CSV}: {type(exc).__name__}: {exc}. "
+            f"If your network is restricted, place the file manually at "
+            f"that path and re-run."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +271,13 @@ def _coalesce(events: list[dict], max_gap_s: float = 0.6) -> list[dict]:
 def _build_tagger(device: str):
     """Construct the PANNs CNN14 tagger. Split out so the batch entry
     point can amortize model load across many videos.
+
+    Bootstraps the AudioSet labels CSV first — otherwise the
+    `from panns_inference import AudioTagging` line below crashes inside
+    panns's own config.py with a FileNotFoundError that obscures the real
+    "no data file shipped with the package" cause.
     """
+    _ensure_panns_data_csv()
     from panns_inference import AudioTagging
     try:
         return AudioTagging(checkpoint_path=None, device=device)

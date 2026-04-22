@@ -140,11 +140,73 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
 
 
 # ---------------------------------------------------------------------------
+# transformers 5.x compatibility shim for Florence-2's trust-remote-code
+# config.
+#
+# Florence-2 ships its own `configuration_florence2.py` (loaded via
+# trust_remote_code=True) that references a handful of generation-related
+# attributes on `self` during __init__:
+#
+#     if self.forced_bos_token_id is None and ...
+#
+# In transformers 4.x those attributes were initialized to None by
+# `PretrainedConfig.__init__`. transformers 5.x removed several of them
+# (they migrated into `GenerationConfig`), so Florence's old config code
+# now crashes with:
+#
+#     AttributeError: 'Florence2LanguageConfig' object has no attribute
+#                     'forced_bos_token_id'
+#
+# We restore the legacy lookup behavior by setting class-level None
+# defaults on PretrainedConfig itself. Instance attribute lookup falls
+# through to the class, so any subclass — including Florence's custom
+# config — sees None instead of AttributeError. We do NOT re-add the
+# attributes to instances, so any code that legitimately wrote them
+# still wins over the class default.
+#
+# Idempotent: re-calling does nothing once the attributes are present.
+# Scope: only patches attributes that were actually present in 4.x and
+# removed in 5.x (verified against the transformers 4.45 → 5.0 changelog).
+# Cheap: pure attribute writes on a class object, no model load.
+# ---------------------------------------------------------------------------
+
+_REMOVED_IN_TRANSFORMERS_5 = (
+    "forced_bos_token_id",
+    "forced_eos_token_id",
+    "begin_suppress_tokens",
+    "suppress_tokens",
+    "task_specific_params",
+)
+
+
+def _install_legacy_pretrained_config_compat() -> None:
+    """Restore the attributes Florence-2's trust-remote-code config still
+    references but which transformers 5.x dropped from PretrainedConfig.
+
+    Safe no-op when transformers isn't installed (the visual lane is
+    optional via `[preprocess]`) and when the attributes already exist
+    (transformers 4.x or future-5.x where the attrs were re-added).
+    """
+    try:
+        from transformers import PretrainedConfig
+    except ImportError:
+        return
+    for attr in _REMOVED_IN_TRANSFORMERS_5:
+        if not hasattr(PretrainedConfig, attr):
+            setattr(PretrainedConfig, attr, None)
+
+
+# ---------------------------------------------------------------------------
 # Florence-2 model construction. trust_remote_code=True is REQUIRED — the
 # model uses a custom modeling file that ships in the HF repo.
 # ---------------------------------------------------------------------------
 
 def _build_florence(model_id: str, device: str, dtype_name: str):
+    # MUST run before from_pretrained — Florence's custom config touches
+    # the removed attrs during __init__, which is invoked synchronously
+    # by AutoConfig (and therefore AutoModelForCausalLM) below.
+    _install_legacy_pretrained_config_compat()
+
     import torch
     from transformers import AutoModelForCausalLM, AutoProcessor
 

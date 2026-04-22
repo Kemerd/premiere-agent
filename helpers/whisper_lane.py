@@ -130,6 +130,43 @@ def _clear_whisper_blocked() -> None:
         pass
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """Return True if `exc` is a CUDA out-of-memory error.
+
+    torch >= 2.4 raises the dedicated `torch.cuda.OutOfMemoryError`
+    subclass; older builds raise plain `RuntimeError` with "out of memory"
+    somewhere in the message. We accept both so the retry logic works
+    regardless of which torch wheel the user installed.
+
+    Pure exception inspection — no torch state poked, safe to call from
+    any thread / context.
+    """
+    try:
+        import torch
+        if isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())):
+            return True
+    except (ImportError, AttributeError):
+        pass
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda error: out of memory" in msg
+
+
+def _release_cuda_cache() -> None:
+    """Drop torch's caching allocator + sync the device. Used between
+    videos and after an OOM so growth on clip N doesn't haunt clip N+1.
+
+    Best-effort: never raises — if torch isn't built with CUDA, or the
+    device is already in a bad state, we just return.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
 def _is_blocked_exception(exc: BaseException) -> bool:
     """Heuristic: does this exception look like 'HF download was blocked'
     rather than 'something else broke'?
@@ -478,15 +515,56 @@ def _process_one(
 
     wav_path = extract_audio_for(video_path, edit_dir, verbose=True)
 
-    t0 = time.time()
-    print(f"  whisper: transcribing {wav_path.name} "
-          f"(batch={batch_size}, chunk={chunk_length_s}s)")
-    hf_result = _transcribe_words(
-        asr, wav_path,
-        language=language,
-        batch_size=batch_size,
-        chunk_length_s=chunk_length_s,
-    )
+    # ------------------------------------------------------------------
+    # OOM-resilient transcription.
+    #
+    # Long-form audio with high batch sizes (--wealthy bumps batch from
+    # 24 to 48) drives Whisper's KV cache to grow during generation. On
+    # a 4+ minute clip with 32 decoder layers in fp16, the cache can
+    # easily push past 30 GB of free VRAM — especially when the other
+    # two lanes briefly co-exist on the same GPU during PARALLEL_3
+    # startup. The crash happens deep inside transformers' cache_utils
+    # at `torch.cat([self.values, value_states], dim=-2)`.
+    #
+    # Strategy: catch the OOM, free the caching allocator, halve the
+    # batch size, and retry the SAME clip. Halving converges quickly
+    # (48 -> 24 -> 12 -> 6 -> 3 -> 1) and outputs are bit-identical
+    # across batch sizes — just slower at smaller batches. We bail when
+    # we hit batch_size=1 and STILL OOM, because at that point the model
+    # itself doesn't fit and the user has a real config problem.
+    # ------------------------------------------------------------------
+    cur_batch = max(1, batch_size)
+    hf_result: dict | None = None
+    while True:
+        t0 = time.time()
+        print(f"  whisper: transcribing {wav_path.name} "
+              f"(batch={cur_batch}, chunk={chunk_length_s}s)")
+        try:
+            hf_result = _transcribe_words(
+                asr, wav_path,
+                language=language,
+                batch_size=cur_batch,
+                chunk_length_s=chunk_length_s,
+            )
+            break
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc):
+                raise
+            _release_cuda_cache()
+            new_batch = cur_batch // 2
+            if new_batch < 1:
+                # Already at the floor — model is too big for this card
+                # in this lane configuration. Surface the real error.
+                print(f"  whisper: CUDA OOM at batch=1 — model does not "
+                      f"fit on this device with the current dtype/chunk. "
+                      f"Re-run with --skip-visual / --skip-audio to free "
+                      f"VRAM, or use --force-schedule sequential.",
+                      file=sys.stderr)
+                raise
+            print(f"  whisper: CUDA OOM at batch={cur_batch}, "
+                  f"retrying at batch={new_batch}",
+                  file=sys.stderr)
+            cur_batch = new_batch
     words = _to_canonical_words(hf_result)
 
     if diarize:
@@ -525,7 +603,13 @@ def _process_one(
     n_words = sum(1 for w in words if w.get("type") == "word")
     kb = out_path.stat().st_size / 1024
     print(f"  whisper_lane done: {n_words} words, {duration:.1f}s audio, "
-          f"{dt:.1f}s wall, {kb:.1f} KB → {out_path.name}")
+          f"{dt:.1f}s wall, {kb:.1f} KB -> {out_path.name}")
+
+    # Drop the KV cache + any transient allocator blocks before the next
+    # clip starts. Without this, generation buffers from a long clip
+    # remain reserved (not released to CUDA) and the very next clip can
+    # OOM on its own KV growth even though steady-state usage is fine.
+    _release_cuda_cache()
     return out_path
 
 
