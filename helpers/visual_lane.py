@@ -267,6 +267,87 @@ def _install_legacy_pretrained_model_compat() -> None:
 
 
 # ---------------------------------------------------------------------------
+# transformers 5.x compatibility shim — third layer, Florence-2 specific.
+#
+# `Florence2PreTrainedModel` (loaded via trust_remote_code) declares
+# `_supports_sdpa` and `_supports_flash_attn_2` as `property` *objects*
+# rather than plain class-attribute booleans:
+#
+#     @property
+#     def _supports_sdpa(self):
+#         return self.<some_instance_state>
+#
+# The getter is invoked during `PreTrainedModel.__init__`'s attention-
+# dispatch resolution — at which point Florence's own __init__ has not
+# yet finished setting up the instance state the getter needs. The
+# getter raises AttributeError; Python's descriptor protocol swallows
+# that AttributeError and falls through to nn.Module.__getattr__, which
+# then raises the misleading top-level error:
+#
+#     AttributeError: 'Florence2ForConditionalGeneration' object has no
+#                     attribute '_supports_sdpa'
+#
+# The previous two patches (config defaults + PreTrainedModel-class
+# defaults) cannot help here, because the *subclass* property shadows
+# the class attribute via Python's MRO — the property is found first,
+# the broken getter runs first, the AttributeError is raised first.
+#
+# Fix: replace the broken `property` descriptor with a plain `False` on
+# the Florence subclass itself. Plain class attributes don't trigger the
+# descriptor protocol, so __getattribute__ returns False directly during
+# init and the dispatcher routes to eager attention (the safe floor).
+#
+# We patch ONLY when the existing class attribute is actually a
+# `property`, so a future Florence release that ships a fixed bool
+# declaration is not silently re-broken by us.
+# ---------------------------------------------------------------------------
+
+_FLORENCE_BROKEN_FLAG_PROPERTIES = (
+    "_supports_sdpa",
+    "_supports_flash_attn_2",
+)
+
+
+def _patch_florence_support_flag_properties(model_id: str) -> None:
+    """Replace Florence-2's broken `property`-typed support flags with
+    plain `False` on `Florence2PreTrainedModel`.
+
+    `model_id` is the HF repo id we'll load the trust_remote_code module
+    from — same id you'll pass to `from_pretrained` shortly after. We
+    fetch the class via `get_class_from_dynamic_module` which is the
+    same path `from_pretrained` uses internally, so this guarantees we
+    patch the exact class that will be instantiated.
+
+    Best-effort: if transformers isn't installed, the dynamic module
+    can't be resolved (network blocked, model id wrong), or the class
+    doesn't actually declare these as properties (a fixed Florence
+    release, or a different model entirely), we silently return. The
+    subsequent `from_pretrained` call surfaces any real problem with a
+    proper traceback.
+    """
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    except ImportError:
+        return
+
+    try:
+        florence_pre = get_class_from_dynamic_module(
+            "modeling_florence2.Florence2PreTrainedModel",
+            model_id,
+            revision=None,
+        )
+    except Exception:
+        # Module not yet downloaded / network blocked / wrong model_id /
+        # not actually a Florence model — leave it alone. The downstream
+        # from_pretrained will produce a real error if anything's wrong.
+        return
+
+    for attr in _FLORENCE_BROKEN_FLAG_PROPERTIES:
+        if isinstance(florence_pre.__dict__.get(attr), property):
+            setattr(florence_pre, attr, False)
+
+
+# ---------------------------------------------------------------------------
 # Florence-2 model construction. trust_remote_code=True is REQUIRED — the
 # model uses a custom modeling file that ships in the HF repo.
 # ---------------------------------------------------------------------------
@@ -279,8 +360,15 @@ def _build_florence(model_id: str, device: str, dtype_name: str):
     # Order matters: config patch must precede the model patch, because
     # AutoConfig resolution happens before any PreTrainedModel subclass
     # is touched. This second patch covers the attention dispatcher's
-    # support-flag reads on the model side.
+    # support-flag reads on the model side via PreTrainedModel defaults.
     _install_legacy_pretrained_model_compat()
+    # Third patch: the previous two cover *missing* attrs, but Florence-2
+    # actively *declares* `_supports_sdpa` as a broken `property` in its
+    # subclass — that shadows our class-level defaults. We have to patch
+    # the Florence subclass itself, which means resolving the dynamic
+    # module first. This call also primes the trust_remote_code download
+    # so the upcoming from_pretrained doesn't have to.
+    _patch_florence_support_flag_properties(model_id)
 
     import torch
     from transformers import AutoModelForCausalLM, AutoProcessor
@@ -291,10 +379,18 @@ def _build_florence(model_id: str, device: str, dtype_name: str):
     torch_dtype = dtype_map[dtype_name]
 
     print(f"  florence: model={model_id}  device={device}  dtype={dtype_name}")
+    # transformers 5.x renamed the kwarg `torch_dtype` -> `dtype` and
+    # warns on every load when you pass the old name. transformers 4.x
+    # only accepts `torch_dtype`. Sniff the major version once and pick
+    # the right keyword so we silence the 5.x noise without breaking
+    # 4.x installs (the [preprocess] extra still pins transformers>=4.45).
+    import transformers as _tf
+    _tf_major = int(_tf.__version__.split(".", 1)[0])
+    dtype_kwarg = {"dtype": torch_dtype} if _tf_major >= 5 else {"torch_dtype": torch_dtype}
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch_dtype,
         trust_remote_code=True,
+        **dtype_kwarg,
     ).to(device).eval()
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     return model, processor, torch_dtype
