@@ -79,6 +79,19 @@ DEFAULT_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 DEFAULT_BATCH_SIZE = 8         # conservative — Parakeet RNNT is small
 TRANSCRIPTS_SUBDIR = "transcripts"
 
+# Env var escape hatch for fully-air-gapped networks: if set, we load the
+# Parakeet weights from a local .nemo file via `ASRModel.restore_from(...)`
+# instead of `ASRModel.from_pretrained(...)` (which would hit HuggingFace).
+#
+# Workflow for users behind a proxy that blocks HF entirely:
+#   1. On a machine with HF access (or via NGC: catalog.ngc.nvidia.com →
+#      nvidia/nemo/parakeet_tdt_0_6b_v3), download the .nemo file.
+#   2. Copy the .nemo to the air-gapped machine.
+#   3. set PARAKEET_MODEL_PATH=C:\path\to\parakeet-tdt-0.6b-v3.nemo
+#   4. Run the skill as normal — fallback path picks the local file up
+#      with zero network calls.
+PARAKEET_MODEL_PATH_ENV = "PARAKEET_MODEL_PATH"
+
 
 # ---------------------------------------------------------------------------
 # Model construction — single load amortized across N videos in one batch
@@ -126,13 +139,57 @@ def _build_parakeet_model(
         raise ValueError(f"unknown dtype '{dtype_name}' (use fp16/fp32/bf16)")
     torch_dtype = dtype_map[dtype_name]
 
-    print(f"  parakeet: model={model_id}  device={device}  dtype={dtype_name}")
+    # Local .nemo escape hatch — for networks that block HuggingFace
+    # entirely (the worst-case fallback failure mode: Whisper blocked,
+    # Parakeet *also* would have to download from HF, leaving us stuck).
+    # User pre-downloads the .nemo file via NGC or a colleague, sets the
+    # env var, and we skip the network path completely.
+    local_path = os.environ.get(PARAKEET_MODEL_PATH_ENV, "").strip()
+
+    print(f"  parakeet: model={model_id}  device={device}  dtype={dtype_name}"
+          + (f"  local={local_path}" if local_path else ""))
 
     # NeMo emits a wall of INFO logs on model construction. Quiet them so
     # the lane output stays readable in the orchestrator's tagged stream.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
-        model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_id)
+        try:
+            if local_path:
+                # `restore_from` reads a .nemo archive from disk — zero
+                # network access. Honors the env-var path verbatim so the
+                # user can drop it anywhere convenient.
+                if not Path(local_path).exists():
+                    raise FileNotFoundError(
+                        f"{PARAKEET_MODEL_PATH_ENV}={local_path} does not "
+                        f"exist. Either fix the path or unset the env var."
+                    )
+                model = nemo_asr.models.ASRModel.restore_from(
+                    restore_path=local_path,
+                )
+            else:
+                model = nemo_asr.models.ASRModel.from_pretrained(
+                    model_name=model_id,
+                )
+        except Exception as e:
+            # Surface a clear, actionable message for the worst-case
+            # fallback-failed-too scenario (HF blocked AND no local file).
+            # We re-raise so the caller (whisper_lane fallback dispatch)
+            # still propagates the real failure, but the user gets a
+            # paste-ready next step instead of a transformers stack trace.
+            raise RuntimeError(
+                f"Parakeet model load failed: {type(e).__name__}: {e}\n\n"
+                f"  If your network blocks HuggingFace entirely, the "
+                f"fallback also can't reach the model. Workaround:\n"
+                f"    1. On a machine with HF or NGC access, download "
+                f"the .nemo file for {model_id}\n"
+                f"       (NGC: https://catalog.ngc.nvidia.com → "
+                f"nvidia/nemo/{model_id.split('/')[-1].replace('-', '_')})\n"
+                f"    2. Copy it to this machine.\n"
+                f"    3. Set the env var: "
+                f"{PARAKEET_MODEL_PATH_ENV}=/path/to/parakeet-tdt-0.6b-v3.nemo\n"
+                f"    4. Re-run the skill — it will load locally with "
+                f"zero network calls."
+            ) from e
 
     # Move to the requested device + dtype. NeMo models inherit nn.Module
     # so the standard .to() chain works. We do it in two calls because
