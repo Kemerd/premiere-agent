@@ -555,102 +555,15 @@ appear on time-squeezed ranges):
 Return the final EDL and a one-line total runtime check.
 ```
 
-## Color grade (when requested)
+## Color grade, Subtitles, Animations — load on demand
 
-Your job is to **reason about the image**, not apply a preset. Look at a frame (via `timeline_view`), decide what's wrong, adjust one thing, look again.
+These three feature areas live in **`references/`** and are **not** loaded into context by default. Each is cold-path — only ~10% of sessions touch them — so paying tokens for them on every invocation is wasted. When the user asks for one, read the matching file in full **before** proposing strategy for that feature:
 
-Mental model is ASC CDL. Per channel: `out = (in * slope + offset) ** power`, then global saturation. `slope` → highlights, `offset` → shadows, `power` → midtones.
+- **Color grade** → `references/color-grade.md` — ASC CDL mental model, shipped filter chain presets (`warm_cinematic`, `neutral_punch`, `none`), per-segment-during-extraction discipline, FCPXML "don't bake the grade" rule, decision flow at a frame.
+- **Subtitles** → `references/subtitles.md` — chunking / case / placement reasoning, the `bold-overlay` and `natural-sentence` worked styles with full `force_style` strings, FCPXML delivery (ship `master.srt` alongside, don't burn), content → style decision shortcuts.
+- **Animations** → `references/animations.md` — tool options (PIL / Manim / Remotion), duration heuristics, animation-payoff timing against `speech_timeline.md`, `ease_out_cubic` / `ease_in_out_cubic` snippets, typing-text anchor trick, parallel sub-agent brief template.
 
-**Example filter chains** (`grade.py` has `--list-presets`; use them as starting points or mix your own):
-
-- **`warm_cinematic`** — retro/technical, subtle teal/orange split, desaturated. Shipped in a real launch video. Safe for talking heads.
-- **`neutral_punch`** — minimal corrective: contrast bump + gentle S-curve. No hue shifts.
-- **`none`** — straight copy. Default when the user hasn't asked.
-
-For anything else — portraiture, nature, product, music video, documentary — invent your own chain. `grade.py --filter '<raw ffmpeg>'` accepts any filter string.
-
-Hard rules: apply **per-segment during extraction** (not post-concat, which re-encodes twice). Never go aggressive without testing skin tones. **For FCPXML delivery, do NOT bake the grade** — leave the cut clean and let the colorist do the grade in the NLE. Mention the grade direction in the FCPXML clip metadata if you have one in mind.
-
-## Subtitles (when requested)
-
-Subtitles have three dimensions worth reasoning about: **chunking** (1/2/3/sentence per line), **case** (UPPER/Title/Natural), and **placement** (margin from bottom). The right combo depends on content.
-
-**Worked styles** — pick, adapt, or invent:
-
-**`bold-overlay`** — short-form tech launch, fast-paced social. 2-word chunks, UPPERCASE, break on punctuation, Helvetica 18 Bold, white-on-outline, `MarginV=35`. `render.py` ships with this as `SUB_FORCE_STYLE`.
-
-```
-FontName=Helvetica,FontSize=18,Bold=1,
-PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,
-BorderStyle=1,Outline=2,Shadow=0,
-Alignment=2,MarginV=35
-```
-
-**`natural-sentence`** (if you invent this mode) — narrative, documentary, education. 4–7 word chunks, sentence case, break on natural pauses, `MarginV=60–80`, larger font for readability, slightly wider max-width. No shipped force_style — design one if you need it.
-
-Invent a third style if neither fits. Hard rules: subtitles LAST (Rule 1), output-timeline offsets (Rule 5).
-
-For FCPXML / xmeml delivery: ship `master.srt` alongside `cut.fcpxml` and `cut.xml`. Most NLEs import SRT as a captions track that the editor can restyle.
-
-## Animations (when requested)
-
-Animations match the content and the brand. **Get the palette, font, and visual language from the conversation** — never assume a default. If the user hasn't told you, propose a palette in the strategy phase and wait for confirmation before building anything.
-
-**Tool options:**
-
-- **PIL + PNG sequence + ffmpeg** — simple overlay cards: counters, typewriter text, single bar reveals, progressive draws. Fast to iterate, any aesthetic you want. The launch video used this.
-- **Manim** — formal diagrams, state machines, equation derivations, graph morphs. Read `skills/manim-video/SKILL.md` and its references for depth.
-- **Remotion** — typography-heavy, brand-aligned, web-adjacent layouts. React/CSS-based.
-
-None is mandatory. Invent hybrids if useful (e.g., PIL background with a Remotion layer on top).
-
-**Duration rules of thumb, context-dependent:**
-
-- **Sync-to-narration explanations.** A viewer needs to parse the content at 1×. Rough floor 3s, typical 5–7s for simple cards, 8–14s for complex diagrams. The launch video shipped at 5–7s per simple card.
-- **Beat-synced accents** (music video, fast montage). 0.5–2s is fine — they're visual accents, not information. The "readable at 1×" rule becomes *"recognizable at 1×"*, not *"fully parseable."*
-- **Hold the final frame ≥ 1s** before the cut (universal).
-- **Over voiceover:** total duration ≥ `narration_length + 1s` (universal).
-- **Never parallel-reveal independent elements** — the eye can't track two new things at once. One thing, pause, next thing.
-
-**Animation payoff timing (rule for sync-to-narration):** get the payoff word's timestamp from `speech_timeline.md`. Start the overlay `reveal_duration` seconds earlier so the landing frame coincides with the spoken payoff word. Without this sync the animation feels disconnected.
-
-**Easing** (universal — never `linear`, it looks robotic):
-
-```python
-def ease_out_cubic(t):    return 1 - (1 - t) ** 3
-def ease_in_out_cubic(t):
-    if t < 0.5: return 4 * t ** 3
-    return 1 - (-2 * t + 2) ** 3 / 2
-```
-
-`ease_out_cubic` for single reveals (slow landing). `ease_in_out_cubic` for continuous draws.
-
-**Typing text anchor trick:** center on the FULL string's width, not the partial-string width — otherwise text slides left during reveal.
-
-**Example palette** (the launch video — one aesthetic among infinite):
-- Background `(10, 10, 10)` near-black
-- Accent `#FF5A00` / `(255, 90, 0)` orange
-- Labels `(110, 110, 110)` dim gray
-- Font: Menlo Bold at `/System/Library/Fonts/Menlo.ttc` (index 1)
-- ≤ 2 accent colors, ~40% empty space, minimal chrome
-- Result: terminal / retro tech feel
-
-This is one style. If the brand is warm and serif, use that. If it's colorful and playful, use that. If the user handed you a style guide, follow it. If they didn't, propose one and confirm.
-
-**Parallel sub-agent brief** — each animation is one sub-agent spawned via the `Agent` tool. Each prompt is self-contained (sub-agents have no parent context). Include:
-
-1. One-sentence goal: *"Build ONE animation: [spec]. Nothing else."*
-2. Absolute output path (`<edit>/animations/slot_<id>/render.mp4`)
-3. Exact technical spec: resolution, fps, codec, pix_fmt, CRF, duration
-4. Style palette as concrete values (RGB tuples, hex, or reference to a design system)
-5. Font path with index
-6. Frame-by-frame timeline (what happens when, with easing)
-7. Anti-list ("no chrome, no extras, no titles unless specified")
-8. Code pattern reference (copy helpers inline, don't import across slots)
-9. Deliverable checklist (script, render, verify duration via ffprobe, report)
-10. **"Do not ask questions. If anything is ambiguous, pick the most obvious interpretation and proceed."**
-
-One sub-agent = one file (unique filenames, parallel agents don't overwrite each other).
+The relevant **Hard Rules** for these features stay in the numbered block above so they bind even if you forget to read the reference: subtitles LAST (Rule 1), per-segment grade during extraction (Rule 2), 30ms boundary afade (Rule 3), overlay `setpts=PTS-STARTPTS+T/TB` (Rule 4), output-timeline SRT offsets (Rule 5), parallel sub-agents for multiple animations (Rule 10). Read the reference for the *taste-call* depth on top of those non-negotiables.
 
 ## Output spec
 
