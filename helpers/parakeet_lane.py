@@ -1,27 +1,31 @@
 """Speech lane (fallback): NVIDIA Parakeet TDT v3 transcription via NeMo.
 
-This module is a drop-in fallback for `whisper_lane.py` when the
-HuggingFace Whisper download is blocked by a corporate proxy (NVIDIA
-intranet, restricted enterprise networks, etc.). It produces the EXACT
-SAME output JSON shape as `whisper_lane.py` so `pack_timelines.py`,
-`render.py`, and the rest of the pipeline are completely unaware that a
-different acoustic model produced the words.
+This module is the torch / NeMo fallback for `parakeet_onnx_lane.py`,
+the project's primary speech lane. It exists for the (rare) hosts
+where ONNX Runtime can't load a working execution provider — ancient
+glibc, no compatible GPU stack, etc. — but `nemo_toolkit` happens to
+work via plain PyTorch. It produces the EXACT SAME output JSON shape
+as the ONNX lane so `pack_timelines.py`, `render.py`, and the rest
+of the pipeline are completely unaware that a different runtime
+produced the words.
 
 Why Parakeet TDT 0.6B v3:
-  * ~2-3x faster than whisper-large-v3-turbo on the same GPU (RNNT decoder).
+  * ~2-3x the throughput of comparable encoder-decoder models on the
+    same GPU thanks to the RNNT decoder.
   * Native word-level timestamps (no extra forced-alignment step).
   * English + 24 European languages (sufficient for most editing work).
   * Distributed via NeMo's HuggingFace AND NGC mirrors — even if HF is
     walled off, NVIDIA's own NGC catalog is reachable from inside the
     NVIDIA corporate network.
-  * No "hallucination on silence" failure mode that plagues Whisper.
+  * Robust on silence and music-only segments (no "hallucination on
+    silence" failure mode common to encoder-decoder ASR).
 
 The lazy NeMo install is handled in `_lazy_nemo.py` so this module's
 top-level import surface stays cheap (no `import nemo` until we
 actually need to build the model).
 
-Output JSON shape (identical to whisper_lane.py — see that file's
-docstring for the canonical schema):
+Output JSON shape (identical to `parakeet_onnx_lane.py` — see that
+file's docstring for the canonical schema):
 
     {
       "model": "nvidia/parakeet-tdt-0.6b-v3",
@@ -37,11 +41,10 @@ docstring for the canonical schema):
       "sample_rate": 16000
     }
 
-Diarization: this lane intentionally re-uses the exact same
-`_diarize_and_assign(...)` helper from `whisper_lane.py`. Speaker
-attribution operates on the canonical word list, not the model — so
-the moment we have words on a shared timeline, the diarizer doesn't
-care whether they came from Whisper or Parakeet.
+Diarization: this lane re-uses the shared `helpers/diarize.py` helper.
+Speaker attribution operates on the canonical word list, not the
+model — so the moment we have words on a shared timeline, the
+diarizer doesn't care which backend produced them.
 
 CLI:
     python helpers/parakeet_lane.py <video> [--language en]
@@ -63,10 +66,12 @@ from extract_audio import SAMPLE_RATE, extract_audio_for
 from progress import install_lane_prefix, lane_progress
 from wealthy import WHISPER_BATCH, is_wealthy
 
-# We deliberately re-use the diarizer from whisper_lane — single source of
-# truth. The function takes the canonical word list + a WAV path; it has
-# zero knowledge of which ASR produced the words.
-from whisper_lane import _diarize_and_assign, _load_hf_token
+# Diarizer lives in `helpers/diarize.py` — single source of truth that
+# operates on the canonical word list and has zero acoustic-model
+# knowledge, so this NeMo fallback shares it byte-for-byte with the
+# primary ONNX lane.
+from diarize import diarize_and_assign as _diarize_and_assign
+from diarize import load_hf_token as _load_hf_token
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +138,8 @@ def _build_parakeet_model(
     import nemo.collections.asr as nemo_asr  # type: ignore
 
     # Map the dtype name to a torch dtype. We accept the same vocabulary
-    # as whisper_lane so callers don't have to special-case Parakeet.
+    # as the primary ONNX lane so callers don't have to special-case
+    # the fallback.
     dtype_map = {
         "fp16": torch.float16,
         "fp32": torch.float32,
@@ -144,9 +150,9 @@ def _build_parakeet_model(
     torch_dtype = dtype_map[dtype_name]
 
     # Local .nemo escape hatch — for networks that block HuggingFace
-    # entirely (the worst-case fallback failure mode: Whisper blocked,
-    # Parakeet *also* would have to download from HF, leaving us stuck).
-    # User pre-downloads the .nemo file via NGC or a colleague, sets the
+    # entirely (worst-case: ONNX lane unavailable AND Parakeet would
+    # also have to download from HF, leaving us stuck). User
+    # pre-downloads the .nemo file via NGC or a colleague, sets the
     # env var, and we skip the network path completely.
     local_path = os.environ.get(PARAKEET_MODEL_PATH_ENV, "").strip()
 
@@ -177,9 +183,9 @@ def _build_parakeet_model(
         except Exception as e:
             # Surface a clear, actionable message for the worst-case
             # fallback-failed-too scenario (HF blocked AND no local file).
-            # We re-raise so the caller (whisper_lane fallback dispatch)
+            # We re-raise so the caller (preprocess.py speech dispatch)
             # still propagates the real failure, but the user gets a
-            # paste-ready next step instead of a transformers stack trace.
+            # paste-ready next step instead of a NeMo stack trace.
             raise RuntimeError(
                 f"Parakeet model load failed: {type(e).__name__}: {e}\n\n"
                 f"  If your network blocks HuggingFace entirely, the "
@@ -374,15 +380,15 @@ def _process_one(
 ) -> Path:
     """Transcribe one video with an already-loaded Parakeet model.
 
-    Mirrors the cache contract of `whisper_lane._process_one` exactly so
-    `pack_timelines.py` sees a single coherent transcripts/ directory
-    regardless of which ASR produced the JSON.
+    Mirrors the cache contract of `parakeet_onnx_lane._process_one`
+    exactly so `pack_timelines.py` sees a single coherent transcripts/
+    directory regardless of which speech backend produced the JSON.
     """
     transcripts_dir = (edit_dir / TRANSCRIPTS_SUBDIR).resolve()
     transcripts_dir.mkdir(parents=True, exist_ok=True)
     out_path = transcripts_dir / f"{video_path.stem}.json"
 
-    # mtime cache — same rule as the Whisper lane: WAV / source unchanged
+    # mtime cache — same rule as the ONNX lane: WAV / source unchanged
     # since the JSON was written? Reuse it.
     if not force and out_path.exists():
         try:
@@ -400,8 +406,9 @@ def _process_one(
     words = _parakeet_to_canonical_words(hyp)
     text = _hypothesis_text(hyp)
 
-    # Optional diarization — re-uses the Whisper lane's helper. Same HF
-    # token sourcing, same pyannote pipeline, same overlap algorithm.
+    # Optional diarization — shared `helpers/diarize.py` helper. Same
+    # HF token sourcing, same pyannote pipeline, same overlap
+    # algorithm as the primary ONNX lane.
     if diarize:
         token = _load_hf_token()
         if not token:
@@ -451,7 +458,7 @@ def _process_one(
 
 
 # ---------------------------------------------------------------------------
-# Batch entry point — drop-in replacement for run_whisper_lane_batch
+# Batch entry point — drop-in fallback for run_parakeet_onnx_lane_batch
 # ---------------------------------------------------------------------------
 
 def run_parakeet_lane_batch(
@@ -462,10 +469,9 @@ def run_parakeet_lane_batch(
     device: str = "cuda:0",
     dtype_name: str = "bf16",
     batch_size: int = DEFAULT_BATCH_SIZE,
-    # Accept (and ignore) chunk_length_s so the call site in
-    # whisper_lane's fallback path can pass through Whisper kwargs
-    # verbatim. Parakeet doesn't need a chunk size — its RNNT decoder
-    # streams natively.
+    # Accept (and ignore) chunk_length_s so any orchestrator that
+    # passes encoder-decoder kwargs verbatim still works. Parakeet
+    # doesn't need a chunk size — its RNNT decoder streams natively.
     chunk_length_s: int = 30,
     language: str | None = None,
     diarize: bool = False,
@@ -474,11 +480,12 @@ def run_parakeet_lane_batch(
 ) -> list[Path]:
     """Run Parakeet on N videos with the model loaded ONCE.
 
-    Same signature as `run_whisper_lane_batch` so the orchestrator and
-    the whisper-lane fallback can swap them out trivially.
+    Same signature as `run_parakeet_onnx_lane_batch` so the
+    orchestrator can swap to this NeMo fallback without changing
+    callers.
     """
     # Pre-flight: skip the (slow) model load entirely when every video
-    # is cache-fresh. Same optimization the whisper lane has.
+    # is cache-fresh. Same optimization the ONNX lane has.
     transcripts_dir = (edit_dir / TRANSCRIPTS_SUBDIR).resolve()
     transcripts_dir.mkdir(parents=True, exist_ok=True)
     if not force:

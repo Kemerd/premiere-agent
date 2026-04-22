@@ -134,12 +134,13 @@ ADVICE_RULES: list[tuple[str, str]] = [
      "PyTorch can't see your GPU. Check `nvidia-smi`. If your GPU is an "
      "RTX 50-series (sm_120), reinstall torch with the cu128 wheel: "
      "`pip install --upgrade --index-url https://download.pytorch.org/whl/cu128 torch`."),
-    ("import whisper_lane",
-     "Whisper lane import failed — usually missing transformers/accelerate. "
-     "Run `pip install -e \".[preprocess]\"` from the project root."),
+    ("import parakeet_onnx_lane",
+     "Parakeet ONNX lane import failed — usually missing onnxruntime / "
+     "onnx-asr. Run `pip install -e \".[preprocess]\"` from the project root."),
     ("import parakeet_lane",
-     "Parakeet fallback lane import failed — pure-Python module, this should "
-     "never happen. Re-clone the repo or check helpers/parakeet_lane.py exists."),
+     "Parakeet NeMo fallback lane import failed — pure-Python module, this "
+     "should never happen. Re-clone the repo or check helpers/parakeet_lane.py "
+     "exists."),
     ("nemo",
      "NeMo install failed (Parakeet ASR fallback). Manual: "
      "`pip install -e .[parakeet]`. If your network blocks PyPI too, install "
@@ -249,24 +250,21 @@ def detect_active_fallbacks() -> list[str]:
     fallback in one line at session start instead of the user being
     surprised mid-run.
 
-    Currently surfaces:
-        * "parakeet"  — set when whisper_lane previously confirmed that
-                        HuggingFace is unreachable on this machine
-                        (sentinel age < 7d, see whisper_lane.BLOCKED_TTL_DAYS).
+    The speech lane runs Parakeet TDT through ONNX Runtime by default;
+    when that's not available (no working EP, exotic OS, etc.) the
+    NeMo torch fallback in `parakeet_lane.py` kicks in. We expose
+    that via the `VIDEO_USE_SPEECH_LANE=nemo` env var rather than a
+    sentinel file — there's no longer a network-blocked "I had to
+    fall back" state to persist across runs.
 
     Returns an empty list when everything is on the default path.
     """
     active: list[str] = []
-    try:
-        # whisper_lane defines the sentinel + the freshness rule. Importing
-        # it is cheap (no torch/transformers loaded at module level).
-        from whisper_lane import _whisper_blocked_recently
-        if _whisper_blocked_recently():
-            active.append("parakeet")
-    except Exception:
-        # Health check must never crash on a broken lane import; the
-        # smoke tests will surface that failure separately.
-        pass
+    backend = os.environ.get("VIDEO_USE_SPEECH_LANE", "").strip().lower()
+    if backend and backend != "onnx":
+        # Surface non-default backend names (e.g. "nemo") so the
+        # session-start banner matches what's actually going to run.
+        active.append(f"speech={backend}")
     return active
 
 

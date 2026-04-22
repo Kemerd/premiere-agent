@@ -1,22 +1,20 @@
-"""Lazy NeMo install — single source of truth for the Parakeet fallback path.
+"""Lazy NeMo install — single source of truth for the Parakeet NeMo fallback.
 
 Why this exists:
   We don't want `nemo_toolkit[asr]` (~600 MB of deps including its own
-  pinned torch / lightning / hydra) in the default install. 99% of users
-  on an open network never need it — Whisper-large-v3 downloads cleanly
-  from HuggingFace and the Parakeet fallback never fires.
+  pinned torch / lightning / hydra) in the default install. 99% of
+  users on an open network never need it — the primary
+  `parakeet_onnx_lane.py` runs on plain ONNX Runtime and the NeMo
+  fallback never fires.
 
-  But for the 1% behind a corporate proxy that blocks HF, the fallback
-  needs to "just work" on first run without making them hunt for an
-  install command. So we shell out to pip the FIRST time the Parakeet
-  lane is invoked, then cache the import for the rest of the process.
+  But for the 1% on hosts where ONNX Runtime can't load a working
+  execution provider, the fallback needs to "just work" on first run
+  without making them hunt for an install command. So we shell out to
+  pip the FIRST time the NeMo Parakeet lane is invoked, then cache
+  the import for the rest of the process.
 
 Called from:
-  - `parakeet_lane._build_parakeet_model`  (primary call site)
-
-NOT called from `whisper_lane.py` directly — the fallback there imports
-`parakeet_lane` which in turn calls into here. Single chain, no
-duplicate install attempts.
+  - `parakeet_lane._build_parakeet_model`  (only call site)
 """
 
 from __future__ import annotations
