@@ -208,6 +208,33 @@ range.end   = min(src_duration, kept_last_word.end + trail_margin / 1000)
 
 And while picking ranges, only consider silence gaps `>= min_silence_to_remove` as legitimate cut targets, and discard any candidate kept clip whose net speech duration is `< min_talk_to_keep`.
 
+**Aggressive intra-phrase silence removal (this is the whole point of the preset).** `min_silence_to_remove` applies to **every word-to-word gap in the speech lane**, not just to phrase boundaries or speaker handoffs. If a single phrase like *"today we're going to ⟨640ms gap⟩ drill the pilot holes"* contains a gap ≥ the threshold, the editor MUST split that phrase into two adjacent ranges from the same source — `[..., "going", "to"]` then `[..., "drill", "the", "pilot", "holes"]` — so the dead air is dropped from the timeline. This is how a Paced preset turns a 12-minute walking-talking-head into 7 minutes without losing a word: by deleting hundreds of small breath gaps, hesitations, and thinking pauses scattered inside otherwise-kept speech. Do not romanticize the "natural rhythm of how someone talks" — the preset *is* the rhythm decision. If the user wants those pauses kept, they pick Calm.
+
+**Algorithm to apply per source clip** (run this before picking takes across clips):
+
+```
+1. Walk the word-level transcript for the source.
+2. Compute gap_i = word[i+1].start - word[i].end  for every adjacent pair.
+3. Mark every gap_i >= min_silence_to_remove as a "cut here" point.
+4. The kept-speech runs are the spans between consecutive cut points
+   (plus the head before the first cut and the tail after the last).
+5. Drop any run whose total speech duration is < min_talk_to_keep
+   (filters orphan single-syllable false starts).
+6. Each surviving run becomes one EDL range, padded with lead_margin
+   at the head and trail_margin at the tail (clamped so adjacent ranges
+   from the same source don't re-overlap into the silence you just cut).
+```
+
+**Boundary clamp** (important — otherwise the margins re-introduce the silence you just removed): when two surviving runs come from the same source and are separated by a cut silence of `gap_ms`, clamp the trailing margin of the first range and the leading margin of the second so their combined padding never exceeds `gap_ms - 60ms` (leave at least 60ms of true silence so the 30ms `afade` pair on each side has room to breathe). Concretely:
+
+```
+combined_pad_ms = min(trail_margin + lead_margin, max(0, gap_ms - 60))
+prev.trail_pad  = combined_pad_ms * trail_margin / (trail_margin + lead_margin)
+next.lead_pad   = combined_pad_ms - prev.trail_pad
+```
+
+This split-evenly-by-ratio rule keeps the head/tail balance the user picked while making sure aggressive silence removal stays aggressive.
+
 **Persist the choice.** Record the preset name (and the four expanded values) in `project.md` under "Strategy" so subsequent sessions inherit a sensible default — but still ask if the user wants to keep it.
 
 ## Cut craft (techniques)
@@ -217,7 +244,7 @@ And while picking ranges, only consider silence gaps `>= min_silence_to_remove` 
 - **Speaker handoffs** benefit from air between utterances. The pacing preset's `lead_margin` + `trail_margin` largely sets this; only override per-handoff if the moment calls for it (e.g. a punchline beat that earns extra silence).
 - **Visual context is the second source of truth.** Before committing to *any* non-trivial cut, check the `visual:` lines around the cut point in `merged_timeline.md`. If captions show a continuous action ("person holding drill") spanning your cut, you're cutting in the middle of a shot — usually fine, but be deliberate. Use the visual lane to find B-roll cutaway candidates, match cuts, shot changes, and to decide whether a moment is worth preserving even when speech is silent. Drill into `visual_timeline.md` when you need the full 1-fps caption stream (the merged view drops `(same)` repeats).
 - **Audio events are noisy hints, not signals.** The `(audio: ...)` lines in `merged_timeline.md` carry `(drill 0.87)`, `(applause 0.92)`, `(laughter)`, `(power_tool)` markers from CLAP scored against the agent-curated vocab. **The model is approximate** — it mis-labels (music tagged as speech, hammers tagged as drums, room tone tagged as applause), especially when the vocabulary is too small or too generic. Use a marker only as a prompt to *go look* at the visual line (and if needed `timeline_view`) at that timestamp. **Never cut purely on a CLAP label.** When CLAP and Florence-2 disagree about what's happening, trust Florence-2. Drill into `audio_timeline.md` when you want the full per-window scoring instead of the collapsed merged form.
-- **Silence gaps are cut candidates.** Use the pacing preset's `min_silence_to_remove` as your threshold (Calm 500ms → Jumpy 50ms). Anything shorter than that is *not* a cut candidate — it's the natural rhythm of the speech. <30ms is always unsafe (mid-phoneme).
+- **Silence gaps are cut candidates — EVERYWHERE, not just at phrase boundaries.** Use the pacing preset's `min_silence_to_remove` as your threshold (Calm 500ms → Jumpy 50ms) and apply it to every adjacent word pair in the speech lane, including gaps that sit *inside* a phrase as the speaker pauses to breathe or think. Splitting a phrase mid-sentence to drop a 400ms thinking pause is the whole point of the preset; it's how you cut runtime without cutting content. The user picked Energetic because they want every breath gone — give them every breath. (Anything shorter than the preset threshold stays as the natural rhythm of the speech. <30ms is always unsafe — mid-phoneme.)
 - **Cut padding comes from the pacing preset**, not from per-cut taste. Expand each range by `lead_margin` at the head and `trail_margin` at the tail (see "Pacing presets"). Hard Rule 7's 30–200ms working window still bounds anything outside the preset table — never go below 30ms.
 - **Never reason audio and video independently.** Every cut must work on both tracks.
 
@@ -372,8 +399,22 @@ RULES:
         range.start = max(0, first_kept_word.start - lead_margin/1000)
         range.end   = min(src_dur, last_kept_word.end + trail_margin/1000)
     Stay inside Hard Rule 7's 30-200ms working window.
-  - Only treat silence gaps >= min_silence_to_remove as cut targets.
-    Anything shorter is the natural rhythm of the speech — do not cut.
+  - Apply min_silence_to_remove to EVERY adjacent word-to-word gap in
+    the speech lane, including gaps that sit INSIDE a phrase. If a phrase
+    contains a >= threshold gap, split it into two adjacent EDL ranges
+    from the same source so the dead air drops out of the timeline.
+    This is the whole point of the preset — it's how an Energetic pass
+    chops a 12-min walk-and-talk into 7 min without losing any words.
+    Anything shorter than the threshold stays as the speech's natural
+    rhythm.
+  - Per-source pre-pass before take selection:
+       1. walk word transcript, compute every gap_i = w[i+1].start - w[i].end
+       2. mark gap_i >= min_silence_to_remove as cut points
+       3. surviving runs (between cut points) become candidate ranges
+       4. drop any run with net speech duration < min_talk_to_keep
+       5. pad each surviving run with lead_margin / trail_margin
+       6. clamp adjacent same-source pads so combined pad <= gap_ms - 60ms
+          (leaves room for the 30ms afade pair at each boundary)
   - Discard any kept clip whose net speech duration is < min_talk_to_keep
     (filters single-syllable false starts that survived silence trimming).
   - Cross-reference visual_timeline.md before committing to a cut whose
