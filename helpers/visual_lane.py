@@ -48,6 +48,7 @@ from pathlib import Path
 # Sibling helpers folder is on sys.path when invoked from the orchestrator.
 # extract_audio is NOT used here — visual lane is fully independent of
 # the audio extraction step.
+from progress import install_lane_prefix, lane_progress
 from wealthy import FLORENCE_BATCH, is_wealthy
 
 
@@ -236,21 +237,24 @@ def _dedup_consecutive(captions: list[dict]) -> list[dict]:
 # Main lane entry point
 # ---------------------------------------------------------------------------
 
-def run_visual_lane(
+def _process_one(
+    model,
+    processor,
+    torch_dtype,
     video_path: Path,
     edit_dir: Path,
     *,
-    model_id: str = DEFAULT_MODEL_ID,
-    fps: int = DEFAULT_FPS,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    device: str = "cuda:0",
-    dtype_name: str = "fp16",
-    task: str = DEFAULT_TASK_PROMPT,
-    force: bool = False,
+    model_id: str,
+    fps: int,
+    batch_size: int,
+    device: str,
+    task: str,
+    force: bool,
 ) -> Path:
-    """Run the visual lane on a single video. Returns the JSON path.
+    """Caption one video with already-built Florence model + processor.
 
-    Caching: per-source-video, mtime-based.
+    Split out so the batch entry point can amortize the ~3s Florence load
+    across many videos in one Python process.
     """
     out_dir = (edit_dir / VISUAL_CAPS_SUBDIR).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -265,59 +269,50 @@ def run_visual_lane(
             pass
 
     duration = _video_duration_s(video_path)
-    expected_frames = int(math.ceil(duration * fps))
+    expected_frames = max(1, int(math.ceil(duration * fps)))
     print(f"  florence: {video_path.name}  duration={duration:.1f}s  "
           f"frames~{expected_frames} @ {fps}fps  batch={batch_size}")
-
-    model, processor, torch_dtype = _build_florence(model_id, device, dtype_name)
 
     captions: list[dict] = []
     batch_imgs: list = []
     batch_ts: list[int] = []
     t0 = time.time()
-    last_log = t0
 
-    for ts, img in _iter_frames_at_fps(video_path, fps):
-        batch_imgs.append(img)
-        batch_ts.append(ts)
-        if len(batch_imgs) >= batch_size:
+    # Per-frame progress is genuinely informative here — Florence is the
+    # slow lane, so users want to see frames-per-second crawl forward.
+    # We tick once per BATCH (not per frame) to keep emit volume sane,
+    # advancing by `len(batch)` each time.
+    with lane_progress(
+        "visual",
+        total=expected_frames,
+        unit="frame",
+        desc=f"florence captions: {video_path.name}",
+    ) as fbar:
+        for ts, img in _iter_frames_at_fps(video_path, fps):
+            batch_imgs.append(img)
+            batch_ts.append(ts)
+            if len(batch_imgs) >= batch_size:
+                texts = _caption_batch(
+                    model, processor, batch_imgs,
+                    device=device, torch_dtype=torch_dtype, task=task,
+                )
+                for tt, txt in zip(batch_ts, texts):
+                    captions.append({"t": tt, "text": txt})
+                fbar.update(advance=len(batch_imgs))
+                batch_imgs.clear()
+                batch_ts.clear()
+
+        # Flush trailing partial batch.
+        if batch_imgs:
             texts = _caption_batch(
                 model, processor, batch_imgs,
                 device=device, torch_dtype=torch_dtype, task=task,
             )
             for tt, txt in zip(batch_ts, texts):
                 captions.append({"t": tt, "text": txt})
-            batch_imgs.clear()
-            batch_ts.clear()
-
-            now = time.time()
-            if now - last_log > 5.0:
-                done = len(captions)
-                rate = done / max(1e-3, now - t0)
-                eta = (expected_frames - done) / max(1e-3, rate)
-                print(f"    florence progress: {done}/{expected_frames} "
-                      f"({rate:.1f} fps, eta {eta:.0f}s)")
-                last_log = now
-
-    # Flush trailing partial batch.
-    if batch_imgs:
-        texts = _caption_batch(
-            model, processor, batch_imgs,
-            device=device, torch_dtype=torch_dtype, task=task,
-        )
-        for tt, txt in zip(batch_ts, texts):
-            captions.append({"t": tt, "text": txt})
+            fbar.update(advance=len(batch_imgs))
 
     dt = time.time() - t0
-
-    # Free GPU memory.
-    try:
-        import torch
-        del model, processor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
 
     captions_md = _dedup_consecutive(captions)
     payload = {
@@ -336,6 +331,77 @@ def run_visual_lane(
     print(f"  visual_lane done: {len(captions)} captions, {dt:.1f}s wall "
           f"({rate:.1f} fps) → {out_path.name}")
     return out_path
+
+
+def run_visual_lane_batch(
+    video_paths: list[Path],
+    edit_dir: Path,
+    *,
+    model_id: str = DEFAULT_MODEL_ID,
+    fps: int = DEFAULT_FPS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    device: str = "cuda:0",
+    dtype_name: str = "fp16",
+    task: str = DEFAULT_TASK_PROMPT,
+    force: bool = False,
+) -> list[Path]:
+    """Run the visual lane on N videos with Florence-2 loaded ONCE."""
+    out_dir = (edit_dir / VISUAL_CAPS_SUBDIR).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not force:
+        all_fresh = True
+        for v in video_paths:
+            out = out_dir / f"{v.stem}.json"
+            try:
+                if not out.exists() or out.stat().st_mtime < v.stat().st_mtime:
+                    all_fresh = False
+                    break
+            except OSError:
+                all_fresh = False
+                break
+        if all_fresh:
+            print(f"  visual_lane: all {len(video_paths)} cache hits, skipping model load")
+            return [out_dir / f"{v.stem}.json" for v in video_paths]
+
+    model, processor, torch_dtype = _build_florence(model_id, device, dtype_name)
+    out_paths: list[Path] = []
+    try:
+        # Outer bar tracks video-of-N progress; inner per-frame bar
+        # (in _process_one) tracks current-video frame progress. Both
+        # emit their own structured PROGRESS lines so the orchestrator
+        # / Claude can render either granularity.
+        with lane_progress(
+            "visual",
+            total=len(video_paths),
+            unit="video",
+            desc="visual captioning",
+        ) as vbar:
+            for v in video_paths:
+                vbar.start_item(v.name)
+                out_paths.append(_process_one(
+                    model, processor, torch_dtype, v, edit_dir,
+                    model_id=model_id, fps=fps, batch_size=batch_size,
+                    device=device, task=task, force=force,
+                ))
+                vbar.update(advance=1, item=v.name)
+    finally:
+        try:
+            import torch
+            del model, processor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    return out_paths
+
+
+def run_visual_lane(
+    video_path: Path,
+    edit_dir: Path,
+    **kwargs,
+) -> Path:
+    """Single-video convenience wrapper around run_visual_lane_batch."""
+    return run_visual_lane_batch([video_path], edit_dir, **kwargs)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +435,8 @@ def main() -> None:
     ap.add_argument("--force", action="store_true",
                     help="Bypass cache, always re-caption.")
     args = ap.parse_args()
+
+    install_lane_prefix()
 
     video = args.video.resolve()
     if not video.exists():

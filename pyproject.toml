@@ -14,7 +14,8 @@ dependencies = [
     "matplotlib",     # timeline_view figure compositing
     "pillow",         # PIL animations + frame manipulation
     "numpy",
-    "tqdm",           # progress bars in the preprocess orchestrator
+    "tqdm",           # frame-level progress in lanes
+    "rich>=13.0",     # multi-lane progress display + structured status lines
 ]
 
 [project.optional-dependencies]
