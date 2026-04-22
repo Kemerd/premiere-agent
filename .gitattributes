@@ -1,0 +1,37 @@
+# Force LF on every shell script regardless of the host's core.autocrlf
+# setting. Without this a Windows clone with core.autocrlf=true (the
+# default for Git for Windows) re-writes install.sh with CRLF line
+# endings, and on Mac/Linux bash then fails to find the interpreter
+# `/usr/bin/env bash<CR>` and dies with "bad interpreter: No such file
+# or directory" before printing anything useful.
+*.sh        text eol=lf
+*.bash      text eol=lf
+
+# Windows scripts get CRLF for the same reason in reverse — cmd.exe and
+# PowerShell tolerate LF most of the time, but a few legacy code paths
+# (multi-line FOR /F constructs, label parsing) misbehave. Pin them.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Python / Markdown / YAML — text, normalize on commit, render LF in
+# the working tree on POSIX and CRLF only if the user opts in via their
+# own core.autocrlf. Default Git behaviour is fine here.
+*.py        text
+*.md        text
+*.toml      text
+*.json      text
+*.yml       text
+*.yaml      text
+
+# Binary assets — never touch.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.webp      binary
+*.mp4       binary
+*.mov       binary
+*.wav       binary
+*.onnx      binary
+*.engine    binary

@@ -43,13 +43,23 @@ preprocess = [
     #   - the silero VAD chunker (optional, used for very long audio)
     #   - HuggingFace Hub model fetch (the [hub] extra)
     "onnx-asr[gpu,hub]>=0.11.0",
-    "onnxruntime-gpu>=1.22.0",  # CUDA + TensorRT EP support
+    # ── ONNX Runtime, split by OS ──
+    # `onnxruntime-gpu` ships CUDA + TensorRT + DirectML + CPU EPs but
+    # has NO macOS wheels on PyPI (and never will — Apple killed CUDA
+    # in 2018). On Darwin we fall back to plain `onnxruntime`, which
+    # bundles the CoreML EP (Apple Neural Engine / Metal) plus the
+    # universal CPU EP. The provider ladder in `_onnx_providers.py`
+    # picks whichever EP the runtime exposes, so the same code path
+    # works either way.
+    "onnxruntime-gpu>=1.22.0;platform_system!='Darwin'",  # Win + Linux
+    "onnxruntime>=1.22.0;platform_system=='Darwin'",      # macOS (CoreML/CPU)
     # tensorrt-cu12-libs is OPTIONAL — only needed when the user opts
     # into the TensorRT execution provider via VIDEO_USE_PARAKEET_TRT=1.
     # Pre-shipped here so the wheel cache primes on first install; the
     # provider ladder in `_onnx_providers.py` falls through to CUDA EP
     # gracefully if the import fails (corporate proxies, custom torch).
-    "tensorrt-cu12-libs;platform_system!='Darwin'",
+    # Skipped on Darwin (no CUDA on Mac) and Linux aarch64 (no wheel).
+    "tensorrt-cu12-libs;platform_system!='Darwin' and platform_machine=='x86_64'",
 
     # ── transformers (Florence-2 + CLAP processors) ──
     # Kept for the visual lane (Florence-2) and the CLAP processor /
@@ -116,8 +126,12 @@ preprocess = [
 # ---------------------------------------------------------------------------
 onnx = [
     "onnx-asr[gpu,hub]>=0.11.0",
-    "onnxruntime-gpu>=1.22.0",
-    "tensorrt-cu12-libs;platform_system!='Darwin'",
+    # Same OS split as the [preprocess] extra above — see the comment
+    # there for why Darwin gets plain `onnxruntime` (CoreML/CPU EPs)
+    # while Win/Linux get `onnxruntime-gpu` (CUDA/TRT/DML EPs).
+    "onnxruntime-gpu>=1.22.0;platform_system!='Darwin'",
+    "onnxruntime>=1.22.0;platform_system=='Darwin'",
+    "tensorrt-cu12-libs;platform_system!='Darwin' and platform_machine=='x86_64'",
 ]
 
 # ---------------------------------------------------------------------------
