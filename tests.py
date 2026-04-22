@@ -567,15 +567,12 @@ def test_heavy(R: Results, tmp: Path) -> None:
 # Entry
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="video-use-premiere smoke tests")
-    ap.add_argument("--heavy", action="store_true",
-                    help="Also run the model-loading tier (~4.5 GB download "
-                         "on first run, GPU recommended).")
-    ap.add_argument("--keep-tmp", action="store_true",
-                    help="Don't delete the temp dir at the end.")
-    args = ap.parse_args()
+def run_all(heavy: bool = False, keep_tmp: bool = False) -> Results:
+    """Programmatic entry point — used by helpers/health.py.
 
+    Mirrors `main()` minus the argparse/banner/exit-code wrapping. Returns
+    the populated `Results` object so the caller can introspect failures.
+    """
     print("video-use-premiere :: smoke tests")
     print("=" * 60)
 
@@ -583,7 +580,7 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="vup-tests-") as td:
         tmp = Path(td)
-        if args.keep_tmp:
+        if keep_tmp:
             print(f"  tmp dir kept: {tmp}")
 
         test_environment(R)
@@ -594,17 +591,31 @@ def main() -> int:
         test_pack_timelines(R, tmp)
         test_fcpxml_roundtrip(R, tmp)
 
-        if args.heavy:
+        if heavy:
             test_heavy(R, tmp)
 
-        if args.keep_tmp:
+        if keep_tmp:
             # Move the tmp dir somewhere we won't auto-delete it.
             keep = PROJECT_ROOT / f"_tests_kept_{int(time.time())}"
             import shutil
             shutil.copytree(tmp, keep)
-            print(f"  copied tmp → {keep}")
+            print(f"  copied tmp -> {keep}")
 
-    return R.summary()
+    R.summary()
+    return R
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="video-use-premiere smoke tests")
+    ap.add_argument("--heavy", action="store_true",
+                    help="Also run the model-loading tier (~4.5 GB download "
+                         "on first run, GPU recommended).")
+    ap.add_argument("--keep-tmp", action="store_true",
+                    help="Don't delete the temp dir at the end.")
+    args = ap.parse_args()
+
+    R = run_all(heavy=args.heavy, keep_tmp=args.keep_tmp)
+    return 0 if not R.failed else 1
 
 
 if __name__ == "__main__":
