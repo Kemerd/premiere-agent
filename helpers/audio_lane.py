@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 
 from extract_audio import SAMPLE_RATE, extract_audio_for
+from progress import install_lane_prefix, lane_progress
 from wealthy import PANNS_WINDOWS_PER_BATCH, is_wealthy
 
 
@@ -304,14 +305,25 @@ def run_audio_lane_batch(
 
     tagger = _build_tagger(device)
     out_paths: list[Path] = []
+    # One tick per video. PANNs' inner sliding-window loop is uniform
+    # work so per-video granularity is honest; sub-window progress would
+    # add more noise than signal in the structured log.
     try:
-        for v in video_paths:
-            out_paths.append(_process_one(
-                tagger, v, edit_dir,
-                threshold=threshold, top_k=top_k,
-                windows_per_batch=windows_per_batch,
-                force=force,
-            ))
+        with lane_progress(
+            "audio",
+            total=len(video_paths),
+            unit="video",
+            desc="audio event tagging",
+        ) as bar:
+            for v in video_paths:
+                bar.start_item(v.name)
+                out_paths.append(_process_one(
+                    tagger, v, edit_dir,
+                    threshold=threshold, top_k=top_k,
+                    windows_per_batch=windows_per_batch,
+                    force=force,
+                ))
+                bar.update(advance=1, item=v.name)
     finally:
         try:
             import torch
@@ -361,6 +373,8 @@ def main() -> None:
     ap.add_argument("--force", action="store_true",
                     help="Bypass cache, always re-tag.")
     args = ap.parse_args()
+
+    install_lane_prefix()
 
     video = args.video.resolve()
     if not video.exists():

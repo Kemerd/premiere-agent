@@ -45,6 +45,7 @@ from pathlib import Path
 # Local sibling imports — work whether invoked via -m helpers.whisper_lane
 # or directly as a script (helpers/ is on sys.path either way).
 from extract_audio import SAMPLE_RATE, extract_audio_for
+from progress import install_lane_prefix, lane_progress
 from wealthy import WHISPER_BATCH, is_wealthy
 
 
@@ -447,18 +448,30 @@ def run_whisper_lane_batch(
 
     asr = _build_pipeline(model_id, device, dtype_name)
     out_paths: list[Path] = []
+    # Outer bar: one tick per video. Each call to _process_one is opaque
+    # work — Whisper's pipeline doesn't expose internal callbacks cheaply,
+    # so we frame progress at the video granularity which is the unit
+    # users actually care about (and which Claude Code can summarize).
     try:
-        for v in video_paths:
-            out_paths.append(_process_one(
-                asr, v, edit_dir,
-                model_id=model_id,
-                language=language,
-                batch_size=batch_size,
-                chunk_length_s=chunk_length_s,
-                diarize=diarize,
-                num_speakers=num_speakers,
-                force=force,
-            ))
+        with lane_progress(
+            "whisper",
+            total=len(video_paths),
+            unit="video",
+            desc="speech transcription",
+        ) as bar:
+            for v in video_paths:
+                bar.start_item(v.name)
+                out_paths.append(_process_one(
+                    asr, v, edit_dir,
+                    model_id=model_id,
+                    language=language,
+                    batch_size=batch_size,
+                    chunk_length_s=chunk_length_s,
+                    diarize=diarize,
+                    num_speakers=num_speakers,
+                    force=force,
+                ))
+                bar.update(advance=1, item=v.name)
     finally:
         try:
             import torch
@@ -513,6 +526,10 @@ def main() -> None:
     ap.add_argument("--force", action="store_true",
                     help="Bypass cache, always re-transcribe.")
     args = ap.parse_args()
+
+    # If we were spawned by the orchestrator, tag every line of our
+    # stdout/stderr with [whisper] so the parent can demux parallel lanes.
+    install_lane_prefix()
 
     video = args.video.resolve()
     if not video.exists():
