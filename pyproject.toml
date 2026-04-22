@@ -67,6 +67,22 @@ diarize = [
 ]
 
 # ---------------------------------------------------------------------------
+# Parakeet fallback ASR (NVIDIA NeMo). Pulled in by `helpers/_lazy_nemo.py`
+# automatically on the first session where Whisper-large-v3 fails to download
+# (corporate proxy blocks HuggingFace, NVIDIA intranet, restricted networks,
+# etc.). This extra exists so users who KNOW their network is blocked can
+# pre-install with `pip install -e .[parakeet]` and skip the first-run pip
+# delay. See `helpers/parakeet_lane.py` for the runtime path.
+#
+# nemo_toolkit[asr] is heavy (~600MB: pulls torch-lightning, hydra-core,
+# omegaconf, librosa, transitive C-extensions). Strictly opt-in to keep the
+# default install slim — most users never trigger the fallback.
+# ---------------------------------------------------------------------------
+parakeet = [
+    "nemo_toolkit[asr]>=2.0",
+]
+
+# ---------------------------------------------------------------------------
 # FCPXML export via the Pixar / SWF industry-standard OpenTimelineIO. Cheap
 # to install (pure Python wheels), kept optional so render-only deployments
 # don't pull it.
@@ -85,7 +101,7 @@ animations = ["manim"]
 # Convenience meta-extra: install absolutely everything.
 # ---------------------------------------------------------------------------
 all = [
-    "video-use-premiere[preprocess,diarize,fcpxml,animations,flash]",
+    "video-use-premiere[preprocess,diarize,fcpxml,animations,flash,parakeet]",
 ]
 
 [build-system]

@@ -130,6 +130,17 @@ ADVICE_RULES: list[tuple[str, str]] = [
     ("import whisper_lane",
      "Whisper lane import failed — usually missing transformers/accelerate. "
      "Run `pip install -e \".[preprocess]\"` from the project root."),
+    ("import parakeet_lane",
+     "Parakeet fallback lane import failed — pure-Python module, this should "
+     "never happen. Re-clone the repo or check helpers/parakeet_lane.py exists."),
+    ("nemo",
+     "NeMo install failed (Parakeet ASR fallback). Manual: "
+     "`pip install -e .[parakeet]`. If your network blocks PyPI too, install "
+     "nemo_toolkit[asr] from a local wheel cache and re-run."),
+    ("parakeet",
+     "Parakeet fallback path errored. Inspect the failure reason; if it's a "
+     "network issue, your proxy may also block NGC. Manual install: "
+     "`pip install -e .[parakeet]`."),
     ("import audio_lane",
      "Audio lane import failed — install PANNs: "
      "`pip install -e \".[preprocess]\"` (pulls panns-inference + torchlibrosa)."),
@@ -225,6 +236,33 @@ def _is_fresh(cache: dict, ttl_days: float) -> tuple[bool, str]:
 # Run wrapper — invokes tests.run_all() and assembles a cache-able payload
 # ---------------------------------------------------------------------------
 
+def detect_active_fallbacks() -> list[str]:
+    """Probe per-machine sentinels that indicate a non-default lane backend
+    is in use. Read at health-check time so Claude can announce the
+    fallback in one line at session start instead of the user being
+    surprised mid-run.
+
+    Currently surfaces:
+        * "parakeet"  — set when whisper_lane previously confirmed that
+                        HuggingFace is unreachable on this machine
+                        (sentinel age < 7d, see whisper_lane.BLOCKED_TTL_DAYS).
+
+    Returns an empty list when everything is on the default path.
+    """
+    active: list[str] = []
+    try:
+        # whisper_lane defines the sentinel + the freshness rule. Importing
+        # it is cheap (no torch/transformers loaded at module level).
+        from whisper_lane import _whisper_blocked_recently
+        if _whisper_blocked_recently():
+            active.append("parakeet")
+    except Exception:
+        # Health check must never crash on a broken lane import; the
+        # smoke tests will surface that failure separately.
+        pass
+    return active
+
+
 def run_and_build_payload(heavy: bool = False) -> dict:
     """Run the smoke suite, return a dict suitable for caching."""
     import tests as t
@@ -255,6 +293,10 @@ def run_and_build_payload(heavy: bool = False) -> dict:
         "failures": failures,
         "skips": [{"name": n, "reason": r} for (n, r) in R.skipped],
         "advice": advice,
+        # Fallbacks listed here are NOT failures — they're informational.
+        # Claude reads this at session start and announces "speech lane
+        # on Parakeet (Whisper unreachable from this machine)" in one line.
+        "fallbacks_active": detect_active_fallbacks(),
     }
 
 
@@ -284,6 +326,18 @@ def print_human(payload: dict, *, from_cache: bool, why_run: str = "") -> None:
           f"transformers {fp.get('transformers')}, "
           f"otio {fp.get('opentimelineio')}, "
           f"platform {fp.get('platform')}")
+
+    fallbacks = payload.get("fallbacks_active") or []
+    if fallbacks:
+        print()
+        print("  FALLBACKS ACTIVE:")
+        for fb in fallbacks:
+            if fb == "parakeet":
+                print("    * speech lane: NVIDIA Parakeet "
+                      "(Whisper download was blocked on this machine; "
+                      "Parakeet is local-only, ~10x faster, English/EU only)")
+            else:
+                print(f"    * {fb}")
 
     if payload.get("failures"):
         print()

@@ -62,6 +62,126 @@ TRANSCRIPTS_SUBDIR = "transcripts"
 
 
 # ---------------------------------------------------------------------------
+# Parakeet fallback plumbing
+#
+# When a corporate proxy blocks HuggingFace (NVIDIA intranet, restricted
+# enterprise networks, etc.) the Whisper model download will fail at the
+# `_build_pipeline` step. We catch that specific failure mode and silently
+# swap in NVIDIA Parakeet via `parakeet_lane.run_parakeet_lane_batch`.
+#
+# Sentinel file: once we've confirmed Whisper is blocked on this machine
+# we write `~/.video-use-premiere/whisper_blocked` with a timestamp. For
+# the next BLOCKED_TTL_DAYS days we skip the Whisper attempt entirely
+# and go straight to Parakeet — saves the ~3-5s download timeout per
+# session on a chronically blocked network.
+# ---------------------------------------------------------------------------
+
+BLOCKED_SENTINEL = Path.home() / ".video-use-premiere" / "whisper_blocked"
+BLOCKED_TTL_DAYS = 7
+
+
+def _whisper_blocked_recently() -> bool:
+    """True if the sentinel exists and is younger than BLOCKED_TTL_DAYS.
+
+    The TTL exists so a temporary network blip doesn't permanently pin
+    the user to Parakeet — a week later we re-attempt Whisper and update
+    the sentinel based on the new outcome. The sentinel lives outside
+    the per-session edit/ dir (Hard Rule 12 exception, same as the
+    health.json cache) because network blockage is a per-machine
+    property, not a per-project one.
+    """
+    if not BLOCKED_SENTINEL.exists():
+        return False
+    try:
+        age_days = (time.time() - BLOCKED_SENTINEL.stat().st_mtime) / 86400.0
+        return age_days < BLOCKED_TTL_DAYS
+    except OSError:
+        return False
+
+
+def _mark_whisper_blocked(reason: str) -> None:
+    """Touch the sentinel so the next session skips the Whisper attempt.
+
+    The reason string is written to the sentinel for forensic value —
+    user can `cat` it to see WHY their session was on Parakeet.
+    """
+    try:
+        BLOCKED_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
+        BLOCKED_SENTINEL.write_text(
+            f"whisper_blocked_at={time.time():.0f}\n"
+            f"reason={reason}\n",
+            encoding="utf-8",
+        )
+    except OSError as e:
+        # Non-fatal — fallback still works, we just won't remember it
+        # next session. Log and move on.
+        print(f"  whisper_lane: could not write block sentinel: {e}",
+              file=sys.stderr)
+
+
+def _clear_whisper_blocked() -> None:
+    """Remove the sentinel — called when Whisper succeeds after we
+    previously thought it was blocked. Network changed, proxy lifted,
+    user joined a different VPN, whatever."""
+    try:
+        if BLOCKED_SENTINEL.exists():
+            BLOCKED_SENTINEL.unlink()
+    except OSError:
+        pass
+
+
+def _is_blocked_exception(exc: BaseException) -> bool:
+    """Heuristic: does this exception look like 'HF download was blocked'
+    rather than 'something else broke'?
+
+    Caught families (most specific to most general):
+        * huggingface_hub.errors.HfHubHTTPError    — HTTP 4xx/5xx from HF
+        * huggingface_hub.errors.OfflineModeIsEnabled  — HF_HUB_OFFLINE=1
+        * urllib3 / requests ConnectionError        — proxy ate the request
+        * socket.timeout / TimeoutError             — proxy stalled
+        * OSError with a network-flavored message   — transformers wraps lots
+
+    We deliberately do NOT match generic OSError unless the message
+    smells like network failure — otherwise a missing file or a CUDA OOM
+    would silently downgrade us to Parakeet and the user would never
+    know their GPU is broken.
+    """
+    # Fast-path: known HuggingFace exception types if the lib is present.
+    try:
+        from huggingface_hub.errors import (
+            HfHubHTTPError, OfflineModeIsEnabled, LocalEntryNotFoundError,
+        )
+        if isinstance(exc, (HfHubHTTPError, OfflineModeIsEnabled,
+                            LocalEntryNotFoundError)):
+            return True
+    except ImportError:
+        pass
+
+    # Generic network errors any HTTP client could raise.
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+
+    # OSError + network-flavored message. transformers wraps a LOT of
+    # download failures in OSError("We couldn't connect to ..."), so we
+    # peek at the message rather than swallow every OSError blindly.
+    if isinstance(exc, OSError):
+        msg = str(exc).lower()
+        network_smells = (
+            "couldn't connect", "could not connect",
+            "connection error", "connection reset", "connection refused",
+            "proxy", "ssl", "certificate", "tls",
+            "name or service not known", "name resolution",
+            "max retries exceeded", "remote disconnected",
+            "403", "407", "451",  # forbidden / proxy-auth / unavailable-legal
+            "offline mode",
+        )
+        if any(s in msg for s in network_smells):
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # .env loader — same one-liner the old transcribe.py used, kept so users
 # don't have to install python-dotenv just for HF_TOKEN.
 # ---------------------------------------------------------------------------
@@ -446,7 +566,73 @@ def run_whisper_lane_batch(
             print(f"  whisper_lane: all {len(video_paths)} cache hits, skipping model load")
             return [transcripts_dir / f"{v.stem}.json" for v in video_paths]
 
-    asr = _build_pipeline(model_id, device, dtype_name)
+    # ------------------------------------------------------------------
+    # Parakeet fallback dispatch.
+    #
+    # Two paths flip us to Parakeet:
+    #   1. The sentinel says Whisper was recently confirmed blocked on
+    #      this machine. Skip the slow attempt entirely.
+    #   2. _build_pipeline() raises a network-flavored exception while
+    #      trying to fetch the Whisper weights. Catch, mark sentinel,
+    #      re-dispatch to Parakeet.
+    # ------------------------------------------------------------------
+    if _whisper_blocked_recently():
+        print(
+            "  whisper_lane: WHISPER previously detected as BLOCKED on this "
+            "machine (sentinel age < 7d). Going straight to NVIDIA Parakeet "
+            "(local, ~10x faster, English/EU only). Delete "
+            f"{BLOCKED_SENTINEL} to re-attempt Whisper."
+        )
+        from parakeet_lane import run_parakeet_lane_batch
+        return run_parakeet_lane_batch(
+            video_paths, edit_dir,
+            device=device,
+            dtype_name=("bf16" if dtype_name == "fp32" else dtype_name),
+            batch_size=batch_size,
+            chunk_length_s=chunk_length_s,
+            language=language,
+            diarize=diarize,
+            num_speakers=num_speakers,
+            force=force,
+        )
+
+    try:
+        asr = _build_pipeline(model_id, device, dtype_name)
+    except BaseException as exc:
+        # We catch BaseException (not just Exception) because some HF
+        # download failures bubble up as KeyboardInterrupt-adjacent
+        # signal hijacking on Windows. Re-raise non-blocking ones so a
+        # real CUDA OOM or syntax error still surfaces loudly.
+        if not _is_blocked_exception(exc):
+            raise
+
+        reason = f"{type(exc).__name__}: {exc}"
+        print(
+            f"  whisper_lane: WHISPER BLOCKED ({reason[:200]}). "
+            f"Falling back to NVIDIA Parakeet (local, ~10x faster, "
+            f"English/EU only). Caching this decision for "
+            f"{BLOCKED_TTL_DAYS}d at {BLOCKED_SENTINEL}.",
+            file=sys.stderr,
+        )
+        _mark_whisper_blocked(reason[:500])
+
+        from parakeet_lane import run_parakeet_lane_batch
+        return run_parakeet_lane_batch(
+            video_paths, edit_dir,
+            device=device,
+            dtype_name=("bf16" if dtype_name == "fp32" else dtype_name),
+            batch_size=batch_size,
+            chunk_length_s=chunk_length_s,
+            language=language,
+            diarize=diarize,
+            num_speakers=num_speakers,
+            force=force,
+        )
+
+    # Whisper loaded fine — clear any stale block sentinel from a
+    # previous network state. Idempotent / safe if the sentinel doesn't
+    # exist (most common case on a clean machine).
+    _clear_whisper_blocked()
     out_paths: list[Path] = []
     # Outer bar: one tick per video. Each call to _process_one is opaque
     # work — Whisper's pipeline doesn't expose internal callbacks cheaply,

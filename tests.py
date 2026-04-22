@@ -146,7 +146,7 @@ def test_environment(R: Results) -> None:
 HELPER_MODULES = (
     "vram", "wealthy", "extract_audio", "progress",
     "pack_timelines", "preprocess", "preprocess_batch",
-    "whisper_lane", "audio_lane", "visual_lane",
+    "whisper_lane", "parakeet_lane", "audio_lane", "visual_lane",
     "render", "export_fcpxml",
 )
 
@@ -448,7 +448,153 @@ def test_fcpxml_roundtrip(R: Results, tmp: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. HEAVY tier — actually load the three production models and run them
+# 8. Parakeet fallback path — exercises the conversion + blocked-exception
+#    classifier without requiring NeMo to be installed. Catches structural
+#    bugs in the fallback that would otherwise only surface on a friend's
+#    NVIDIA-blocked machine.
+# ---------------------------------------------------------------------------
+
+def test_parakeet_fallback(R: Results, tmp: Path) -> None:
+    _section("Parakeet fallback path (pure-Python, no nemo required)")
+
+    # Import the lane itself — pure Python, no nemo touch yet.
+    try:
+        import parakeet_lane as pl
+        R.ok("import parakeet_lane")
+    except Exception as e:
+        R.fail("import parakeet_lane", f"{type(e).__name__}: {e}")
+        return
+
+    # _lazy_nemo helper should be importable + expose ensure_nemo_installed.
+    try:
+        from _lazy_nemo import ensure_nemo_installed, is_nemo_installed
+        assert callable(ensure_nemo_installed)
+        assert callable(is_nemo_installed)
+        R.ok("import _lazy_nemo")
+        # is_nemo_installed should return False on a clean install
+        # (or True if the user pre-installed [parakeet]); either way it
+        # must NOT raise. We just exercise the boolean contract.
+        result = is_nemo_installed()
+        assert isinstance(result, bool)
+        R.ok(f"_lazy_nemo.is_nemo_installed() -> {result}")
+    except Exception as e:
+        R.fail("_lazy_nemo helpers", f"{type(e).__name__}: {e}")
+
+    # Converter contract: a synthetic hypothesis mimicking NeMo's
+    # `output[0].timestamp['word']` shape must produce the same canonical
+    # word list whisper_lane._to_canonical_words would have produced.
+    try:
+        # Plain object with .timestamp attribute (NeMo Hypothesis shape)
+        class _FakeHyp:
+            text = "Hello world. Again."
+            timestamp = {
+                "word": [
+                    {"word": "Hello",  "start": 1.0,  "end": 1.4},
+                    {"word": "world.", "start": 1.45, "end": 2.0},
+                    # 3-second silence gap -> spacing entry expected
+                    {"word": "Again.", "start": 5.0,  "end": 5.6},
+                ],
+            }
+
+        words = pl._parakeet_to_canonical_words(_FakeHyp())
+        assert isinstance(words, list), "must return list"
+
+        word_entries = [w for w in words if w.get("type") == "word"]
+        spacing_entries = [w for w in words if w.get("type") == "spacing"]
+
+        assert len(word_entries) == 3, f"expected 3 words, got {len(word_entries)}"
+        assert len(spacing_entries) == 1, \
+            f"expected 1 spacing (3s gap), got {len(spacing_entries)}"
+
+        # Field-shape check matches whisper_lane._to_canonical_words output.
+        for w in word_entries:
+            assert "text" in w and "start" in w and "end" in w
+            assert "speaker_id" in w and w["speaker_id"] is None
+            assert isinstance(w["start"], float)
+            assert isinstance(w["end"], float)
+
+        # Spacing entry must bridge the gap exactly: 2.0 -> 5.0
+        sp = spacing_entries[0]
+        assert sp["start"] == 2.0 and sp["end"] == 5.0, \
+            f"spacing range wrong: {sp['start']}-{sp['end']}"
+        R.ok("_parakeet_to_canonical_words shape + gap detection")
+    except Exception as e:
+        traceback.print_exc()
+        R.fail("converter shape", f"{type(e).__name__}: {e}")
+
+    # Defensive: empty timestamp dict must not crash, must return [].
+    try:
+        class _Empty:
+            text = ""
+            timestamp = {}
+        out = pl._parakeet_to_canonical_words(_Empty())
+        assert out == [], f"expected [], got {out}"
+        R.ok("converter handles empty hypothesis")
+    except Exception as e:
+        R.fail("converter empty hyp", f"{type(e).__name__}: {e}")
+
+    # Blocked-exception classifier — verify it correctly identifies the
+    # exception families that mean "HF is firewalled" without false-
+    # positiving on real bugs (CUDA OOM, missing file, etc.).
+    try:
+        from whisper_lane import _is_blocked_exception
+
+        # Network errors → must be classified as blocked
+        assert _is_blocked_exception(ConnectionError("connection refused"))
+        assert _is_blocked_exception(TimeoutError("timed out"))
+        assert _is_blocked_exception(
+            OSError("We couldn't connect to 'https://huggingface.co'")
+        )
+        assert _is_blocked_exception(OSError("HTTPError 407 Proxy Auth"))
+        R.ok("blocked classifier: true positives")
+
+        # Real bugs → must NOT be classified as blocked (else we'd
+        # silently downgrade users to Parakeet on a CUDA OOM, and
+        # they'd never know their GPU is broken).
+        assert not _is_blocked_exception(ValueError("bad shape"))
+        assert not _is_blocked_exception(
+            RuntimeError("CUDA out of memory")
+        )
+        assert not _is_blocked_exception(
+            OSError("[Errno 2] No such file or directory: 'foo.wav'")
+        )
+        R.ok("blocked classifier: rejects unrelated errors")
+    except Exception as e:
+        traceback.print_exc()
+        R.fail("blocked classifier", f"{type(e).__name__}: {e}")
+
+    # Sentinel write / read / clear contract — uses a tmp path override
+    # to avoid touching the user's real ~/.video-use-premiere/.
+    try:
+        import whisper_lane as wl
+
+        # Redirect the sentinel to our tmp dir for the duration of the
+        # test. monkeypatching a module-level constant is a standard
+        # Python testing idiom; we restore the original after.
+        original_sentinel = wl.BLOCKED_SENTINEL
+        try:
+            wl.BLOCKED_SENTINEL = tmp / "whisper_blocked_test"
+            assert not wl._whisper_blocked_recently()
+            R.ok("sentinel: absent -> not blocked")
+
+            wl._mark_whisper_blocked("test reason: synthetic")
+            assert wl.BLOCKED_SENTINEL.exists()
+            assert wl._whisper_blocked_recently()
+            R.ok("sentinel: write + recent detection")
+
+            wl._clear_whisper_blocked()
+            assert not wl.BLOCKED_SENTINEL.exists()
+            assert not wl._whisper_blocked_recently()
+            R.ok("sentinel: clear")
+        finally:
+            wl.BLOCKED_SENTINEL = original_sentinel
+    except Exception as e:
+        traceback.print_exc()
+        R.fail("sentinel lifecycle", f"{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 9. HEAVY tier — actually load the three production models and run them
 #    on a 2-second synthetic clip. Tagged --heavy so it doesn't fire on
 #    every smoke run.
 # ---------------------------------------------------------------------------
@@ -590,6 +736,7 @@ def run_all(heavy: bool = False, keep_tmp: bool = False) -> Results:
         test_progress(R)
         test_pack_timelines(R, tmp)
         test_fcpxml_roundtrip(R, tmp)
+        test_parakeet_fallback(R, tmp)
 
         if heavy:
             test_heavy(R, tmp)
