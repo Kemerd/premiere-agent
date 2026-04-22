@@ -1,0 +1,95 @@
+[project]
+name = "video-use-premiere"
+version = "0.2.0"
+description = "Conversation-driven video editor skill for Claude Code — local-first, three-lane preprocessing, FCPXML export"
+requires-python = ">=3.10"
+
+# ---------------------------------------------------------------------------
+# Always-on dependencies. Kept light so the package installs fast in CI / dev
+# environments where you only want the renderer or FCPXML exporter and not
+# the heavy ML preprocessors.
+# ---------------------------------------------------------------------------
+dependencies = [
+    "librosa",        # waveform analysis for timeline_view
+    "matplotlib",     # timeline_view figure compositing
+    "pillow",         # PIL animations + frame manipulation
+    "numpy",
+    "tqdm",           # progress bars in the preprocess orchestrator
+]
+
+[project.optional-dependencies]
+# ---------------------------------------------------------------------------
+# Heavy ML preprocessing stack. Pulled in by install.sh / install.bat so a
+# `pip install -e .` for a renderer-only deployment stays minimal.
+#
+# torch is NOT listed here because the user typically wants a specific CUDA
+# index URL (cu121, cpu, rocm6.0…). The install scripts handle that.
+# ---------------------------------------------------------------------------
+preprocess = [
+    # ── Speech: insanely-fast-whisper-style stack ──
+    # We don't pip-install the `insanely-fast-whisper` CLI itself — that's a
+    # subprocess wrapper that re-loads the model on every call. We use the
+    # exact same underlying components (transformers pipeline + Whisper +
+    # fp16 + batched chunking + optional FA2) directly, which lets us keep
+    # the model resident across all source files in a batch.
+    "transformers>=4.45",      # Whisper pipeline AND Florence-2 live here
+    "optimum>=1.20",           # BetterTransformer fast-path, IFW-recommended
+    "accelerate>=0.30",        # device_map + dtype routing for the pipeline
+    # ── Audio events ──
+    "panns-inference>=0.1.1",  # CNN14 audio tagger, AudioSet 527-class
+    # ── Visuals ──
+    "einops",                  # Florence-2 transitive
+    "timm",                    # Florence-2 transitive
+    "imageio-ffmpeg",          # in-memory frame extraction for visual_lane
+    # ── Shared I/O ──
+    "soundfile",               # WAV reading for audio_lane
+]
+
+# ---------------------------------------------------------------------------
+# Optional Flash Attention 2. Massive (~3-5x) Whisper speedup but the wheel
+# build is fiddly on Windows (needs MSVC + CUDA toolkit) so it's strictly
+# opt-in. install.sh / install.bat do NOT pull this. Users who want it run
+# `pip install -e .[flash]` after a successful base install. The
+# whisper_lane code transparently falls back to SDPA when FA2 isn't found.
+# ---------------------------------------------------------------------------
+flash = [
+    "flash-attn>=2.5.0",
+]
+
+# ---------------------------------------------------------------------------
+# Optional speaker diarization on top of whisper_lane. pyannote.audio needs
+# an HF_TOKEN with model-card acceptance. Gated so users without speakers
+# don't pay the cost (~600MB of extra deps + a model download on first run).
+# ---------------------------------------------------------------------------
+diarize = [
+    "pyannote.audio>=3.1",
+]
+
+# ---------------------------------------------------------------------------
+# FCPXML export via the Pixar / SWF industry-standard OpenTimelineIO. Cheap
+# to install (pure Python wheels), kept optional so render-only deployments
+# don't pull it.
+# ---------------------------------------------------------------------------
+fcpxml = [
+    "opentimelineio>=0.17",
+    "otio-fcpx-xml-adapter>=0.2",
+]
+
+# ---------------------------------------------------------------------------
+# Animations. Manim is huge; kept opt-in.
+# ---------------------------------------------------------------------------
+animations = ["manim"]
+
+# ---------------------------------------------------------------------------
+# Convenience meta-extra: install absolutely everything.
+# ---------------------------------------------------------------------------
+all = [
+    "video-use-premiere[preprocess,diarize,fcpxml,animations,flash]",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []

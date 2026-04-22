@@ -1,0 +1,391 @@
+"""Audio events lane: PANNs CNN14 → AudioSet 527-class tags.
+
+For non-speech audio context — drill, sawing, hammer, applause, laughter,
+glass breaking, music — Whisper is the wrong tool (it transcribes speech and
+collapses everything else into `(applause)` style tags at best). PANNs (the
+PreTrained Audio Neural Network) trained on AudioSet has 527 fine-grained
+classes and gives confidence scores per second.
+
+We use the panns_inference package which wraps a CNN14 checkpoint:
+    https://github.com/qiuqiangkong/panns_inference
+
+Scheme:
+    1. Load the 16k mono WAV (already cached by extract_audio_for).
+    2. Slide a WINDOW_S-second window with HOP_S-second hop.
+    3. For each window, take the CNN14 sigmoid output, keep top-K classes
+       with confidence >= THRESHOLD.
+    4. Adjacent windows with the same dominant class get coalesced into
+       one event range (saves a lot of clutter in the markdown).
+
+JSON shape:
+    {
+      "model": "PANNs CNN14 / AudioSet",
+      "duration": 43.0,
+      "events": [
+        {"start": 12.04, "end": 12.40, "label": "drill", "score": 0.87},
+        {"start": 12.04, "end": 12.40, "label": "power_tool", "score": 0.71},
+        ...
+      ]
+    }
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+from extract_audio import SAMPLE_RATE, extract_audio_for
+from wealthy import PANNS_WINDOWS_PER_BATCH, is_wealthy
+
+
+# ---------------------------------------------------------------------------
+# Tunables. WINDOW_S=1.0 + HOP_S=0.5 mirrors PANNs' own demo and keeps the
+# event grid at ~2 events/sec which packs nicely into the markdown view
+# without losing transient sounds (a hammer hit is ~150ms — the 0.5s hop
+# guarantees it lands in at least one window).
+# ---------------------------------------------------------------------------
+
+WINDOW_S = 1.0
+HOP_S = 0.5
+DEFAULT_THRESHOLD = 0.30
+DEFAULT_TOP_K = 5
+# Default windows-per-call. The single-window (=1) loop preserves exact
+# legacy behavior; bumping to 16 already gives ~5-8x speedup on GPU with
+# trivial memory cost. Wealthy mode raises to PANNS_WINDOWS_PER_BATCH.
+DEFAULT_WINDOWS_PER_BATCH = 16
+AUDIO_TAGS_SUBDIR = "audio_tags"
+
+
+# ---------------------------------------------------------------------------
+# Label normalization — AudioSet labels are space + uppercase ("Power tool",
+# "Hammer", "Drill"). Convert to snake_case for cleaner markdown.
+# ---------------------------------------------------------------------------
+
+def _norm_label(label: str) -> str:
+    return label.strip().lower().replace(" ", "_").replace(",", "")
+
+
+# ---------------------------------------------------------------------------
+# WAV loader — we want a numpy float32 array at SAMPLE_RATE. soundfile is
+# fastest for PCM_16; we already extracted that format.
+# ---------------------------------------------------------------------------
+
+def _load_wav_mono_16k(wav_path: Path):
+    """Returns np.ndarray shape (n_samples,), float32 in [-1, 1]."""
+    import numpy as np
+    import soundfile as sf
+
+    audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+    if sr != SAMPLE_RATE:
+        # extract_audio guarantees 16k but defend anyway — a stray drop-in
+        # WAV could break PANNs silently otherwise.
+        raise ValueError(
+            f"expected {SAMPLE_RATE} Hz audio, got {sr} for {wav_path}"
+        )
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1).astype(np.float32)
+    return audio
+
+
+# ---------------------------------------------------------------------------
+# Sliding-window inference
+# ---------------------------------------------------------------------------
+
+def _slide_and_tag_with_tagger(
+    tagger,
+    audio,
+    sample_rate: int,
+    *,
+    window_s: float,
+    hop_s: float,
+    top_k: int,
+    threshold: float,
+    windows_per_batch: int,
+) -> list[dict]:
+    """Run CNN14 over hop-spaced windows, return per-window top-K events.
+
+    Performance note: the per-call overhead of `tagger.inference()` (Python
+    + tensor staging) dwarfs the actual GPU forward pass for a single 1s
+    16k window. Batching N windows into one (N, 16000) tensor collapses
+    that overhead into one round trip — typical 8-15x speedup on GPU,
+    smaller but still positive on CPU. `windows_per_batch=1` reproduces
+    the old per-window loop exactly.
+
+    Memory: one batch holds N * win_samples * 4 bytes (float32). At
+    N=64, win=16000 that's ~4 MB — trivial. The output tensor adds
+    N * 527 * 4 = ~135 KB per batch.
+    """
+    import numpy as np
+    from panns_inference import labels as panns_labels
+
+    win_samples = int(window_s * sample_rate)
+    hop_samples = int(hop_s * sample_rate)
+    n = len(audio)
+
+    n_starts = max(1, 1 + (n - win_samples) // hop_samples) if n >= win_samples else 1
+
+    # Build all (start_sample, end_sample) tuples up front. Cheap, lets us
+    # slice the audio into a contiguous batch buffer below.
+    starts: list[int] = [w_idx * hop_samples for w_idx in range(n_starts)]
+
+    out: list[dict] = []
+
+    # Process in chunks of `windows_per_batch`. Each chunk becomes one
+    # (B, win_samples) tensor handed to PANNs in a single call.
+    for batch_off in range(0, len(starts), windows_per_batch):
+        batch_starts = starts[batch_off : batch_off + windows_per_batch]
+        b = len(batch_starts)
+
+        # Pre-allocate the batch buffer once per chunk. Rows beyond the
+        # actual audio length are zero-padded (silence) which is what the
+        # old per-window path did one-at-a-time.
+        batch = np.zeros((b, win_samples), dtype=np.float32)
+        for i, s in enumerate(batch_starts):
+            e = min(n, s + win_samples)
+            clip = audio[s:e]
+            batch[i, : len(clip)] = clip
+
+        clipwise_output, _embedding = tagger.inference(batch)  # (B, 527)
+
+        # Decode each row's top-K above threshold.
+        for i, s in enumerate(batch_starts):
+            scores = clipwise_output[i]
+            e = min(n, s + win_samples)
+            idx_sorted = np.argsort(-scores)[:top_k]
+            for idx in idx_sorted:
+                score = float(scores[idx])
+                if score < threshold:
+                    break
+                out.append({
+                    "start": s / sample_rate,
+                    "end": e / sample_rate,
+                    "label": _norm_label(panns_labels[int(idx)]),
+                    "score": round(score, 3),
+                })
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Event coalescing — fold adjacent windows with the same label into one
+# longer range. Massively cuts down the markdown noise on continuous sounds
+# (a 5-second drill becomes ONE event line, not ten).
+# ---------------------------------------------------------------------------
+
+def _coalesce(events: list[dict], max_gap_s: float = 0.6) -> list[dict]:
+    """Merge consecutive same-label events whose gap <= max_gap_s.
+    Score of the merged range is the max of the constituents.
+    """
+    by_label: dict[str, list[dict]] = {}
+    for ev in events:
+        by_label.setdefault(ev["label"], []).append(ev)
+
+    merged: list[dict] = []
+    for label, evs in by_label.items():
+        evs.sort(key=lambda e: e["start"])
+        cur = dict(evs[0])
+        for nxt in evs[1:]:
+            if nxt["start"] - cur["end"] <= max_gap_s:
+                cur["end"] = max(cur["end"], nxt["end"])
+                cur["score"] = max(cur["score"], nxt["score"])
+            else:
+                merged.append(cur)
+                cur = dict(nxt)
+        merged.append(cur)
+
+    merged.sort(key=lambda e: (e["start"], -e["score"]))
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Main lane entry point
+# ---------------------------------------------------------------------------
+
+def _build_tagger(device: str):
+    """Construct the PANNs CNN14 tagger. Split out so the batch entry
+    point can amortize model load across many videos.
+    """
+    from panns_inference import AudioTagging
+    try:
+        return AudioTagging(checkpoint_path=None, device=device)
+    except TypeError:
+        return AudioTagging(checkpoint_path=None)
+
+
+def _process_one(
+    tagger,
+    video_path: Path,
+    edit_dir: Path,
+    *,
+    threshold: float,
+    top_k: int,
+    windows_per_batch: int,
+    force: bool,
+) -> Path:
+    """Run audio tagging on one video with an already-built tagger."""
+    out_dir = (edit_dir / AUDIO_TAGS_SUBDIR).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{video_path.stem}.json"
+
+    if not force and out_path.exists():
+        try:
+            if out_path.stat().st_mtime >= video_path.stat().st_mtime:
+                print(f"  audio_lane cache hit: {out_path.name}")
+                return out_path
+        except OSError:
+            pass
+
+    wav_path = extract_audio_for(video_path, edit_dir, verbose=True)
+    print(f"  panns: loading audio from {wav_path.name}")
+    audio = _load_wav_mono_16k(wav_path)
+    duration = len(audio) / SAMPLE_RATE
+    print(f"  panns: {duration:.1f}s, sliding {WINDOW_S}s window @ {HOP_S}s hop "
+          f"(threshold={threshold}, top_k={top_k}, windows_per_batch={windows_per_batch})")
+
+    t0 = time.time()
+    raw_events = _slide_and_tag_with_tagger(
+        tagger, audio, SAMPLE_RATE,
+        window_s=WINDOW_S, hop_s=HOP_S,
+        top_k=top_k, threshold=threshold,
+        windows_per_batch=windows_per_batch,
+    )
+    events = _coalesce(raw_events)
+    dt = time.time() - t0
+
+    payload = {
+        "model": "PANNs CNN14 / AudioSet",
+        "window_s": WINDOW_S,
+        "hop_s": HOP_S,
+        "threshold": threshold,
+        "top_k": top_k,
+        "windows_per_batch": windows_per_batch,
+        "duration": round(duration, 3),
+        "events": events,
+    }
+    tmp_path = out_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
+
+    print(f"  audio_lane done: {len(events)} events ({len(raw_events)} raw), "
+          f"{dt:.1f}s wall → {out_path.name}")
+    return out_path
+
+
+def run_audio_lane_batch(
+    video_paths: list[Path],
+    edit_dir: Path,
+    *,
+    threshold: float = DEFAULT_THRESHOLD,
+    top_k: int = DEFAULT_TOP_K,
+    windows_per_batch: int = DEFAULT_WINDOWS_PER_BATCH,
+    device: str = "cuda",
+    force: bool = False,
+) -> list[Path]:
+    """Run the audio lane on N videos with the tagger loaded ONCE."""
+    out_dir = (edit_dir / AUDIO_TAGS_SUBDIR).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not force:
+        all_fresh = True
+        for v in video_paths:
+            out = out_dir / f"{v.stem}.json"
+            try:
+                if not out.exists() or out.stat().st_mtime < v.stat().st_mtime:
+                    all_fresh = False
+                    break
+            except OSError:
+                all_fresh = False
+                break
+        if all_fresh:
+            print(f"  audio_lane: all {len(video_paths)} cache hits, skipping model load")
+            return [out_dir / f"{v.stem}.json" for v in video_paths]
+
+    tagger = _build_tagger(device)
+    out_paths: list[Path] = []
+    try:
+        for v in video_paths:
+            out_paths.append(_process_one(
+                tagger, v, edit_dir,
+                threshold=threshold, top_k=top_k,
+                windows_per_batch=windows_per_batch,
+                force=force,
+            ))
+    finally:
+        try:
+            import torch
+            del tagger
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    return out_paths
+
+
+def run_audio_lane(
+    video_path: Path,
+    edit_dir: Path,
+    **kwargs,
+) -> Path:
+    """Single-video convenience wrapper around run_audio_lane_batch."""
+    return run_audio_lane_batch([video_path], edit_dir, **kwargs)[0]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Audio events lane: PANNs CNN14 → AudioSet 527 tags",
+    )
+    ap.add_argument("video", type=Path, help="Path to source video file")
+    ap.add_argument(
+        "--edit-dir", type=Path, default=None,
+        help="Edit output dir (default: <video parent>/edit)",
+    )
+    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+                    help=f"Min confidence to keep an event (default {DEFAULT_THRESHOLD})")
+    ap.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
+                    help=f"Top-K labels per window (default {DEFAULT_TOP_K})")
+    ap.add_argument("--windows-per-batch", type=int, default=None,
+                    help=f"Windows per CNN14 forward pass (default "
+                         f"{DEFAULT_WINDOWS_PER_BATCH}, or {PANNS_WINDOWS_PER_BATCH} "
+                         f"with --wealthy)")
+    ap.add_argument("--wealthy", action="store_true",
+                    help="Speed knob for 24GB+ cards (4090/5090). Bigger PANNs batch, "
+                         "same model + outputs. Also reads VIDEO_USE_WEALTHY=1.")
+    ap.add_argument("--device", default="cuda",
+                    help="cuda | cpu (default: cuda — falls through to cpu if no CUDA)")
+    ap.add_argument("--force", action="store_true",
+                    help="Bypass cache, always re-tag.")
+    args = ap.parse_args()
+
+    video = args.video.resolve()
+    if not video.exists():
+        sys.exit(f"video not found: {video}")
+    edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
+
+    # Resolve windows-per-batch: explicit CLI value wins, else wealthy mode
+    # picks the tier, else the conservative default.
+    if args.windows_per_batch is not None:
+        wpb = args.windows_per_batch
+    elif is_wealthy(args.wealthy):
+        wpb = PANNS_WINDOWS_PER_BATCH
+    else:
+        wpb = DEFAULT_WINDOWS_PER_BATCH
+
+    run_audio_lane(
+        video_path=video,
+        edit_dir=edit_dir,
+        threshold=args.threshold,
+        top_k=args.top_k,
+        windows_per_batch=wpb,
+        device=args.device,
+        force=args.force,
+    )
+
+
+if __name__ == "__main__":
+    main()
