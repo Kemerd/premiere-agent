@@ -118,19 +118,21 @@ python helpers/health.py --clear           # wipe cache (next call re-runs)
 
 ### Preprocessing (the three lanes)
 
-- **`preprocess_batch.py <videos_dir>`** — auto-discover videos, run all three lanes with VRAM-aware scheduling. Default entry point. Flags: `--wealthy` (24GB+ GPU), `--diarize`, `--language en`, `--force`, `--skip-{whisper,audio,visual}`.
-- **`preprocess.py <video1> [<video2> ...]`** — same orchestrator with explicit file list. Use when you want a subset.
-- **`pack_timelines.py --edit-dir <dir>`** — read the three lane caches (`transcripts/`, `audio_tags/`, `visual_caps/`) and produce `speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`. Add `--merge` for `merged_timeline.md`.
-- **Individual lanes** (rarely needed — the orchestrator wraps them): `whisper_lane.py`, `audio_lane.py`, `visual_lane.py`. Each accepts `--wealthy` and runs standalone.
-- **`extract_audio.py <video>`** — manually extract 16kHz mono WAV. Cached. Mainly for debugging.
-- **`vram.py`** — print detected GPU + the schedule that would be picked. Useful sanity check.
+> **All helpers live in `helpers/`.** Always invoke them from the skill root as `python helpers/<script>.py …` (the sibling-import pattern they use depends on `helpers/` being the script's own directory, which `sys.path` resolves automatically when you run them by path). Never `cd helpers/` first — `cwd` semantics differ across shells (PowerShell, bash, agentic shells that don't persist `cd`), and the cache layout assumes the project root is the cwd.
+
+- **`helpers/preprocess_batch.py <videos_dir>`** — auto-discover videos, run all three lanes with VRAM-aware scheduling. Default entry point. Flags: `--wealthy` (24GB+ GPU), `--diarize`, `--language en`, `--force`, `--skip-{whisper,audio,visual}`.
+- **`helpers/preprocess.py <video1> [<video2> ...]`** — same orchestrator with explicit file list. Use when you want a subset.
+- **`helpers/pack_timelines.py --edit-dir <dir>`** — read the three lane caches (`transcripts/`, `audio_tags/`, `visual_caps/`) and produce `speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`. Add `--merge` for `merged_timeline.md`.
+- **Individual lanes** (rarely needed — the orchestrator wraps them): `helpers/whisper_lane.py`, `helpers/audio_lane.py`, `helpers/visual_lane.py`. Each accepts `--wealthy` and runs standalone.
+- **`helpers/extract_audio.py <video>`** — manually extract 16kHz mono WAV. Cached. Mainly for debugging.
+- **`helpers/vram.py`** — print detected GPU + the schedule that would be picked. Useful sanity check.
 
 ### Editing
 
-- **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly. The visual_timeline.md replaces 90% of the old "scan with timeline_view" workflow.
-- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST → loudness norm → final.mp4. `--preview` for 1080p fast, `--draft` for 720p ultrafast, `--build-subtitles` to generate master.srt inline. **Flattens J/L cuts to hard cuts** — see Cut Techniques below.
-- **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
-- **`export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit an editor-ready FCPXML timeline. Honors `audio_lead` / `video_tail` (J/L cuts) and `transition_in` (cross-dissolves) natively. Opens in Premiere Pro, DaVinci Resolve, Final Cut Pro. `--frame-rate 24` (default), 25, 29.97, 30, 60.
+- **`helpers/timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly. The visual_timeline.md replaces 90% of the old "scan with timeline_view" workflow.
+- **`helpers/render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST → loudness norm → final.mp4. `--preview` for 1080p fast, `--draft` for 720p ultrafast, `--build-subtitles` to generate master.srt inline. **Flattens J/L cuts to hard cuts** — see Cut Techniques below.
+- **`helpers/grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
+- **`helpers/export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit an editor-ready FCPXML timeline. Honors `audio_lead` / `video_tail` (J/L cuts) and `transition_in` (cross-dissolves) natively. Opens in Premiere Pro, DaVinci Resolve, Final Cut Pro. `--frame-rate 24` (default), 25, 29.97, 30, 60.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
