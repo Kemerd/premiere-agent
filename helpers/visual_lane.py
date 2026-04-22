@@ -64,7 +64,15 @@ from wealthy import FLORENCE_BATCH, is_wealthy
 # Tunables
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL_ID = "microsoft/Florence-2-base"
+# HF community port of Florence-2-base. Same weights / same MIT license /
+# same task prompts as `microsoft/Florence-2-base`, but uses the NATIVE
+# `Florence2ForConditionalGeneration` class shipped in transformers 4.55+
+# instead of the abandoned trust_remote_code modeling file. The original
+# microsoft repo's remote code broke against transformers' new attention
+# dispatcher contract (`_supports_sdpa` requirement) and HF themselves
+# now point users at this checkpoint as the canonical replacement —
+# see https://github.com/huggingface/transformers/issues/41622.
+DEFAULT_MODEL_ID = "florence-community/Florence-2-base"
 DEFAULT_FPS = 1
 DEFAULT_BATCH_SIZE = 8           # safe on 4 GB; orchestrator can override
 DEFAULT_TASK_PROMPT = "<MORE_DETAILED_CAPTION>"
@@ -205,418 +213,65 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
 
 
 # ---------------------------------------------------------------------------
-# transformers 5.x compatibility shim for Florence-2's trust-remote-code
-# config.
+# Florence-2 model construction.
 #
-# Florence-2 ships its own `configuration_florence2.py` (loaded via
-# trust_remote_code=True) that references a handful of generation-related
-# attributes on `self` during __init__:
+# We use `florence-community/Florence-2-base` — the HF-format port of
+# `microsoft/Florence-2-base` that ships with the NATIVE
+# `Florence2ForConditionalGeneration` class (added to transformers in
+# 4.55). No `trust_remote_code`, no remote modeling file, no monkey
+# patches required for the four 5.x dispatcher / cache / tokenizer
+# breakages we used to carry. HF themselves point users at the
+# community port now; see issue #41622.
 #
-#     if self.forced_bos_token_id is None and ...
-#
-# In transformers 4.x those attributes were initialized to None by
-# `PretrainedConfig.__init__`. transformers 5.x removed several of them
-# (they migrated into `GenerationConfig`), so Florence's old config code
-# now crashes with:
-#
-#     AttributeError: 'Florence2LanguageConfig' object has no attribute
-#                     'forced_bos_token_id'
-#
-# We restore the legacy lookup behavior by setting class-level None
-# defaults on PretrainedConfig itself. Instance attribute lookup falls
-# through to the class, so any subclass — including Florence's custom
-# config — sees None instead of AttributeError. We do NOT re-add the
-# attributes to instances, so any code that legitimately wrote them
-# still wins over the class default.
-#
-# Idempotent: re-calling does nothing once the attributes are present.
-# Scope: only patches attributes that were actually present in 4.x and
-# removed in 5.x (verified against the transformers 4.45 → 5.0 changelog).
-# Cheap: pure attribute writes on a class object, no model load.
-# ---------------------------------------------------------------------------
-
-_REMOVED_IN_TRANSFORMERS_5 = (
-    "forced_bos_token_id",
-    "forced_eos_token_id",
-    "begin_suppress_tokens",
-    "suppress_tokens",
-    "task_specific_params",
-)
-
-
-def _install_legacy_pretrained_config_compat() -> None:
-    """Restore the attributes Florence-2's trust-remote-code config still
-    references but which transformers 5.x dropped from PretrainedConfig.
-
-    Safe no-op when transformers isn't installed (the visual lane is
-    optional via `[preprocess]`) and when the attributes already exist
-    (transformers 4.x or future-5.x where the attrs were re-added).
-    """
-    try:
-        from transformers import PretrainedConfig
-    except ImportError:
-        return
-    for attr in _REMOVED_IN_TRANSFORMERS_5:
-        if not hasattr(PretrainedConfig, attr):
-            setattr(PretrainedConfig, attr, None)
-
-
-# ---------------------------------------------------------------------------
-# transformers 5.x compatibility shim — second layer, model side.
-#
-# In transformers 5.x the attention dispatcher in `modeling_utils.py`
-# unconditionally reads support flags off `self` to decide which kernel
-# to wire up (eager vs sdpa vs flash-attn-2). Bona-fide HF models declare
-# these as class attributes on their subclass of `PreTrainedModel`. But
-# Florence-2 ships its modeling file via trust_remote_code, and that file
-# predates the new dispatcher contract — it never declares `_supports_sdpa`
-# at all. Result, on first forward pass:
-#
-#     AttributeError: 'Florence2ForConditionalGeneration' object has no
-#                     attribute '_supports_sdpa'
-#         at transformers/modeling_utils.py:1709
-#
-# Why setting these to False is the correct floor (not True):
-#   - False → dispatcher falls back to the eager attention path, which
-#     is universally correct, just slower. Worst case: a perf hit.
-#   - True without the model actually implementing the SDPA / flash-attn
-#     contract → the dispatcher hands the kernel tensors it can't handle,
-#     producing silently-wrong outputs (or a crash inside the kernel,
-#     which is the lucky case). Correctness > throughput.
-#
-# Why this is safe for models that DO declare the attrs:
-#   - We only `setattr` when `hasattr(...)` is False on the class. Real
-#     HF models that declare `_supports_sdpa = True` on their subclass
-#     are untouched — subclass attribute lookup hits their declaration
-#     long before walking up to `PreTrainedModel`.
-#   - Instance-level writes (`self._supports_sdpa = True` from inside a
-#     custom __init__) also win over the class default, because Python
-#     attribute lookup checks the instance __dict__ first. We're setting
-#     the FLOOR, not overriding declared values.
-#
-# Scope: this matters only for trust_remote_code modules whose authors
-# never updated to the 5.x dispatcher contract. First-party HF models
-# always declare these flags — the patch is a no-op for them.
-#
-# Idempotent, cheap, no model load required.
-# ---------------------------------------------------------------------------
-
-_MISSING_MODEL_FLAGS_IN_TRANSFORMERS_5 = (
-    "_supports_sdpa",
-    "_supports_flash_attn_2",
-    "_supports_flash_attn",          # legacy 4.x name, harmless to add
-    "_supports_cache_class",
-    "_supports_static_cache",
-    "_supports_quantized_cache",
-)
-
-
-def _install_legacy_pretrained_model_compat() -> None:
-    """Provide False defaults for attention-dispatch support flags that
-    transformers 5.x's `PreTrainedModel` no longer declares but its
-    dispatcher unconditionally reads.
-
-    Safe no-op when transformers isn't installed (the visual lane is
-    optional via `[preprocess]`) and when the attributes already exist
-    (transformers 4.x, or trust_remote_code modules that *do* declare
-    them). False is the correctness-preserving floor: it forces the
-    eager attention path instead of risking a silently-wrong fast path.
-    """
-    try:
-        from transformers.modeling_utils import PreTrainedModel
-    except ImportError:
-        return
-    for attr in _MISSING_MODEL_FLAGS_IN_TRANSFORMERS_5:
-        if not hasattr(PreTrainedModel, attr):
-            setattr(PreTrainedModel, attr, False)
-
-
-# ---------------------------------------------------------------------------
-# transformers 5.x compatibility shim — fourth layer, tokenizer side.
-#
-# Florence-2's processor (the trust_remote_code `processing_florence2.py`)
-# directly reads `tokenizer.additional_special_tokens` as an instance
-# attribute during processor construction. In transformers 4.x this was
-# always present (a real attribute initialized to `[]` in
-# `PreTrainedTokenizerBase.__init__`). In transformers 5.x it was removed
-# from the slow tokenizer's instance dict; the canonical access is now via
-# `tokenizer.special_tokens_map.get("additional_special_tokens", [])`.
-#
-# Florence-2's processor was written before that move and crashes with:
-#
-#     AttributeError: RobertaTokenizer has no attribute
-#                     additional_special_tokens.
-#                     Did you mean: 'add_special_tokens'?
-#
-# We can't (and shouldn't) edit the trust_remote_code module — it lives in
-# the HF cache. So we add a `property` to the tokenizer base classes that
-# returns `[]` (or whatever's in `special_tokens_map`) when the underlying
-# attribute is missing. Plain `setattr(cls, "additional_special_tokens",
-# [])` would be wrong: the SETTER side of the same name still needs to
-# work for code that *does* register additional special tokens. A property
-# with both getter and setter preserves both contracts.
-#
-# Patch the bases (`PreTrainedTokenizerBase`, `PreTrainedTokenizer`,
-# `PreTrainedTokenizerFast`) — every concrete tokenizer (Roberta, BART,
-# T5, ...) inherits from one of those, so one shim covers them all.
-# ---------------------------------------------------------------------------
-
-def _install_legacy_tokenizer_compat() -> None:
-    """Backfill `additional_special_tokens` on tokenizer base classes when
-    transformers 5.x removed the legacy instance attribute that
-    Florence-2's remote-code processor still reads as a bare attribute.
-
-    Idempotent + best-effort: if transformers is uninstalled, if any of
-    the base classes can't be imported, or if the attribute is already a
-    real property/attr on the class, we leave the world alone. The check
-    `attr in cls.__dict__` is intentional — we want to detect whether the
-    *exact* class declares it, not whether some superclass does (which it
-    will, after our first patch — that's what makes this idempotent).
-    """
-    try:
-        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-    except ImportError:
-        return
-
-    # Build the (getter, setter) pair once. The getter falls back through
-    # three sources in priority order:
-    #   1. The instance dict — if downstream code wrote a real attribute,
-    #      respect it (transformers 4.x style code path).
-    #   2. `special_tokens_map["additional_special_tokens"]` — the
-    #      canonical transformers 5.x location.
-    #   3. Empty list — safe default; Florence's processor only reads the
-    #      attribute and never errors on `[]`.
-    def _get_additional_special_tokens(self):
-        # Instance attribute wins — preserves any explicit assignment.
-        # We poke __dict__ directly to avoid triggering this very property.
-        if "additional_special_tokens" in self.__dict__:
-            return self.__dict__["additional_special_tokens"]
-        # Fall back to the canonical 5.x location.
-        try:
-            stm = self.special_tokens_map
-        except AttributeError:
-            return []
-        return list(stm.get("additional_special_tokens", []))
-
-    def _set_additional_special_tokens(self, value):
-        # Stash on the instance so the getter above will return it next
-        # time, AND mirror it into the underlying tokenizer state via the
-        # public API when available (so HF internals stay consistent).
-        self.__dict__["additional_special_tokens"] = (
-            list(value) if value is not None else []
-        )
-        # Best-effort sync with the special_tokens_map. add_special_tokens
-        # exists on both fast and slow tokenizers across all versions, so
-        # this is safe to call. Wrapped in try/except because some
-        # subclasses lock the tokenizer state during init and would raise.
-        try:
-            self.add_special_tokens(
-                {"additional_special_tokens": list(value or [])}
-            )
-        except Exception:
-            pass
-
-    new_property = property(
-        _get_additional_special_tokens,
-        _set_additional_special_tokens,
-    )
-
-    # Walk every tokenizer base class transformers exposes and inject the
-    # shim where it's actually missing. We tolerate any of these imports
-    # failing — different transformers versions split the class hierarchy
-    # differently (PreTrainedTokenizerFast moved out of tokenization_utils
-    # into tokenization_utils_fast in 4.x, etc.).
-    base_classes: list[type] = [PreTrainedTokenizerBase]
-    try:
-        from transformers.tokenization_utils import PreTrainedTokenizer
-        base_classes.append(PreTrainedTokenizer)
-    except ImportError:
-        pass
-    try:
-        from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
-        base_classes.append(PreTrainedTokenizerFast)
-    except ImportError:
-        pass
-
-    for cls in base_classes:
-        # Only patch if THIS class doesn't declare the attr — the inheritance
-        # chain will surface our patch from a base class to subclasses anyway.
-        # Without this guard we'd shadow a working property with our own.
-        if "additional_special_tokens" in cls.__dict__:
-            existing = cls.__dict__["additional_special_tokens"]
-            # If it's already a property (vanilla 4.x or working 5.x), leave
-            # it alone — our shim is for the "attribute went missing" case.
-            if isinstance(existing, property):
-                continue
-            # Plain class attr (rare) — also leave alone, it works.
-            continue
-        # Attr missing on this class. Patch it. Subclasses (RobertaTokenizer
-        # et al.) automatically inherit the property via Python's MRO, so a
-        # single setattr here covers every concrete tokenizer.
-        setattr(cls, "additional_special_tokens", new_property)
-
-
-# ---------------------------------------------------------------------------
-# transformers 5.x compatibility shim — third layer, Florence-2 specific.
-#
-# `Florence2PreTrainedModel` (loaded via trust_remote_code) declares
-# `_supports_sdpa` and `_supports_flash_attn_2` as `property` *objects*
-# rather than plain class-attribute booleans:
-#
-#     @property
-#     def _supports_sdpa(self):
-#         return self.<some_instance_state>
-#
-# The getter is invoked during `PreTrainedModel.__init__`'s attention-
-# dispatch resolution — at which point Florence's own __init__ has not
-# yet finished setting up the instance state the getter needs. The
-# getter raises AttributeError; Python's descriptor protocol swallows
-# that AttributeError and falls through to nn.Module.__getattr__, which
-# then raises the misleading top-level error:
-#
-#     AttributeError: 'Florence2ForConditionalGeneration' object has no
-#                     attribute '_supports_sdpa'
-#
-# The previous two patches (config defaults + PreTrainedModel-class
-# defaults) cannot help here, because the *subclass* property shadows
-# the class attribute via Python's MRO — the property is found first,
-# the broken getter runs first, the AttributeError is raised first.
-#
-# Fix: replace the broken `property` descriptor with a plain `False` on
-# the Florence subclass itself. Plain class attributes don't trigger the
-# descriptor protocol, so __getattribute__ returns False directly during
-# init and the dispatcher routes to eager attention (the safe floor).
-#
-# We patch ONLY when the existing class attribute is actually a
-# `property`, so a future Florence release that ships a fixed bool
-# declaration is not silently re-broken by us.
-# ---------------------------------------------------------------------------
-
-_FLORENCE_BROKEN_FLAG_PROPERTIES = (
-    "_supports_sdpa",
-    "_supports_flash_attn_2",
-)
-
-
-def _patch_florence_support_flag_properties(model_id: str) -> None:
-    """Replace Florence-2's broken `property`-typed support flags with
-    plain `False` on `Florence2PreTrainedModel`.
-
-    `model_id` is the HF repo id we'll load the trust_remote_code module
-    from — same id you'll pass to `from_pretrained` shortly after. We
-    fetch the class via `get_class_from_dynamic_module` which is the
-    same path `from_pretrained` uses internally, so this guarantees we
-    patch the exact class that will be instantiated.
-
-    Best-effort: if transformers isn't installed, the dynamic module
-    can't be resolved (network blocked, model id wrong), or the class
-    doesn't actually declare these as properties (a fixed Florence
-    release, or a different model entirely), we silently return. The
-    subsequent `from_pretrained` call surfaces any real problem with a
-    proper traceback.
-    """
-    try:
-        from transformers.dynamic_module_utils import get_class_from_dynamic_module
-    except ImportError:
-        return
-
-    try:
-        florence_pre = get_class_from_dynamic_module(
-            "modeling_florence2.Florence2PreTrainedModel",
-            model_id,
-            revision=None,
-        )
-    except Exception:
-        # Module not yet downloaded / network blocked / wrong model_id /
-        # not actually a Florence model — leave it alone. The downstream
-        # from_pretrained will produce a real error if anything's wrong.
-        return
-
-    for attr in _FLORENCE_BROKEN_FLAG_PROPERTIES:
-        if isinstance(florence_pre.__dict__.get(attr), property):
-            setattr(florence_pre, attr, False)
-
-
-# ---------------------------------------------------------------------------
-# Florence-2 model construction. trust_remote_code=True is REQUIRED — the
-# model uses a custom modeling file that ships in the HF repo.
+# Same weights, same MIT license, same task prompts (`<MORE_DETAILED_CAPTION>`
+# etc.) as the original microsoft repo — just the loading mechanics changed.
 # ---------------------------------------------------------------------------
 
 def _build_florence(model_id: str, device: str, dtype_name: str):
-    # ------------------------------------------------------------------
-    # transformers 5.x compatibility shims.
-    #
-    # Every patch below addresses a Florence-2 ↔ transformers 5.x
-    # breakage. On the supported / pinned config (transformers 4.x) NONE
-    # of these are needed — and worse, running them on 4.x risks
-    # shadowing perfectly-good attrs with our defensive defaults
-    # (e.g. setting `_supports_sdpa = False` on 4.x where it was
-    # correctly True). We gate the entire patch block behind a version
-    # check so the supported path stays untouched and only the escape
-    # hatch (5.x) pays the patching cost.
-    #
-    # If you somehow end up here on 5.x: the patches still won't fully
-    # save you — there's a 5th breakage in Florence's
-    # `prepare_inputs_for_generation` against the new EncoderDecoderCache
-    # API that we don't currently patch. Consider downgrading per the
-    # pyproject.toml pin.
-    # ------------------------------------------------------------------
-    try:
-        import transformers as _tf
-        _tf_major = int(_tf.__version__.split(".", 1)[0])
-    except (ImportError, ValueError):
-        _tf_major = 0  # unknown — be conservative, run patches
+    """Construct Florence-2 from the HF community port.
 
-    if _tf_major >= 5:
-        # MUST run before from_pretrained — Florence's custom config
-        # touches the removed attrs during __init__, which is invoked
-        # synchronously by AutoConfig (and therefore AutoModelForCausalLM).
-        _install_legacy_pretrained_config_compat()
-        # Order matters: config patch must precede the model patch,
-        # because AutoConfig resolution happens before any PreTrainedModel
-        # subclass is touched. This second patch covers the attention
-        # dispatcher's support-flag reads on the model side via
-        # PreTrainedModel defaults.
-        _install_legacy_pretrained_model_compat()
-        # Third patch: the previous two cover *missing* attrs, but
-        # Florence-2 actively *declares* `_supports_sdpa` as a broken
-        # `property` in its subclass — that shadows our class-level
-        # defaults. We have to patch the Florence subclass itself,
-        # which means resolving the dynamic module first. This call
-        # also primes the trust_remote_code download so the upcoming
-        # from_pretrained doesn't have to.
-        _patch_florence_support_flag_properties(model_id)
-        # Fourth patch: tokenizer-side. Florence's processor reads
-        # `tokenizer.additional_special_tokens` as a bare attr;
-        # transformers 5.x removed that. Backfill the property on the
-        # tokenizer base classes so every concrete tokenizer
-        # (RobertaTokenizer in our case) picks it up via MRO before
-        # AutoProcessor.from_pretrained runs.
-        _install_legacy_tokenizer_compat()
-
+    Uses the native `Florence2ForConditionalGeneration` class shipped in
+    transformers 4.55+ — no `trust_remote_code`, no remote modeling file,
+    no monkey patches. Falls back to `AutoModelForImageTextToText` if the
+    explicit class import fails (forward-compatible with transformers
+    moving the class around in future minor releases).
+    """
     import torch
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers import AutoProcessor
+
+    # Tiny version sniff to pick the right dtype kwarg name.
+    # transformers 5.x renamed `torch_dtype` -> `dtype` and emits a
+    # DeprecationWarning on every load if the old name is used. 4.x
+    # still requires `torch_dtype`. One cheap probe at load time
+    # silences the noise on 5.x without breaking the 4.55-4.x range.
+    import transformers as _tf
+    _tf_major = int(_tf.__version__.split(".", 1)[0])
 
     dtype_map = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
     if dtype_name not in dtype_map:
         raise ValueError(f"unknown dtype '{dtype_name}'")
     torch_dtype = dtype_map[dtype_name]
+    dtype_kwarg = {"dtype": torch_dtype} if _tf_major >= 5 else {"torch_dtype": torch_dtype}
+
+    # Prefer the explicit class import — it's the path the model card
+    # documents and gives us a clear ImportError if the user's
+    # transformers is too old (< 4.55, before the class was added).
+    # Fall back to AutoModelForImageTextToText, which is Florence-2's
+    # registered Auto class per its config.json. Both paths are
+    # zero-cost — they resolve to the same class object.
+    try:
+        from transformers import Florence2ForConditionalGeneration as _ModelCls
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as _ModelCls
 
     print(f"  florence: model={model_id}  device={device}  dtype={dtype_name}")
-    # transformers 5.x renamed the kwarg `torch_dtype` -> `dtype` and
-    # warns on every load when you pass the old name. transformers 4.x
-    # only accepts `torch_dtype`. Sniff the major version once and pick
-    # the right keyword so we silence the 5.x noise without breaking
-    # 4.x installs (the [preprocess] extra still pins transformers>=4.45).
-    import transformers as _tf
-    _tf_major = int(_tf.__version__.split(".", 1)[0])
-    dtype_kwarg = {"dtype": torch_dtype} if _tf_major >= 5 else {"torch_dtype": torch_dtype}
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        trust_remote_code=True,
-        **dtype_kwarg,
-    ).to(device).eval()
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+    # No trust_remote_code — community port ships native HF code.
+    # `.to(device)` after `.from_pretrained()` is fine here; we don't
+    # use device_map="auto" because we want hard, predictable placement
+    # for the multi-process VRAM accounting in the orchestrator.
+    model = _ModelCls.from_pretrained(model_id, **dtype_kwarg).to(device).eval()
+    processor = AutoProcessor.from_pretrained(model_id)
     return model, processor, torch_dtype
 
 
