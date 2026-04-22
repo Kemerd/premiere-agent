@@ -212,10 +212,14 @@ def _is_known_broken_parallel_combo(device_name: str) -> tuple[bool, str]:
         # to leave parallel scheduling on for whatever IS running.
         return False, "transformers not importable"
     if major < 5:
-        return False, f"transformers {_tf.__version__} < 5"
+        # Supported / pinned config — sdpa works on Blackwell here, no
+        # context corruption observed, parallel is fine. This is the
+        # path users SHOULD be on (see pyproject.toml).
+        return False, f"transformers {_tf.__version__} < 5 (supported config)"
     return True, (
         f"Blackwell ({device_name}) + transformers {_tf.__version__} — "
-        f"known to produce fake OOMs under multi-process CUDA contention"
+        f"known to produce fake OOMs under multi-process CUDA contention "
+        f"(downgrade to transformers<5 for the supported parallel path)"
     )
 
 

@@ -535,28 +535,56 @@ def _patch_florence_support_flag_properties(model_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_florence(model_id: str, device: str, dtype_name: str):
-    # MUST run before from_pretrained — Florence's custom config touches
-    # the removed attrs during __init__, which is invoked synchronously
-    # by AutoConfig (and therefore AutoModelForCausalLM) below.
-    _install_legacy_pretrained_config_compat()
-    # Order matters: config patch must precede the model patch, because
-    # AutoConfig resolution happens before any PreTrainedModel subclass
-    # is touched. This second patch covers the attention dispatcher's
-    # support-flag reads on the model side via PreTrainedModel defaults.
-    _install_legacy_pretrained_model_compat()
-    # Third patch: the previous two cover *missing* attrs, but Florence-2
-    # actively *declares* `_supports_sdpa` as a broken `property` in its
-    # subclass — that shadows our class-level defaults. We have to patch
-    # the Florence subclass itself, which means resolving the dynamic
-    # module first. This call also primes the trust_remote_code download
-    # so the upcoming from_pretrained doesn't have to.
-    _patch_florence_support_flag_properties(model_id)
-    # Fourth patch: tokenizer-side. Florence's processor reads
-    # `tokenizer.additional_special_tokens` as a bare attr; transformers
-    # 5.x removed that. Backfill the property on the tokenizer base
-    # classes so every concrete tokenizer (RobertaTokenizer in our case)
-    # picks it up via MRO before AutoProcessor.from_pretrained runs.
-    _install_legacy_tokenizer_compat()
+    # ------------------------------------------------------------------
+    # transformers 5.x compatibility shims.
+    #
+    # Every patch below addresses a Florence-2 ↔ transformers 5.x
+    # breakage. On the supported / pinned config (transformers 4.x) NONE
+    # of these are needed — and worse, running them on 4.x risks
+    # shadowing perfectly-good attrs with our defensive defaults
+    # (e.g. setting `_supports_sdpa = False` on 4.x where it was
+    # correctly True). We gate the entire patch block behind a version
+    # check so the supported path stays untouched and only the escape
+    # hatch (5.x) pays the patching cost.
+    #
+    # If you somehow end up here on 5.x: the patches still won't fully
+    # save you — there's a 5th breakage in Florence's
+    # `prepare_inputs_for_generation` against the new EncoderDecoderCache
+    # API that we don't currently patch. Consider downgrading per the
+    # pyproject.toml pin.
+    # ------------------------------------------------------------------
+    try:
+        import transformers as _tf
+        _tf_major = int(_tf.__version__.split(".", 1)[0])
+    except (ImportError, ValueError):
+        _tf_major = 0  # unknown — be conservative, run patches
+
+    if _tf_major >= 5:
+        # MUST run before from_pretrained — Florence's custom config
+        # touches the removed attrs during __init__, which is invoked
+        # synchronously by AutoConfig (and therefore AutoModelForCausalLM).
+        _install_legacy_pretrained_config_compat()
+        # Order matters: config patch must precede the model patch,
+        # because AutoConfig resolution happens before any PreTrainedModel
+        # subclass is touched. This second patch covers the attention
+        # dispatcher's support-flag reads on the model side via
+        # PreTrainedModel defaults.
+        _install_legacy_pretrained_model_compat()
+        # Third patch: the previous two cover *missing* attrs, but
+        # Florence-2 actively *declares* `_supports_sdpa` as a broken
+        # `property` in its subclass — that shadows our class-level
+        # defaults. We have to patch the Florence subclass itself,
+        # which means resolving the dynamic module first. This call
+        # also primes the trust_remote_code download so the upcoming
+        # from_pretrained doesn't have to.
+        _patch_florence_support_flag_properties(model_id)
+        # Fourth patch: tokenizer-side. Florence's processor reads
+        # `tokenizer.additional_special_tokens` as a bare attr;
+        # transformers 5.x removed that. Backfill the property on the
+        # tokenizer base classes so every concrete tokenizer
+        # (RobertaTokenizer in our case) picks it up via MRO before
+        # AutoProcessor.from_pretrained runs.
+        _install_legacy_tokenizer_compat()
 
     import torch
     from transformers import AutoModelForCausalLM, AutoProcessor

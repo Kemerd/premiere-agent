@@ -372,42 +372,60 @@ def _load_hf_token() -> str | None:
 # ---------------------------------------------------------------------------
 
 def _resolve_whisper_attn(device: str) -> str:
-    """Pick the safest attention implementation for Whisper.
+    """Pick the safest attention implementation for Whisper, transformers-version aware.
 
-    Background — why eager is the default:
-        transformers 5.x + sdpa + Whisper-large-v3 + Blackwell (sm_120)
-        is a known-broken combination. Symptoms: cryptic "CUDA error:
-        out of memory" raised on `inputs.to(device)` of a tiny mel-spec
-        tensor, with the "CUDA kernel errors might be asynchronously
-        reported" preamble — i.e. an earlier kernel failed silently and
-        poisoned the CUDA context. The retry-loop sees identical fake
-        OOMs at every batch size from 24 down to 1 and bails. See:
-            https://github.com/huggingface/transformers/issues/38662
-        and r/CUDA threads on PyTorch sm_120 + Whisper interactions.
+    The decision matrix:
 
-        Florence-2 in the same process runs fine on the same card
-        because its broken sdpa/flash flags are already monkey-patched
-        off in visual_lane.py — meaning Florence runs eager too. We're
-        just making Whisper consistent with that.
+        +---------------------+--------------+-----------------------------+
+        | transformers        | device       | chosen attn_implementation  |
+        +---------------------+--------------+-----------------------------+
+        | < 5  (supported)    | cuda / mps   | sdpa  (fast path, fused)    |
+        | < 5  (supported)    | cpu          | sdpa  (still fine on CPU)   |
+        | >= 5 (unsupported)  | cuda + sm120 | eager (Blackwell sdpa bug)  |
+        | >= 5 (unsupported)  | other        | eager (out of an abundance) |
+        +---------------------+--------------+-----------------------------+
 
-    Performance tradeoff: eager vs sdpa is roughly 1.5-2x slower on
-    Whisper-large-v3 long-form. On a 5090 that's still ~50x realtime,
-    which is fine for batch preprocessing. Once HF / PyTorch ships a
-    fix for the sdpa-on-Blackwell path, set `VIDEO_USE_WHISPER_ATTN=sdpa`
-    (or `flash_attention_2`) to opt back in without code changes.
+    Why this split:
+      * transformers < 5 is the supported / pinned configuration in
+        pyproject.toml — sdpa on Whisper-large-v3 is well-tested there
+        and saves us a HUGE amount of memory because sdpa never
+        materializes the O(seq^2) attention matrix. With seq=1500 on
+        the encoder × batch=24 × 32 layers × 20 heads in fp16, eager
+        attention's matrices are ~50+ GB; sdpa folds them into the
+        kernel and peaks at ~5 GB. This is the difference between
+        batch=24 fitting in 32 GB vs. OOMing.
+      * transformers >= 5.x is the user-escape-hatch path. The 5.x +
+        sdpa + Whisper + Blackwell (sm_120) combination silently
+        poisons the CUDA context (see
+        https://github.com/huggingface/transformers/issues/38662) and
+        every retry sees the same poisoned context. eager dodges the
+        broken kernel selector at the cost of memory — which means
+        users on 5.x ALSO need a smaller batch size; that's their
+        problem to opt into via --batch-size.
 
-    MPS path is unchanged: MPS doesn't support FA2 and our eager
-    default is already valid there.
+    The env var `VIDEO_USE_WHISPER_ATTN` ALWAYS wins — power users who
+    want flash_attention_2 or want to test a fix for the 5.x bug can
+    flip it without a code change.
     """
-    # Env var override comes first — power users / future-us can flip
-    # this once the underlying bug is fixed without redeploying code.
+    # Env var override always wins.
     forced = os.environ.get("VIDEO_USE_WHISPER_ATTN", "").strip().lower()
     if forced in ("eager", "sdpa", "flash_attention_2"):
         return forced
 
-    # Default policy: eager. Safe on every device + transformers combo
-    # we've seen in the wild. The perf hit is a deliberate tradeoff for
-    # not silently poisoning CUDA contexts on Blackwell.
+    # transformers-version-aware default. Fall back to "eager" if we
+    # can't probe (no transformers installed shouldn't happen in this
+    # codepath, but defensive coding never hurt anyone).
+    try:
+        import transformers as _tf
+        major = int(_tf.__version__.split(".", 1)[0])
+    except (ImportError, ValueError):
+        return "eager"
+
+    if major < 5:
+        # Supported config — go fast.
+        return "sdpa"
+
+    # Unsupported config — go safe (slow but correct on Blackwell).
     return "eager"
 
 
