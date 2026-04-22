@@ -1,19 +1,30 @@
-"""Export an EDL to FCPXML for Premiere Pro / DaVinci Resolve / Final Cut Pro.
+"""Export an EDL to NLE-native interchange for Premiere Pro / Resolve / FCP X.
 
 Reads the same `edl.json` shape that helpers/render.py reads, but instead
-of producing a flattened MP4 it produces an FCPXML timeline file that
-opens natively in:
+of producing a flattened MP4 it produces editor-ready timeline file(s).
 
-  - Adobe Premiere Pro          (File → Import → cut.fcpxml)
-  - DaVinci Resolve             (File → Import Timeline → AAF/EDL/XML)
-  - Apple Final Cut Pro         (File → Import → XML)
+Two flavors, picked by the receiving NLE:
 
-Why FCPXML and not EDL/AAF/CMX 3600:
-  - FCPXML is the only widely-supported format that natively encodes
-    SPLIT EDITS (J-cuts and L-cuts) — separate audio + video edges per
-    clip. EDL / CMX 3600 is single-track and would force flattening.
-  - OpenTimelineIO (the standard) has a maintained FCPXML adapter.
-  - Round-trips between all three majors with zero massaging.
+  * .fcpxml  — Final Cut Pro X / FCPXML 1.10+. Native to:
+      - Apple Final Cut Pro   (File → Import → XML)
+      - DaVinci Resolve       (File → Import → Timeline → AAF/EDL/XML)
+    Premiere Pro does NOT read this directly — Adobe documents the
+    XtoCC translator workflow for it.
+
+  * .xml     — Final Cut Pro 7 xmeml. Native to:
+      - Adobe Premiere Pro    (File → Import → cut.xml)
+    No XtoCC, no extra tooling. This is the Premiere handoff path.
+
+Default behaviour is to emit BOTH from a single timeline build so the
+recipient picks whichever NLE they live in without us having to re-run
+anything. Override with `--targets {fcpxml,premiere,both}`.
+
+Why split-edit-friendly XML and not EDL/AAF/CMX 3600:
+  - Both XML dialects natively encode SPLIT EDITS (J-cuts and L-cuts)
+    via independent audio + video extents per clip. CMX 3600 is
+    single-track and would force flattening.
+  - OpenTimelineIO ships maintained adapters for both dialects.
+  - Round-trips across the three majors with zero massaging.
 
 How J/L cuts map:
   - audio_lead  → the clip's AUDIO source_range starts (audio_lead) seconds
@@ -23,20 +34,28 @@ How J/L cuts map:
                   LATER than its VIDEO source_range. Audio lingers under
                   the next clip's video. (L-cut)
   - transition_in → an otio.schema.Transition placed BEFORE this clip on
-                    both tracks; OTIO's FCPXML adapter writes it as a
-                    cross-dissolve.
+                    both tracks; OTIO's adapters write it as a
+                    cross-dissolve in either dialect.
 
-Caveat: NLEs handle frame-aligned cuts. Whisper word timestamps land on
-arbitrary milliseconds. The exporter snaps every cut edge to the nearest
-frame at the EDL's `frame_rate` (default 24) so the import is clean.
+Caveat: NLEs handle frame-aligned cuts. Whisper / Parakeet word
+timestamps land on arbitrary milliseconds. The exporter snaps every cut
+edge to the nearest frame at the EDL's `frame_rate` (default 24) so the
+import is clean.
 
 Usage:
+    # Default — emit both cut.fcpxml AND cut.xml side-by-side
     python helpers/export_fcpxml.py <edl.json> -o cut.fcpxml
-    python helpers/export_fcpxml.py <edl.json> -o cut.fcpxml --frame-rate 30
+
+    # Resolve / FCP X only
+    python helpers/export_fcpxml.py <edl.json> -o cut.fcpxml --targets fcpxml
+
+    # Premiere Pro only (FCP7 xmeml)
+    python helpers/export_fcpxml.py <edl.json> -o cut.xml --targets premiere
 
 Dependencies (install via `pip install -e .[fcpxml]`):
     opentimelineio>=0.17
-    otio-fcpx-xml-adapter>=0.2
+    otio-fcpx-xml-adapter>=0.2     # .fcpxml writer (Resolve / FCP X)
+    otio-fcp-adapter>=0.2          # .xml writer    (Premiere Pro native)
 """
 
 from __future__ import annotations
@@ -322,15 +341,39 @@ def build_timeline(edl: dict, frame_rate: float):
 
 
 # ---------------------------------------------------------------------------
-# Write — defers to OTIO's adapter registry which dispatches by extension.
+# Writers — one per dialect. OTIO dispatches by file extension under the
+# hood so the surface API stays trivial; each writer just owns the
+# "missing adapter" diagnostic for its dialect.
+#
+# Both writers accept the SAME otio.schema.Timeline instance, so a single
+# build_timeline() pass feeds both outputs. There's no duplication of the
+# expensive ffprobe / frame-snapping work between them.
 # ---------------------------------------------------------------------------
 
-def write_fcpxml(timeline, out_path: Path) -> None:
-    """Write the timeline to disk as FCPXML.
+# Friendly target -> (extension, adapter pip package, NLE list) mapping.
+# Used both at write time (for diagnostics) and at CLI parse time (to
+# derive sibling output paths).
+_TARGET_INFO = {
+    "fcpxml": {
+        "ext": ".fcpxml",
+        "adapter_pkg": "otio-fcpx-xml-adapter",
+        "opens_in": "DaVinci Resolve / Final Cut Pro X",
+    },
+    "premiere": {
+        "ext": ".xml",
+        "adapter_pkg": "otio-fcp-adapter",
+        "opens_in": "Adobe Premiere Pro (File -> Import, native xmeml)",
+    },
+}
 
-    OTIO discovers the FCPXML adapter via the otio_fcpx_xml_adapter
-    package (declared in pyproject.toml's [fcpxml] extra). If it's
-    missing, OTIO raises a clean error here.
+
+def write_fcpxml(timeline, out_path: Path) -> None:
+    """Write the timeline as FCPXML 1.10+ (.fcpxml) — Resolve / FCP X path.
+
+    OTIO discovers the writer via the `otio_fcpx_xml_adapter` package
+    (declared in pyproject.toml's [fcpxml] extra). If it's missing we
+    raise a clean install hint instead of letting OTIO's generic
+    "no adapter for extension" message reach the user.
     """
     otio = _import_otio()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,10 +381,64 @@ def write_fcpxml(timeline, out_path: Path) -> None:
         otio.adapters.write_to_file(timeline, str(out_path))
     except otio.exceptions.NoKnownAdapterForExtensionError:
         sys.exit(
-            "OTIO has no FCPXML adapter installed. Add the extra:\n"
+            "OTIO has no FCPXML (.fcpxml) adapter installed. Fix:\n"
             "  pip install -e .[fcpxml]\n"
-            "(this pulls in otio-fcpx-xml-adapter)."
+            "(this pulls in otio-fcpx-xml-adapter for Resolve / FCP X "
+            "and otio-fcp-adapter for Premiere Pro)."
         )
+
+
+def write_premiere_xml(timeline, out_path: Path) -> None:
+    """Write the timeline as Final Cut Pro 7 xmeml (.xml) — Premiere path.
+
+    Why a separate writer: Premiere Pro does NOT natively read FCPXML
+    1.10+ (the .fcpxml extension). It reads the older Final Cut Pro 7
+    xmeml flavor (.xml). OTIO ships an `fcp_xml` adapter for that
+    dialect via the `otio-fcp-adapter` PyPI package — it lands the
+    same split-edit / dissolve fidelity as the .fcpxml path because
+    xmeml supports both natively. End result: Premiere Pro users get
+    a one-click File -> Import experience and skip the XtoCC step
+    Adobe documents.
+    """
+    otio = _import_otio()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        otio.adapters.write_to_file(timeline, str(out_path))
+    except otio.exceptions.NoKnownAdapterForExtensionError:
+        sys.exit(
+            "OTIO has no FCP7 xmeml (.xml) adapter installed. Fix:\n"
+            "  pip install -e .[fcpxml]\n"
+            "(this pulls in otio-fcp-adapter for Premiere Pro's native "
+            "xmeml import — no XtoCC required)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Output-path resolution. `-o` is treated as a basename: we strip the
+# extension and re-attach the canonical one per target. That way the user
+# can pass `-o cut.fcpxml`, `-o cut.xml`, or just `-o cut` and we DTRT.
+# ---------------------------------------------------------------------------
+
+def _resolve_output_paths(
+    user_output: Path, targets: str
+) -> tuple[Path | None, Path | None]:
+    """Return (fcpxml_path, premiere_xml_path) per the --targets choice.
+
+    Either entry is None when that target is disabled. The basename
+    (parent + stem) is taken from `user_output`; we always re-attach
+    the canonical extension so we never collide (cut.fcpxml + cut.xml).
+    """
+    parent = user_output.parent
+    stem = user_output.stem
+    fcpx = parent / f"{stem}{_TARGET_INFO['fcpxml']['ext']}"
+    prxml = parent / f"{stem}{_TARGET_INFO['premiere']['ext']}"
+    if targets == "both":
+        return fcpx, prxml
+    if targets == "fcpxml":
+        return fcpx, None
+    if targets == "premiere":
+        return None, prxml
+    raise ValueError(f"unknown --targets value: {targets!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -350,14 +447,28 @@ def write_fcpxml(timeline, out_path: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Export an edl.json to FCPXML for Premiere/Resolve/FCP",
+        description="Export an edl.json to NLE-native interchange XML "
+                    "(FCPXML for Resolve / FCP X, FCP7 xmeml for Premiere).",
     )
     ap.add_argument("edl", type=Path, help="Path to edl.json")
-    ap.add_argument("-o", "--output", type=Path, required=True,
-                    help="Output FCPXML file path")
-    ap.add_argument("--frame-rate", type=float, default=24.0,
-                    help="Timeline frame rate. Snap all cuts to whole frames "
-                         "at this rate. Default 24. Common: 23.976, 25, 29.97, 30, 60.")
+    ap.add_argument(
+        "-o", "--output", type=Path, required=True,
+        help="Output basename. Extension is normalized per target — pass "
+             "`cut.fcpxml`, `cut.xml`, or just `cut` and we'll attach the "
+             "right suffix(es) per --targets.",
+    )
+    ap.add_argument(
+        "--targets", choices=["both", "fcpxml", "premiere"], default="both",
+        help="Which dialect(s) to emit. Default: both. "
+             "`fcpxml` -> .fcpxml only (Resolve / FCP X). "
+             "`premiere` -> .xml only (Premiere native). "
+             "`both` writes side-by-side from a single timeline build.",
+    )
+    ap.add_argument(
+        "--frame-rate", type=float, default=24.0,
+        help="Timeline frame rate. Snap all cuts to whole frames at this "
+             "rate. Default 24. Common: 23.976, 25, 29.97, 30, 60.",
+    )
     args = ap.parse_args()
 
     edl_path = args.edl.resolve()
@@ -365,24 +476,51 @@ def main() -> None:
         sys.exit(f"edl not found: {edl_path}")
 
     edl = json.loads(edl_path.read_text(encoding="utf-8"))
+
+    # Build ONCE — both writers consume the same otio.schema.Timeline.
+    # ffprobe + frame-snapping costs are paid here, not per-dialect.
     timeline = build_timeline(edl, frame_rate=args.frame_rate)
-    write_fcpxml(timeline, args.output.resolve())
+
+    fcpx_out, prxml_out = _resolve_output_paths(args.output.resolve(), args.targets)
 
     n_clips = sum(
-        1 for t in timeline.tracks
-        for c in t
+        1 for t in timeline.tracks for c in t
         if c.__class__.__name__ == "Clip"
     )
     n_trans = sum(
-        1 for t in timeline.tracks
-        for c in t
+        1 for t in timeline.tracks for c in t
         if c.__class__.__name__ == "Transition"
     )
-    kb = args.output.stat().st_size / 1024
-    print(f"FCPXML written: {args.output}  ({kb:.1f} KB)")
-    print(f"  timeline rate: {args.frame_rate} fps")
-    print(f"  clips: {n_clips}  transitions: {n_trans}")
-    print(f"  open in: Premiere Pro / DaVinci Resolve / Final Cut Pro")
+    print(f"timeline built: {n_clips} clips, {n_trans} transitions, "
+          f"{args.frame_rate} fps")
+
+    # Emit each requested dialect. Failures in one writer don't prevent
+    # the other from running — the user shouldn't lose the Premiere file
+    # because, say, the Resolve adapter hit a bug on their OTIO version.
+    if fcpx_out is not None:
+        try:
+            write_fcpxml(timeline, fcpx_out)
+            kb = fcpx_out.stat().st_size / 1024
+            print(f"  [fcpxml]   {fcpx_out}  ({kb:.1f} KB)  "
+                  f"-> {_TARGET_INFO['fcpxml']['opens_in']}")
+        except SystemExit:
+            # Re-raise install-hint exits unchanged so the user sees the fix.
+            raise
+        except Exception as e:
+            print(f"  [fcpxml]   FAILED: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
+    if prxml_out is not None:
+        try:
+            write_premiere_xml(timeline, prxml_out)
+            kb = prxml_out.stat().st_size / 1024
+            print(f"  [premiere] {prxml_out}  ({kb:.1f} KB)  "
+                  f"-> {_TARGET_INFO['premiere']['opens_in']}")
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"  [premiere] FAILED: {type(e).__name__}: {e}",
+                  file=sys.stderr)
 
 
 if __name__ == "__main__":

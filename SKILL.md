@@ -31,6 +31,7 @@ These are the things where deviation produces silent failures or broken output. 
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
 12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use-premiere/` project directory.
+13. **Editor sub-agent must read ALL THREE timelines end-to-end before emitting a single EDL range** — `speech_timeline.md` first (the spine), then `visual_timeline.md` (shot continuity / B-roll), then `audio_timeline.md` (soundscape hints). Never edit from a single lane. A cut chosen from one timeline alone is a cut made blind to the other two — you will land mid-shot, mid-action, or on a CLAP mis-label. The brief in "Editor sub-agent brief" enforces this with a mandatory PRE-FLIGHT block; do not strip it when spawning.
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
@@ -60,7 +61,10 @@ The skill lives in `video-use-premiere/`. User footage lives wherever they put i
     ├── verify/                  ← debug frames / timeline PNGs
     ├── preview.mp4
     ├── final.mp4                ← flattened deliverable (ffmpeg path)
-    └── cut.fcpxml               ← editor-ready timeline (NLE path)
+    ├── cut.fcpxml               ← editor-ready timeline, FCPXML 1.10+
+    │                              (Resolve / Final Cut Pro X)
+    └── cut.xml                  ← editor-ready timeline, FCP7 xmeml
+                                   (Premiere Pro native, no XtoCC)
 ```
 
 ## Setup
@@ -145,7 +149,7 @@ The default audio workflow is: read `speech_timeline.md` + `visual_timeline.md` 
 - **`helpers/timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly. The visual_timeline.md replaces 90% of the old "scan with timeline_view" workflow.
 - **`helpers/render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST → loudness norm → final.mp4. `--preview` for 1080p fast, `--draft` for 720p ultrafast, `--build-subtitles` to generate master.srt inline. **Flattens J/L cuts to hard cuts** — see Cut Techniques below.
 - **`helpers/grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
-- **`helpers/export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit an editor-ready FCPXML timeline. Honors `audio_lead` / `video_tail` (J/L cuts) and `transition_in` (cross-dissolves) natively. Opens in Premiere Pro, DaVinci Resolve, Final Cut Pro. `--frame-rate 24` (default), 25, 29.97, 30, 60.
+- **`helpers/export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit editor-ready timeline files. Honors `audio_lead` / `video_tail` (J/L cuts) and `transition_in` (cross-dissolves) natively. **Default emits BOTH `cut.fcpxml` AND `cut.xml`** side-by-side from a single timeline build, because Premiere Pro and Resolve/FCP X want different XML dialects: `.fcpxml` (FCPXML 1.10+) is native to DaVinci Resolve and Final Cut Pro X, `.xml` (Final Cut Pro 7 xmeml) is native to Premiere Pro. The recipient picks whichever NLE they live in — no XtoCC conversion required for Premiere. Override with `--targets {both,fcpxml,premiere}`. `--frame-rate 24` (default), 25, 29.97, 30, 60.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
@@ -159,7 +163,7 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 5. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate, **delivery format**. **Wait for confirmation.**
 6. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments where the visual_timeline caption alone isn't enough. Build animations in parallel sub-agents. Apply grade per-segment.
    - **Flat MP4 path:** Compose via `render.py`.
-   - **NLE handoff path:** Export via `export_fcpxml.py`. Recipient finishes in Premiere/Resolve/FCP.
+   - **NLE handoff path:** Export via `export_fcpxml.py`. Default emits both `cut.fcpxml` (Resolve / FCP X) and `cut.xml` (Premiere Pro native xmeml) from one build — recipient picks. Tell Premiere users to `File → Import → cut.xml` (the `.fcpxml` does **not** work natively in Premiere — that's the file Adobe wants you to run through XtoCC, which we sidestep entirely).
    - **Both:** run them both — they consume the same EDL.
 7. **Preview.** `render.py --preview` (or hand the `cut.fcpxml` to the user to open and scrub).
 8. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
@@ -252,6 +256,18 @@ When the task is "pick the best take of each beat across many clips," spawn a de
 ```
 You are editing a <type> video. Pick the best take of each beat and 
 assemble them chronologically by beat, not by source clip order.
+
+PRE-FLIGHT (mandatory — do this before writing a single range):
+  1. Read speech_timeline.md  END-TO-END.  This is the editorial spine — every
+     cut start/end must land on a word boundary from this file.
+  2. Read visual_timeline.md  END-TO-END.  Verify shot continuity at every cut
+     point. A clean audio cut that lands mid-action visually is still a bad cut.
+  3. Read audio_timeline.md   END-TO-END.  Lowest-priority lane — CLAP labels
+     are noisy hints, never primary signal. When CLAP and Florence-2 disagree
+     about what's happening on screen, trust Florence-2.
+  If any of the three is missing from <edit>/, STOP and report — do not proceed
+  with partial inputs. Reading only one lane (especially audio_timeline.md
+  alone) is a Hard Rule violation (#13). All three, every time, full read.
 
 INPUTS (in priority order — trust them in this order when they disagree):
   - speech_timeline.md  (phrase-level Parakeet transcripts; ACCURATE, the spine)

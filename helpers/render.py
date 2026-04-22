@@ -28,6 +28,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Force UTF-8 on stdout/stderr so Unicode arrows / em-dashes / ellipses in our
+# log output don't crash on Windows consoles still defaulting to cp1252.
+# Cheap, idempotent, only runs once at import time. Without this, a stray
+# `→` in a `print(...)` aborts the entire render *after* the work is done.
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 try:
     from grade import get_preset, auto_grade_for_clip  # same directory
 except Exception:
@@ -315,13 +327,34 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         seg_end = float(r["end"])
         seg_duration = seg_end - seg_start
 
-        tr_path = transcripts_dir / f"{src_name}.json"
-        if not tr_path.exists():
-            print(f"  no transcript for {src_name}, skipping captions for this segment")
+        # Transcripts are cached by the *source file stem* (see parakeet_onnx_lane.py:
+        # `transcripts_dir / f"{video_path.stem}.json"`), NOT by the EDL short label.
+        # The EDL `src_name` is just a human-friendly key (e.g. "C0303") that maps,
+        # via `sources[src_name]`, to the real filename / path on disk
+        # (e.g. "DJI_20250217172514_0303_D.mp4"). We resolve through that mapping so
+        # the SRT lookup matches whatever Parakeet actually wrote.
+        src_ref = sources.get(src_name)
+        if not src_ref:
+            print(f"  no source mapping for {src_name}, skipping captions for this segment")
             seg_offset += seg_duration
             continue
+        src_stem = Path(src_ref).stem
 
-        transcript = json.loads(tr_path.read_text())
+        tr_path = transcripts_dir / f"{src_stem}.json"
+        if not tr_path.exists():
+            # Fallback: also try the bare label, in case an older preprocess run
+            # keyed transcripts by the short EDL name instead of the file stem.
+            legacy = transcripts_dir / f"{src_name}.json"
+            if legacy.exists():
+                tr_path = legacy
+            else:
+                print(f"  no transcript for {src_name} (looked for {src_stem}.json), skipping captions for this segment")
+                seg_offset += seg_duration
+                continue
+
+        # Parakeet writes transcripts as UTF-8; be explicit so Windows hosts
+        # don't fall back to cp1252 and choke on smart-quotes / em-dashes.
+        transcript = json.loads(tr_path.read_text(encoding="utf-8"))
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
 
         # Group into 2-word chunks, break on punctuation
@@ -364,7 +397,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         lines.append(f"{_srt_timestamp(a)} --> {_srt_timestamp(b)}")
         lines.append(t)
         lines.append("")
-    out_path.write_text("\n".join(lines))
+    out_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"master SRT → {out_path.name} ({len(entries)} cues)")
 
 

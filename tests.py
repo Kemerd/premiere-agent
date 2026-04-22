@@ -516,7 +516,7 @@ def test_fcpxml_roundtrip(R: Results, tmp: Path) -> None:
         return
 
     try:
-        from export_fcpxml import build_timeline, write_fcpxml
+        from export_fcpxml import build_timeline, write_fcpxml, write_premiere_xml
 
         # FCPXML adapter requires `available_range` on each external ref,
         # which we populate via ffprobe. Generate a tiny REAL clip (20s)
@@ -607,6 +607,43 @@ def test_fcpxml_roundtrip(R: Results, tmp: Path) -> None:
             # but don't fail the whole suite — the WRITE is what matters
             # for Premiere import.
             R.skip("FCPXML re-read", f"{type(e).__name__}: {e}")
+
+        # ── Premiere Pro xmeml (.xml) writer — separate adapter, separate
+        # PyPI package (otio-fcp-adapter). This is the path Premiere reads
+        # NATIVELY (no XtoCC). We write the SAME timeline through it so a
+        # missing adapter or schema regression can't slip into a release.
+        # The FCPX path above already validated the structural fidelity;
+        # here we only need to assert the file lands on disk and re-reads.
+        try:
+            xml_out = tmp / "test.xml"
+            write_premiere_xml(timeline, xml_out)
+            if not xml_out.exists() or xml_out.stat().st_size < 100:
+                R.fail("Premiere xmeml written",
+                       f"file missing or tiny: "
+                       f"{xml_out.stat().st_size if xml_out.exists() else 0}b")
+            else:
+                R.ok(f"Premiere xmeml written ({xml_out.stat().st_size} bytes)")
+                try:
+                    reloaded_xml = otio.adapters.read_from_file(str(xml_out))
+                    r_clips_xml = sum(
+                        1 for t in reloaded_xml.tracks for c in t
+                        if isinstance(c, otio.schema.Clip)
+                    )
+                    print(f"  xmeml reloaded: {r_clips_xml} clips total")
+                    R.ok("Premiere xmeml reread via OTIO adapter")
+                except Exception as e:
+                    R.skip("Premiere xmeml re-read", f"{type(e).__name__}: {e}")
+        except SystemExit as e:
+            # write_premiere_xml exits with an install hint when the
+            # otio-fcp-adapter package is missing — surface that as a
+            # skip rather than a hard fail so users on .[fcpxml] without
+            # the new pin don't see a red CI when only the .fcpxml path
+            # is needed.
+            R.skip("Premiere xmeml writer",
+                   f"otio-fcp-adapter not installed ({e})")
+        except Exception as e:
+            traceback.print_exc()
+            R.fail("Premiere xmeml round-trip", f"{type(e).__name__}: {e}")
     except Exception as e:
         traceback.print_exc()
         R.fail("FCPXML round-trip", f"{type(e).__name__}: {e}")

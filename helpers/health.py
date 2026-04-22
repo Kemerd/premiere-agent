@@ -156,11 +156,13 @@ ADVICE_RULES: list[tuple[str, str]] = [
      "Visual lane import failed — install Florence-2 deps: "
      "`pip install -e \".[preprocess]\"` (transformers, einops, timm)."),
     ("import export_fcpxml",
-     "FCPXML export deps missing. Install: `pip install -e \".[fcpxml]\"` "
-     "(opentimelineio + otio-fcpx-xml-adapter)."),
+     "FCPXML/xmeml export deps missing. Install: `pip install -e \".[fcpxml]\"` "
+     "(opentimelineio + otio-fcpx-xml-adapter for .fcpxml -> Resolve/FCP X, "
+     "+ otio-fcp-adapter for .xml -> Premiere Pro native)."),
     ("fcpxml round-trip",
-     "FCPXML export module loaded but failed to round-trip. "
-     "Common cause: source file missing or unreadable for ffprobe. "
+     "NLE export module loaded but failed to round-trip. "
+     "Common cause: source file missing or unreadable for ffprobe, OR the "
+     "Premiere xmeml adapter (otio-fcp-adapter) isn't installed. "
      "Re-run with --keep-tmp to inspect the synthetic test clip."),
     ("schedule sanity",
      "VRAM scheduler picked an unexpected tier. If you want to override, "

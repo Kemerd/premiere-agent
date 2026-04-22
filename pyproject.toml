@@ -143,13 +143,28 @@ parakeet = [
 ]
 
 # ---------------------------------------------------------------------------
-# FCPXML export via the Pixar / SWF industry-standard OpenTimelineIO. Cheap
+# NLE handoff via the Pixar / ASWF industry-standard OpenTimelineIO. Cheap
 # to install (pure Python wheels), kept optional so render-only deployments
 # don't pull it.
+#
+# Two adapters are pinned because Premiere Pro and Resolve/FCP X want
+# DIFFERENT interchange dialects:
+#
+#   * otio-fcpx-xml-adapter -> FCPXML 1.10+ (.fcpxml). Native to DaVinci
+#     Resolve and Final Cut Pro X. Premiere does NOT read this directly
+#     (it requires the third-party XtoCC translator).
+#
+#   * otio-fcp-adapter      -> Final Cut Pro 7 xmeml (.xml). Premiere Pro
+#     imports this NATIVELY via File -> Import. This is the Premiere
+#     handoff path -- no XtoCC, no extra tools.
+#
+# helpers/export_fcpxml.py emits BOTH by default so the recipient can
+# pick whichever NLE they want without re-running the export.
 # ---------------------------------------------------------------------------
 fcpxml = [
     "opentimelineio>=0.17",
-    "otio-fcpx-xml-adapter>=0.2",
+    "otio-fcpx-xml-adapter>=0.2",   # .fcpxml -> Resolve / FCP X
+    "otio-fcp-adapter>=0.2",        # .xml    -> Premiere Pro (FCP7 xmeml)
 ]
 
 # ---------------------------------------------------------------------------
