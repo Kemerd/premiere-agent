@@ -141,7 +141,46 @@ def _run_lane(job: LaneJob) -> int:
     # Newlines are kept for readability; subprocess passes the whole
     # string to python as one -c argument.
     if job.name == "whisper":
-        import_line = "from whisper_lane import run_whisper_lane_batch as fn"
+        # ── Speech lane backend selection ─────────────────────────────
+        # The lane is named "whisper" for historical reasons (progress
+        # bars, cache contracts, log prefixes all key off this string).
+        # Behind that name we dispatch to one of three implementations:
+        #
+        #   onnx    (default) - parakeet_onnx_lane (multi-session ORT
+        #                       pool, ~10x faster than legacy whisper,
+        #                       no transformers / DTW dependency)
+        #   nemo              - parakeet_lane (NeMo torch-mode Parakeet,
+        #                       fallback when ORT can't import e.g. on
+        #                       exotic CPUs / corporate proxies)
+        #   whisper           - whisper_lane (legacy HF transformers
+        #                       pipeline; multilingual escape hatch when
+        #                       Parakeet TDT v3 doesn't speak the user's
+        #                       language)
+        #
+        # The output JSON shape is byte-identical across all three so
+        # downstream consumers (pack_timelines, render, health) don't
+        # notice the swap.
+        backend = os.environ.get(
+            "VIDEO_USE_SPEECH_LANE", "onnx"
+        ).strip().lower() or "onnx"
+        if backend == "onnx":
+            import_line = (
+                "from parakeet_onnx_lane import "
+                "run_parakeet_onnx_lane_batch as fn"
+            )
+        elif backend == "nemo":
+            import_line = (
+                "from parakeet_lane import run_parakeet_lane_batch as fn"
+            )
+        elif backend == "whisper":
+            import_line = (
+                "from whisper_lane import run_whisper_lane_batch as fn"
+            )
+        else:
+            raise ValueError(
+                f"unknown VIDEO_USE_SPEECH_LANE={backend!r} "
+                f"(valid: onnx, nemo, whisper)"
+            )
     elif job.name == "audio":
         import_line = "from audio_lane import run_audio_lane_batch as fn"
     elif job.name == "visual":

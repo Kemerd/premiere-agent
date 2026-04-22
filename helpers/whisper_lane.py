@@ -59,51 +59,88 @@ from wealthy import WHISPER_BATCH, is_wealthy
 
 
 # ---------------------------------------------------------------------------
+# Lane status (as of 2026-04): MULTILINGUAL FALLBACK.
+#
+# This module is no longer the default speech lane — the primary path
+# is now `helpers/parakeet_onnx_lane.py` (multi-session ONNX Runtime
+# pool driving NVIDIA Parakeet TDT 0.6B v2/v3). The orchestrator
+# dispatches to this whisper lane when:
+#
+#   * The user explicitly opts in via `VIDEO_USE_SPEECH_LANE=whisper`.
+#   * The user passes a `--language` outside Parakeet TDT v3's
+#     supported set (en + 24 European langs); Whisper covers ~99
+#     languages so it remains the safe escape hatch for the long tail.
+#
+# The Parakeet fallback dispatch lower in this file (the
+# `_whisper_blocked_recently()` sentinel + the corp-proxy detection)
+# still applies WHEN this lane runs, layered on top of the new ONNX
+# default. Three-tier resilience: ONNX → Whisper → NeMo Parakeet.
+#
+# ---------------------------------------------------------------------------
 # Tunables — sized for whisper-large-v3-TURBO + `return_timestamps="word"`.
 #
-# Why turbo, not large-v3:
-#   The editor needs word-precise cut boundaries, which forces
-#   `return_timestamps="word"` in the HF pipeline (see `_transcribe_words`
-#   below). Word timestamps run a per-chunk DTW alignment over the
-#   decoder's cross-attention weights — and DTW cost scales LINEARLY with
-#   decoder layer count. large-v3 has 32 decoder layers; turbo has 4
-#   (https://huggingface.co/openai/whisper-large-v3-turbo). That single
-#   fact collapses our peak working set by ~8x at the same batch size,
-#   for the same English transcription quality (turbo's WER is within
-#   noise of large-v3 on English; multilingual degrades a bit, which is
-#   acceptable for an editor that's overwhelmingly English).
+# IMPORTANT MEMORY MATH CORRECTION (was lying, now isn't):
+# ----------------------------------------------------------------
+# Earlier revisions of this comment claimed `batch=16, word
+# timestamps : ~7-8 GB peak`. That number was theoretical, derived
+# from a per-chunk activation breakdown that ignored the actual
+# `transformers >= 4.43` regression in word-timestamp memory
+# accounting (HF issue #27834). Empirical reality on a 5090 with
+# transformers 4.55+, fp16, sdpa, batch=16, 30s chunks, on a single
+# 4-minute clip:
 #
-# Per-chunk cost breakdown on turbo, fp16, 30s chunk:
+#       batch=16, word timestamps : ~26-30 GB peak
+#       batch=32, word timestamps : ~40+ GB peak (OOM on 32 GB)
+#
+# The DTW alignment + cross-attention buffer accumulation across
+# generation steps grows much faster than the per-chunk breakdown
+# below suggests. Upstream is aware (linked issue) but no fix
+# landed yet for the turbo variant. This is a *primary reason*
+# we moved the default to Parakeet ONNX — Parakeet TDT emits
+# token durations natively (no DTW) and peaks at ~1.6 GB per
+# session including activations.
+#
+# Why turbo over large-v3 (still true, just less impressive):
+#   Word timestamps run a per-chunk DTW alignment over the decoder's
+#   cross-attention weights — DTW cost scales LINEARLY with decoder
+#   layer count. large-v3 has 32 decoder layers; turbo has 4. That
+#   does collapse the cross-attn working set by ~8x... but the
+#   global word-timestamp accumulator overhead (the part HF #27834
+#   is about) doesn't scale with decoder depth, so the absolute
+#   savings are smaller than the multiplier suggests.
+#
+# Per-chunk cost breakdown on turbo, fp16, 30s chunk (THIS PART
+# IS HONEST — it's the SUM across all chunks where reality bites):
 #       weights                  :  ~1.6 GB resident
 #       encoder fwd (sdpa-fused) :  ~3-5 GB transient (per call)
 #       cross-attn maps for DTW  :  ~107 MB per chunk × batch
 #       decoder KV cache         :  ~16  MB per chunk × batch
 #
-# Concretely, peak VRAM with word timestamps:
-#
-#       batch=16, word timestamps : ~7-8  GB peak   (was ~22 GB on large-v3)
-#       batch=32, word timestamps : ~10-12 GB peak  (was OOM on 24 GB)
-#       batch=48, word timestamps : ~13-15 GB peak  (was OOM on 32 GB)
-#
-# IFW's own benchmark table (batch=24, segment timestamps, FA2) is STILL
-# not a one-to-one reference for our config — we pay the DTW tax they
-# don't — but turbo plus 4 decoder layers shrinks that gap from "3-4x
-# inflation" down to "~1.3x inflation" relative to their numbers.
-#
 # Empirical safe-zone floors (turbo, word timestamps, 30s chunks,
-# accounting for desktop compositor ~1 GB + caching allocator
+# transformers 4.55+, accounting for desktop compositor + alloc
 # fragmentation across multi-video runs):
-#   * 12 GB card (3060)         : batch <= 8
-#   * 24 GB card (3090/4090)    : batch <= 16  (default tier)
-#   * 32 GB card (5090)         : batch <= 32  (wealthy tier)
+#   * 12 GB card (3060)         : batch <= 4   (was claimed <= 8)
+#   * 24 GB card (3090/4090)    : batch <= 8   (was claimed <= 16)
+#   * 32 GB card (5090)         : batch <= 16  (was claimed <= 32)
+#
+# If you need higher throughput on a 32 GB card, USE THE ONNX LANE
+# (default since 2026-04). It runs 4-8 sessions in parallel at
+# ~10 GB total and beats this lane's wall-clock by ~10x.
 # ---------------------------------------------------------------------------
 
 # whisper-large-v3-turbo: 809M params, 4 decoder layers, ~1.6 GB fp16.
 # Same encoder as large-v3, English quality is within noise. The 8x
-# reduction in decoder layers is what makes word timestamps tractable
-# in our memory budget — see comment block above.
+# reduction in decoder layers reduces (but does NOT eliminate — see
+# HF #27834 above) the word-timestamp memory tax.
 DEFAULT_MODEL_ID = "openai/whisper-large-v3-turbo"
-DEFAULT_BATCH_SIZE = 16       # safe on 24 GB cards with turbo + word timestamps
+# Default batch — historically claimed "safe on 24 GB" which is no
+# longer true on transformers 4.55+ (real peak is ~26-30 GB). The
+# OOM-resilient retry loop in `_process_one` halves on OOM, so
+# leaving this at 16 still works (it just lands at 8 or 4 after
+# one retry on tight VRAM). Users hitting consistent OOMs should
+# move to the ONNX lane (default since 2026-04) — see the lane
+# status note above.
+DEFAULT_BATCH_SIZE = 16
 DEFAULT_CHUNK_LENGTH_S = 30   # Whisper's native receptive field
 TRANSCRIPTS_SUBDIR = "transcripts"
 

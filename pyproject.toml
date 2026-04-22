@@ -27,7 +27,35 @@ dependencies = [
 # index URL (cu121, cpu, rocm6.0…). The install scripts handle that.
 # ---------------------------------------------------------------------------
 preprocess = [
-    # ── Speech: insanely-fast-whisper-style stack ──
+    # ── Speech (PRIMARY): ONNX Runtime Parakeet TDT ──
+    # As of 2026-04 the speech lane defaults to a multi-session ONNX
+    # Runtime pool driving NVIDIA Parakeet TDT 0.6B (English v2 / multi-
+    # lingual v3, auto-routed by language). One InferenceSession per
+    # worker thread, ORT releases the GIL during native Run() so N
+    # python threads = N parallel native inferences on one GPU.
+    #
+    # See helpers/parakeet_onnx_lane.py / helpers/_onnx_pool.py for the
+    # full plumbing, helpers/_onnx_providers.py for the EP ladder.
+    #
+    # `onnx-asr[gpu,hub]` ships:
+    #   - the NeMo-compatible mel-spectrogram preprocessor (ONNX)
+    #   - the TDT decoder (token + duration)
+    #   - the silero VAD chunker (optional, used for very long audio)
+    #   - HuggingFace Hub model fetch (the [hub] extra)
+    "onnx-asr[gpu,hub]>=0.11.0",
+    "onnxruntime-gpu>=1.22.0",  # CUDA + TensorRT EP support
+    # tensorrt-cu12-libs is OPTIONAL — only needed when the user opts
+    # into the TensorRT execution provider via VIDEO_USE_PARAKEET_TRT=1.
+    # Pre-shipped here so the wheel cache primes on first install; the
+    # provider ladder in `_onnx_providers.py` falls through to CUDA EP
+    # gracefully if the import fails (corporate proxies, custom torch).
+    "tensorrt-cu12-libs;platform_system!='Darwin'",
+
+    # ── Speech (multilingual fallback / legacy): insanely-fast-whisper-style ──
+    # Kept as the multilingual escape hatch when an ISO language code
+    # arrives that isn't in Parakeet TDT v3's supported set, AND as the
+    # secondary fallback when the ONNX runtime path can't import.
+    #
     # We don't pip-install the `insanely-fast-whisper` CLI itself — that's a
     # subprocess wrapper that re-loads the model on every call. We use the
     # exact same underlying components (transformers pipeline + Whisper +
@@ -60,6 +88,25 @@ preprocess = [
     "imageio-ffmpeg",          # in-memory frame extraction for visual_lane
     # ── Shared I/O ──
     "soundfile",               # WAV reading for audio_lane
+]
+
+# ---------------------------------------------------------------------------
+# Standalone ONNX-Parakeet extra. Same packages as the speech sub-block of
+# `preprocess`, exposed as its own optional install for renderer-only or
+# transcribe-only deployments that don't want the full preprocess stack
+# (transformers / panns / florence). Useful in CI to test the speech lane
+# in isolation. Activate the TensorRT EP at runtime with:
+#
+#   set VIDEO_USE_PARAKEET_TRT=1     (Windows)
+#   export VIDEO_USE_PARAKEET_TRT=1  (POSIX)
+#
+# Without that env var the lane uses the CUDA EP (still ~57-100x RTFx on
+# Ampere+) and avoids the first-run TensorRT engine compile cost.
+# ---------------------------------------------------------------------------
+onnx = [
+    "onnx-asr[gpu,hub]>=0.11.0",
+    "onnxruntime-gpu>=1.22.0",
+    "tensorrt-cu12-libs;platform_system!='Darwin'",
 ]
 
 # ---------------------------------------------------------------------------
@@ -117,7 +164,7 @@ animations = ["manim"]
 # Convenience meta-extra: install absolutely everything.
 # ---------------------------------------------------------------------------
 all = [
-    "video-use-premiere[preprocess,diarize,fcpxml,animations,flash,parakeet]",
+    "video-use-premiere[preprocess,onnx,diarize,fcpxml,animations,flash,parakeet]",
 ]
 
 [build-system]
