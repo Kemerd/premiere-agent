@@ -1,14 +1,14 @@
 ---
 name: video-use-premiere
-description: Edit any video by conversation. Local three-lane preprocessing (Whisper speech + PANNs audio events + Florence-2 visual captions), cut, color grade, generate overlay animations, burn subtitles, OR export FCPXML to Premiere/Resolve/FCP with split edits. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
+description: Edit any video by conversation. Local three-lane preprocessing (Whisper speech + CLAP zero-shot audio events + Florence-2 visual captions), cut, color grade, generate overlay animations, burn subtitles, OR export FCPXML to Premiere/Resolve/FCP with split edits. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
 ---
 
 # Video Use Premiere
 
 ## Principle
 
-1. **LLM reasons from raw transcript + audio events + visual captions + on-demand drill-down.** Three lightweight markdown views (`speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`) are the entire reading surface. Everything else — filler tagging, retake detection, shot classification, B-roll spotting, emphasis scoring — you derive at decision time.
-2. **Speech is primary, visuals are secondary, audio events are noisy hints.** Cut candidates come from Whisper speech boundaries and silence gaps — that lane is highly accurate and is the editorial spine. Visual captions (Florence-2) are the second source of truth: they answer "what's actually on screen here?" and resolve ambiguous decision points (B-roll spotting, shot continuity, action beats). Audio events (PANNs: `drill`, `applause`, `laughter`, etc.) are **approximate** — the model frequently mis-labels (e.g. tags music as "speech", confuses tools, hallucinates applause). Treat them as suggestive prompts to look at the visual lane at that timestamp, **not** as ground truth. When PANNs and Florence-2 disagree, **trust Florence-2.**
+1. **LLM reasons from raw transcript + sound captions + visual captions + on-demand drill-down.** Three lightweight markdown views (`speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`) are the entire reading surface. Everything else — filler tagging, retake detection, shot classification, B-roll spotting, emphasis scoring — you derive at decision time.
+2. **Speech is primary, visuals are secondary, audio events are tertiary.** Cut candidates come from Whisper speech boundaries and silence gaps — that lane is highly accurate and is the editorial spine. Visual captions (Florence-2) are the second source of truth: they answer "what's actually on screen here?" and resolve ambiguous decision points (B-roll spotting, shot continuity, action beats). Audio events (CLAP, zero-shot scoring against a vocabulary) tag non-speech sounds per ~10s window (tools, materials, ambience, music, animals, vehicles). Vocabulary is editable per project — see Phase B below for the agent-curated workflow that makes labels much sharper. When audio and visual disagree about *what is happening on screen*, **trust the visual lane.**
 3. **Ask → confirm → execute → iterate → persist.** Never touch the cut until the user has confirmed the strategy in plain English.
 4. **Generalize.** Do not assume what kind of video this is. Look at the material, ask the user, then edit.
 5. **Artistic freedom is the default.** Every specific value, preset, font, color, duration, pitch structure, and technique in this document is a *worked example* from one proven video — not a mandate. Read them to understand what's possible and why each worked. Then make your own taste calls based on what the material actually is and what the user actually wants. **The only things you MUST do are in the Hard Rules section below.** Everything else is yours.
@@ -44,14 +44,16 @@ The skill lives in `video-use-premiere/`. User footage lives wherever they put i
 └── edit/
     ├── project.md               ← memory; appended every session
     ├── speech_timeline.md       ← Whisper phrase-level transcripts (lane 1)
-    ├── audio_timeline.md        ← PANNs audio events, coalesced  (lane 2)
+    ├── audio_timeline.md        ← CLAP audio events, coalesced   (lane 2)
     ├── visual_timeline.md       ← Florence-2 captions @ 1fps     (lane 3)
     ├── merged_timeline.md       ← optional, all three interleaved by ts
     ├── edl.json                 ← cut decisions
     ├── transcripts/<name>.json  ← cached raw Whisper words
-    ├── audio_tags/<name>.json   ← cached raw PANNs events
+    ├── audio_tags/<name>.json   ← cached raw CLAP (label, score) events
+    ├── audio_vocab.txt          ← optional: agent-curated vocab for Phase B
+    ├── audio_vocab_embeds.npz   ← cached CLAP text embeddings for that vocab
     ├── visual_caps/<name>.json  ← cached raw Florence-2 captions
-    ├── audio_16k/<name>.wav     ← shared 16kHz mono PCM (Whisper + PANNs)
+    ├── audio_16k/<name>.wav     ← shared 16kHz mono PCM (speech lane + CLAP)
     ├── animations/slot_<id>/    ← per-animation source + render + reasoning
     ├── clips_graded/            ← per-segment extracts with grade + fades
     ├── master.srt               ← output-timeline subtitles
@@ -208,13 +210,13 @@ Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but 
   [006.08-006.74] S0 We fixed this.
 ```
 
-**`audio_timeline.md`** — PANNs CNN14 events, coalesced over time. Top scoring labels first per range. **Approximate / noisy** — treat each marker as a *prompt to look at the visual lane at that timestamp*, not as a confirmed event. Confidence scores below ~0.6 are basically guesses; even high scores mis-label frequently on tools, music, and crowd sounds.
+**`audio_timeline.md`** — Audio Flamingo 3 (NVIDIA, 7B audio-language model) natural-language captions of non-speech audio, one caption per ~30s chunk. Open-vocabulary — the model describes what it actually hears (specific tools, materials, ambience, music character) instead of mapping into a fixed 527-class taxonomy. Use it to find action beats, sync points, ambient transitions, and sounds the visual lane can't see (off-screen tools, room tone changes). When AF3 and Florence-2 disagree about what's on screen, trust Florence-2 — AF3 is the authority on the **soundscape**, not the picture.
 
 ```
-## C0108  (duration: 87.4s, 14 events)
-  [012.04-015.20] (drill 0.87, power_tool 0.71)
-  [018.50-019.10] (laughter 0.92)
-  [022.80-024.10] (hammer 0.65, metal 0.58)
+## C0108  (duration: 87.4s, 3 chunks @ 30.0s)
+  [000.00-030.00] A power drill running in short bursts on metal, with a faint shop fan in the background.
+  [030.00-060.00] Hammer strikes on sheet metal, then a man laughs briefly off-mic. Drill resumes at the end.
+  [060.00-087.40] Sandpaper rubbing on wood in long even strokes; quiet otherwise.
 ```
 
 **`visual_timeline.md`** — Florence-2 detailed captions @ 1fps. Consecutive identical captions collapse to `(same)`. Use to spot shots, B-roll candidates, match cuts, action. **This is the second source of truth after speech** — when classifying *what is happening* in a moment, prefer this over the audio events lane.
@@ -241,9 +243,10 @@ INPUTS (in priority order — trust them in this order when they disagree):
   - speech_timeline.md  (phrase-level Whisper transcripts; ACCURATE, the spine)
   - visual_timeline.md  (1fps Florence-2 captions; second source of truth for
                          what's on screen / what's happening)
-  - audio_timeline.md   (PANNs non-speech events; NOISY, mis-labels often —
-                         use only as a hint to go look at the visual lane at
-                         that timestamp; never cut purely on a PANNs label)
+  - audio_timeline.md   (Audio Flamingo 3 natural-language sound captions per
+                         ~30s chunk; describes the soundscape — tools,
+                         materials, ambience, music. Trust for non-speech
+                         audio; defer to visual_timeline for what's on screen)
   - Product/narrative context: <2 sentences from the user>
   - Speaker(s): <name, role, delivery style note>
   - Expected structure: <pick an archetype or invent one>

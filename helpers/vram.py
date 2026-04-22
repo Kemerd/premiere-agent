@@ -15,17 +15,25 @@ Approximate steady-state model footprints with conservative settings:
   - parakeet-tdt-0.6b NeMo torch, fp16:             ~3-4 GB
 
   ── Other lanes ──
-  - PANNs CNN14:                                    ~0.6 GB
-  - Florence-2-base, fp16, batch 8:                 ~2.5 GB
+  - CLAP audio lane (Xenova/clap-htsat-unfused, ONNX):     ~1.5 GB peak
+    (audio + text encoders resident, batch=16 windows × 10s × 48kHz
+     transient mel + activation working set; ~3 GB peak with the
+     "large" tier under --wealthy)
+  - Florence-2-base, fp16, batch 8:                        ~2.5 GB
 
 The default speech lane is the multi-session ONNX path (see
 helpers/parakeet_onnx_lane.py / helpers/_onnx_pool.py) which auto-clamps
-its pool size to fit available VRAM. A single all-three-parallel run on
-the default tier (4-session ONNX pool) peaks around 9.5 GB; on the
-wealthy tier (8-session pool) around 16 GB. The 8 GB / 4 GB / 2 GB
-thresholds in `pick_schedule` are unchanged because the legacy paths
-(NeMo Parakeet, HF Whisper) still need them when the user opts out of
-the ONNX default via `VIDEO_USE_SPEECH_LANE={nemo,whisper}`.
+its pool size to fit available VRAM.
+
+Parallel-mode opt-in viability:
+the audio lane is back to a small CLAP encoder (~1.5 GB) so PARALLEL_3
+(whisper + audio + visual) is viable again on any 8 GB+ card —
+Parakeet-pool ~6 GB + CLAP ~1.5 GB + Florence ~2.5 GB easily fits on a
+12 GB card with headroom. The 8 GB / 4 GB / 2 GB thresholds in
+`pick_schedule` are unchanged. The default schedule is still SEQUENTIAL
+for the unrelated multi-context CUDA allocator fragmentation issues
+called out below; users on multi-GPU rigs or datacenter cards opt into
+parallel via VIDEO_USE_PARALLEL_LANES=1.
 
 Detection strategy (in order):
 
@@ -55,9 +63,9 @@ class Schedule(enum.Enum):
     """
 
     PARALLEL_3 = "parallel"        # all three lanes concurrent
-    PARALLEL_2_SEQ_1 = "mixed"     # whisper || panns, then florence solo
+    PARALLEL_2_SEQ_1 = "mixed"     # whisper || audio, then florence solo
     SEQUENTIAL = "sequential"      # one lane at a time, GPU
-    CPU_FALLBACK = "cpu"           # no CUDA — whisper int8 + PANNs CPU
+    CPU_FALLBACK = "cpu"           # no CUDA — int8 speech, CLAP CPU EP, Florence CPU
 
 
 @dataclass(frozen=True)
@@ -172,15 +180,17 @@ _SEQUENTIAL_MIN_GB = 2.0
 # Why: real-world testing on a Blackwell RTX 5090 (32 GB) showed that
 # even with comfortable VRAM headroom, multi-process CUDA on a single
 # GPU produces hard-to-diagnose OOMs and context corruption when three
-# heavy ML lanes (Whisper, PANNs, Florence-2) load and infer
-# concurrently. Each lane is its own subprocess with its own CUDA
-# context; the driver-level allocator fragments badly across contexts,
-# and one lane's transient inference spike can starve another's
-# resident weights mid-forward. nvidia-smi snapshots at the OOM moment
-# show 31 GB used across all procs in a 32 GB card — not because any
-# single lane needs that much, but because PyTorch's caching allocator
-# in three contexts simultaneously claims more than the sum of their
-# working sets.
+# heavy ML lanes (Whisper, CLAP, Florence-2) load and infer concurrently.
+# Each lane is its own subprocess with its own CUDA context; the
+# driver-level allocator fragments badly across contexts, and one lane's
+# transient inference spike can starve another's resident weights
+# mid-forward. nvidia-smi snapshots at the OOM moment show 31 GB used
+# across all procs in a 32 GB card — not because any single lane needs
+# that much, but because PyTorch's caching allocator in three contexts
+# simultaneously claims more than the sum of their working sets. This
+# is a CUDA-runtime / multi-process issue, NOT a per-lane footprint
+# issue: even with the lightweight CLAP audio lane (~1.5 GB) the
+# fragmentation pattern persists.
 #
 # Sequential schedule sidesteps the entire class of problems: each lane
 # loads, runs, releases, then the next lane starts. End-to-end wall
@@ -195,7 +205,7 @@ _SEQUENTIAL_MIN_GB = 2.0
 # Activate via:
 #
 #    --force-schedule parallel        (CLI flag, single run)
-#    --force-schedule mixed           (whisper||panns then florence solo)
+#    --force-schedule mixed           (whisper||audio then florence solo)
 #    VIDEO_USE_PARALLEL_LANES=1       (env var, persists across runs)
 #
 # When opt-in is set, we still apply the historical VRAM-driven tier

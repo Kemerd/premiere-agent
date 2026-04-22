@@ -80,22 +80,29 @@ preprocess = [
 
     "optimum>=1.20",           # BetterTransformer fast-path, IFW-recommended
     "accelerate>=0.30",        # device_map + dtype routing for the pipeline
-    # ── Audio events ──
-    "panns-inference>=0.1.1",  # CNN14 audio tagger, AudioSet 527-class
+    # ── Audio events (LAION CLAP via ONNX Runtime) ──
+    # The CLAP audio lane (helpers/audio_lane.py) uses Xenova's
+    # pre-converted ONNX exports of the LAION CLAP weights, fetched on
+    # first run via `huggingface_hub` (transitive through transformers).
+    # `transformers.AutoProcessor` handles the audio + text preprocessing
+    # so the lane stays ORT-only at inference time. `soxr` is optional
+    # but used for fast 16kHz->48kHz resampling on the WAV cache; if
+    # missing the lane falls back to `librosa.resample` (slower, also OK).
+    "soxr",                    # fast libsoxr resampling for CLAP's 48kHz path
     # ── Visuals ──
     "einops",                  # Florence-2 transitive
     "timm",                    # Florence-2 transitive
     "imageio-ffmpeg",          # in-memory frame extraction for visual_lane
     # ── Shared I/O ──
-    "soundfile",               # WAV reading for audio_lane
+    "soundfile",               # WAV reading for audio_lane + extract_audio cache
 ]
 
 # ---------------------------------------------------------------------------
 # Standalone ONNX-Parakeet extra. Same packages as the speech sub-block of
 # `preprocess`, exposed as its own optional install for renderer-only or
 # transcribe-only deployments that don't want the full preprocess stack
-# (transformers / panns / florence). Useful in CI to test the speech lane
-# in isolation. Activate the TensorRT EP at runtime with:
+# (transformers / florence). Useful in CI to test the speech lane in
+# isolation. Activate the TensorRT EP at runtime with:
 #
 #   set VIDEO_USE_PARAKEET_TRT=1     (Windows)
 #   export VIDEO_USE_PARAKEET_TRT=1  (POSIX)
