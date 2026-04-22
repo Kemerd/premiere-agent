@@ -98,6 +98,69 @@ _DEFAULT_AUDIO_CHANNELS = 2
 _DEFAULT_AUDIO_SAMPLERATE = 48000
 _DEFAULT_VIDEO_WIDTH = 1920
 _DEFAULT_VIDEO_HEIGHT = 1080
+_DEFAULT_VIDEO_FPS = 24.0  # only used when no source has a probe-able fps
+
+# FCPXML 1.10+ colorSpace string table. Maps ffprobe's
+# (color_primaries, color_transfer, color_matrix) triple to the exact
+# string Apple expects in <format colorSpace="..."/>. The legacy strings
+# (no parenthesised name) are also accepted by Resolve and Premiere; the
+# parenthesised form is what FCP X writes itself, so we use it for max
+# round-trip cleanliness.
+#
+# We key on (transfer, primaries) — the matrix usually mirrors primaries
+# for these well-known spaces, and ffprobe occasionally omits one but
+# rarely both. Anything unrecognised falls through to Rec. 709, which is
+# the safe assumption for SDR camera footage.
+_FCPXML_COLORSPACE_TABLE: dict[tuple[str, str], str] = {
+    # SDR Rec. 709 (the 99% case for HD camera footage)
+    ("bt709", "bt709"):           "1-1-1 (Rec. 709)",
+    ("bt709", "unknown"):         "1-1-1 (Rec. 709)",
+    ("smpte170m", "smpte170m"):   "1-1-1 (Rec. 709)",
+    # SD NTSC / PAL — mapped to Rec. 709 by FCP X for SD masters too
+    ("smpte170m", "bt470bg"):     "1-1-1 (Rec. 709)",
+    ("bt470bg", "bt470bg"):       "1-1-1 (Rec. 709)",
+    # Rec. 2020 SDR / HDR variants
+    ("bt2020-10", "bt2020"):      "9-1-1 (Rec. 2020)",
+    ("bt2020-10", "bt2020nc"):    "9-1-1 (Rec. 2020)",
+    ("bt2020-12", "bt2020"):      "9-1-1 (Rec. 2020)",
+    ("arib-std-b67", "bt2020"):   "9-16-9 (Rec. 2020 HLG)",
+    ("arib-std-b67", "bt2020nc"): "9-16-9 (Rec. 2020 HLG)",
+    ("smpte2084", "bt2020"):      "9-18-9 (Rec. 2020 PQ)",
+    ("smpte2084", "bt2020nc"):    "9-18-9 (Rec. 2020 PQ)",
+}
+_DEFAULT_FCPXML_COLORSPACE = "1-1-1 (Rec. 709)"
+
+
+def _classify_colorspace(transfer: str, primaries: str) -> str:
+    """Map ffprobe color tags to an FCPXML 1.10+ colorSpace string.
+
+    Defaults to Rec. 709 — Premiere and Resolve will accept that for any
+    SDR source even when the camera tagged things weirdly, and HDR
+    metadata gets a proper mapping when ffprobe surfaces it.
+    """
+    t = (transfer or "unknown").lower()
+    p = (primaries or "unknown").lower()
+    return _FCPXML_COLORSPACE_TABLE.get((t, p), _DEFAULT_FCPXML_COLORSPACE)
+
+
+def _parse_fps(rate_str: str) -> float | None:
+    """Parse ffprobe rational rate strings like '30000/1001' or '24/1'.
+
+    Returns None for empty / malformed / zero-denominator inputs so
+    callers can fall back without exception spam.
+    """
+    if not rate_str or rate_str == "0/0":
+        return None
+    try:
+        if "/" in rate_str:
+            num, den = rate_str.split("/", 1)
+            n, d = float(num), float(den)
+            if d <= 0:
+                return None
+            return n / d
+        return float(rate_str)
+    except (TypeError, ValueError):
+        return None
 
 
 # SourceMeta cache — one entry per absolute source path. Values are the
@@ -127,8 +190,8 @@ def _probe_source_meta(path: Path) -> dict:
         return _PROBE_CACHE[key]
 
     # Single ffprobe call returns BOTH format-level (duration) and
-    # stream-level (audio channels, sample rate, video dims) data as
-    # JSON — cheaper than two probes and atomically consistent.
+    # stream-level (audio channels, sample rate, video dims, fps, color)
+    # as JSON — cheaper than two probes and atomically consistent.
     meta = {
         "duration_s": _FFPROBE_FALLBACK_DURATION_S,
         "has_video": True,
@@ -137,6 +200,16 @@ def _probe_source_meta(path: Path) -> dict:
         "audio_rate": _DEFAULT_AUDIO_SAMPLERATE,
         "video_width": _DEFAULT_VIDEO_WIDTH,
         "video_height": _DEFAULT_VIDEO_HEIGHT,
+        # Frame rate stays None until we positively read it from the
+        # source — that lets _resolve_sequence_settings() distinguish
+        # "no fps in this source" from "this source is genuinely 24fps"
+        # when picking the timeline rate.
+        "video_fps": None,
+        # ffprobe color tags, kept raw so we can map per-format later.
+        "color_primaries": "unknown",
+        "color_transfer": "unknown",
+        "color_space": "unknown",
+        "pixel_aspect_ratio": "1:1",  # square pixels, the modern default
     }
     try:
         proc = subprocess.run(
@@ -184,6 +257,30 @@ def _probe_source_meta(path: Path) -> dict:
                                                _DEFAULT_VIDEO_HEIGHT)
                 except (TypeError, ValueError):
                     pass
+                # Prefer avg_frame_rate (mean across the file) over
+                # r_frame_rate (the encoder's nominal cadence). For VFR
+                # sources avg is more honest; for CFR they're identical.
+                fps = (_parse_fps(s.get("avg_frame_rate") or "")
+                       or _parse_fps(s.get("r_frame_rate") or ""))
+                if fps and fps > 0:
+                    meta["video_fps"] = fps
+                # Color tags — ffprobe sometimes leaves these blank for
+                # camera files that didn't write VUI bits; we keep the
+                # "unknown" sentinel so the colorspace classifier can
+                # fall back to Rec. 709.
+                if s.get("color_primaries"):
+                    meta["color_primaries"] = str(s["color_primaries"])
+                if s.get("color_transfer"):
+                    meta["color_transfer"] = str(s["color_transfer"])
+                if s.get("color_space"):
+                    meta["color_space"] = str(s["color_space"])
+                # Pixel aspect ratio: ffprobe gives "1:1", "10:11", etc.
+                # We only override the default when ffprobe reports a
+                # non-square value — otherwise Resolve sometimes warns
+                # about implicit anamorphic interpretation.
+                par = s.get("sample_aspect_ratio")
+                if par and par not in ("0:1", "1:1", "N/A"):
+                    meta["pixel_aspect_ratio"] = str(par)
         meta["has_audio"] = a_seen
         meta["has_video"] = v_seen
         if not a_seen and not v_seen:
@@ -201,6 +298,112 @@ def _probe_source_meta(path: Path) -> dict:
 
     _PROBE_CACHE[key] = meta
     return meta
+
+
+# ---------------------------------------------------------------------------
+# Sequence-shape resolution.
+#
+# A timeline that doesn't match its source footage trips Premiere's
+# "this clip does not match the sequence's settings — change to match?"
+# dialog on every clip and (worse) silently downscales high-res sources
+# to whatever default the user's NLE happens to have. We avoid both by
+# picking the source that contributes the MOST runtime to the EDL and
+# inheriting its resolution / fps / color space onto the sequence.
+#
+# The frame_rate argument from the CLI is honored as an override when
+# explicit; "auto" / None means "match the dominant source".
+# ---------------------------------------------------------------------------
+
+def _pick_primary_source(edl: dict) -> str | None:
+    """Return the source key whose ranges sum to the largest cut duration.
+
+    Ties are broken by the order of first appearance in the EDL, which
+    mirrors how an editor would naturally think of the "primary" clip.
+    Returns None for an empty EDL (caller falls back to defaults).
+    """
+    totals: dict[str, float] = {}
+    order: dict[str, int] = {}
+    ranges = edl.get("ranges") or edl.get("edl") or []
+    for i, r in enumerate(ranges):
+        src = r.get("source")
+        if not src:
+            continue
+        try:
+            dur = float(r.get("end", 0)) - float(r.get("start", 0))
+        except (TypeError, ValueError):
+            dur = 0.0
+        if dur <= 0:
+            continue
+        totals[src] = totals.get(src, 0.0) + dur
+        order.setdefault(src, i)
+    if not totals:
+        return None
+    # Sort by (-total, first-seen index) so longest wins, ties go to
+    # the earliest source — deterministic and obvious in the output.
+    return sorted(totals.items(),
+                  key=lambda kv: (-kv[1], order[kv[0]]))[0][0]
+
+
+def _resolve_sequence_settings(edl: dict, frame_rate_arg) -> dict:
+    """Collapse the EDL's source set into one sequence-shape dict.
+
+    Returns a dict matching the _probe_source_meta() shape PLUS an
+    "fcpxml_color_space" string and a final "video_fps" guaranteed > 0.
+    The caller hands this dict to build_timeline / the writers / the
+    post-write patchers, all of which need the same numbers to agree.
+
+    `frame_rate_arg` semantics:
+      - None or "auto"      -> inherit from primary source (then default)
+      - numeric (float/int) -> hard override; primary's fps is ignored
+    """
+    primary_key = _pick_primary_source(edl)
+    sources = edl.get("sources") or {}
+
+    # Default sequence-shape — matches the _probe defaults so the caller
+    # can rely on every key being present even with no sources at all.
+    seq = {
+        "primary_source": primary_key,
+        "video_width": _DEFAULT_VIDEO_WIDTH,
+        "video_height": _DEFAULT_VIDEO_HEIGHT,
+        "video_fps": _DEFAULT_VIDEO_FPS,
+        "audio_channels": _DEFAULT_AUDIO_CHANNELS,
+        "audio_rate": _DEFAULT_AUDIO_SAMPLERATE,
+        "color_primaries": "unknown",
+        "color_transfer": "unknown",
+        "color_space": "unknown",
+        "pixel_aspect_ratio": "1:1",
+        "fcpxml_color_space": _DEFAULT_FCPXML_COLORSPACE,
+    }
+    primary_meta = None
+    if primary_key and primary_key in sources:
+        try:
+            primary_meta = _probe_source_meta(Path(sources[primary_key]).resolve())
+            for k in ("video_width", "video_height", "audio_channels",
+                      "audio_rate", "color_primaries", "color_transfer",
+                      "color_space", "pixel_aspect_ratio"):
+                if primary_meta.get(k) is not None:
+                    seq[k] = primary_meta[k]
+            if primary_meta.get("video_fps"):
+                seq["video_fps"] = primary_meta["video_fps"]
+        except Exception as e:
+            print(f"  warn: primary source probe failed for "
+                  f"{primary_key} ({type(e).__name__}: {e}); using defaults.",
+                  file=sys.stderr)
+
+    # CLI override — "auto" / None means "use what we just resolved".
+    # Any positive numeric value wins over the source's native fps.
+    if frame_rate_arg is not None and frame_rate_arg != "auto":
+        try:
+            user_fps = float(frame_rate_arg)
+            if user_fps > 0:
+                seq["video_fps"] = user_fps
+        except (TypeError, ValueError):
+            pass
+
+    seq["fcpxml_color_space"] = _classify_colorspace(
+        seq["color_transfer"], seq["color_primaries"]
+    )
+    return seq
 
 
 # Backward-compat shim for older callers (and tests) that only need the
@@ -320,7 +523,7 @@ def _range(start_s: float, dur_s: float, frame_rate: float):
 # force matching extents, defeating the whole point.
 # ---------------------------------------------------------------------------
 
-def build_timeline(edl: dict, frame_rate: float):
+def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None = None):
     """Build and return an otio.schema.Timeline from the EDL.
 
     Schema fields honored:
@@ -332,6 +535,12 @@ def build_timeline(edl: dict, frame_rate: float):
         - video_tail      : L-cut offset (seconds, optional, default 0)
         - transition_in   : dissolve seconds before this clip (optional)
         - beat / quote    : copied to clip metadata for editor reference
+
+    `sequence_settings` (optional) carries the resolved sequence-shape
+    dict from _resolve_sequence_settings() — width/height/fps/color
+    space/audio rate. We stash it on the Timeline's metadata so the
+    post-write patchers can find it without re-probing. When None we
+    skip the stash; the patchers will fall back to per-asset probing.
     """
     otio = _import_otio()
 
@@ -345,6 +554,15 @@ def build_timeline(edl: dict, frame_rate: float):
     # auto-convert on import but giving them the same rate the user
     # eventually delivers at avoids any subtle re-quantization.
     timeline.global_start_time = otio.opentime.RationalTime(0, frame_rate)
+
+    # Stash the resolved sequence-shape dict on the timeline so the
+    # post-write patchers (_patch_fcpxml_sequence_format /
+    # _patch_xmeml_sequence_format) can read width/height/colorSpace/
+    # audio shape without re-resolving everything from the EDL.
+    if sequence_settings:
+        timeline.metadata["video-use-premiere"] = {
+            "sequence": dict(sequence_settings),
+        }
 
     v_track = otio.schema.Track(
         name="V1", kind=otio.schema.TrackKind.Video,
@@ -601,14 +819,34 @@ def _path_from_safe_url(url: str) -> Path | None:
         return None
 
 
-def _patch_fcpxml_audio_shape(out_path: Path) -> int:
-    """Rewrite asset attributes in a freshly-written .fcpxml so each
-    asset declares the audio + video shape that matches its real source.
+def _read_sequence_meta_from_timeline_xml(root) -> dict | None:
+    """Extract our stashed sequence-settings dict from the timeline XML.
 
-    Returns the count of assets patched. Errors are non-fatal — if the
-    file isn't valid XML or no assets are found, we leave it alone and
-    let the user's NLE complain at import time (which is the same
-    behaviour they'd get without this patch).
+    OTIO serializes Timeline.metadata under <metadata><k>...</k></metadata>
+    in FCPXML, and as adapter-specific element trees in xmeml. We don't
+    actually rely on that round-trip here — instead the writers receive
+    the dict in-process and pass it to the patchers directly. This
+    function exists for symmetry / standalone re-patch invocations and
+    currently always returns None; future work could parse it out.
+    """
+    return None
+
+
+def _patch_fcpxml_audio_shape(out_path: Path, sequence_meta: dict | None = None) -> int:
+    """Rewrite asset + format attributes in a freshly-written .fcpxml so:
+
+    1. Each <asset> declares the audio / video shape that matches its
+       real source (hasAudio, audioSources, audioChannels, audioRate),
+       so Premiere and Resolve don't trip "Cannot Link Media" dialogs.
+    2. Each <format> the adapter emitted gets `width`, `height`, and
+       `colorSpace` attributes pulled from the sequence settings (or
+       the primary asset, when sequence_meta is None). Without these
+       Premiere drops the import into a default 1080p Rec.709 sequence
+       and warns about every clip not matching the sequence settings.
+
+    Returns the count of <asset> elements patched. Errors are non-fatal
+    — the .fcpxml is left in a valid (if unpatched) state and the NLE's
+    own import logic still handles it, just less cleanly.
     """
     try:
         # Local import keeps cElementTree out of the cold-start path.
@@ -655,7 +893,42 @@ def _patch_fcpxml_audio_shape(out_path: Path) -> int:
 
         patched += 1
 
-    if patched == 0:
+    # ── <format> sequence-shape patch ──────────────────────────────────
+    # Decide what to advertise as the sequence resolution / colorSpace.
+    # Prefer the explicit sequence_meta passed by the writer (resolved
+    # from the EDL primary source); fall back to the FIRST patched
+    # asset's shape as a sensible last resort so a standalone re-patch
+    # still does the right thing.
+    fmt_w = fmt_h = fmt_cs = None
+    if sequence_meta:
+        fmt_w = sequence_meta.get("video_width")
+        fmt_h = sequence_meta.get("video_height")
+        fmt_cs = sequence_meta.get("fcpxml_color_space")
+    if fmt_w is None or fmt_h is None or fmt_cs is None:
+        # Fall back to the dominant probed source in the cache.
+        for cached in _PROBE_CACHE.values():
+            if cached.get("has_video"):
+                fmt_w = fmt_w or cached.get("video_width")
+                fmt_h = fmt_h or cached.get("video_height")
+                fmt_cs = fmt_cs or _classify_colorspace(
+                    cached.get("color_transfer", "unknown"),
+                    cached.get("color_primaries", "unknown"),
+                )
+                break
+
+    if fmt_w and fmt_h:
+        for fmt in root.iter("format"):
+            # Don't clobber existing values — the adapter normally
+            # leaves these blank, but if a future version starts
+            # writing them we want to respect that.
+            if not fmt.get("width"):
+                fmt.set("width", str(int(fmt_w)))
+            if not fmt.get("height"):
+                fmt.set("height", str(int(fmt_h)))
+            if fmt_cs and not fmt.get("colorSpace"):
+                fmt.set("colorSpace", fmt_cs)
+
+    if patched == 0 and not (fmt_w and fmt_h):
         return 0
 
     try:
@@ -673,6 +946,139 @@ def _patch_fcpxml_audio_shape(out_path: Path) -> int:
     return patched
 
 
+# ---------------------------------------------------------------------------
+# FCP7 xmeml sequence-shape patch.
+#
+# The otio-fcp-adapter writes a <sequence> with proper rate + duration but
+# emits an empty <media><video/><audio/></media> shell. Premiere's xmeml
+# importer falls back to its New Sequence default (1080p / 48k) when the
+# format characteristics are missing — same painful "doesn't match"
+# dialog as FCPXML, plus an unwanted resolution downgrade.
+#
+# We patch the sequence to declare the correct width / height / pixel
+# aspect / field dominance / audio rate / channel count, matching the
+# primary source's shape. The per-clip <file> elements already carry
+# their real audio/video shape via media_reference.metadata['fcp_xml'],
+# which the adapter serializes for free.
+# ---------------------------------------------------------------------------
+
+def _patch_xmeml_sequence_format(out_path: Path, sequence_meta: dict | None) -> int:
+    """Inject sequence-level format characteristics into a written .xml.
+
+    Returns the number of <sequence> elements patched (typically 1).
+    Non-fatal: any failure leaves the file untouched and prints a warn.
+    """
+    if not sequence_meta:
+        return 0
+
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(str(out_path))
+        root = tree.getroot()
+    except Exception as e:
+        print(f"  warn: could not parse {out_path.name} for xmeml "
+              f"sequence patch ({type(e).__name__}: {e}); leaving as-is.",
+              file=sys.stderr)
+        return 0
+
+    def _ensure(parent, tag):
+        """Return an existing direct child with `tag`, or create a fresh one."""
+        existing = parent.find(tag)
+        if existing is not None:
+            return existing
+        return ET.SubElement(parent, tag)
+
+    def _set_text(parent, tag, value):
+        """Idempotently set <tag>value</tag> as a child of `parent`."""
+        elt = _ensure(parent, tag)
+        elt.text = str(value)
+        return elt
+
+    width = int(sequence_meta.get("video_width") or _DEFAULT_VIDEO_WIDTH)
+    height = int(sequence_meta.get("video_height") or _DEFAULT_VIDEO_HEIGHT)
+    fps = float(sequence_meta.get("video_fps") or _DEFAULT_VIDEO_FPS)
+    a_channels = int(sequence_meta.get("audio_channels") or _DEFAULT_AUDIO_CHANNELS)
+    a_rate = int(sequence_meta.get("audio_rate") or _DEFAULT_AUDIO_SAMPLERATE)
+    par = sequence_meta.get("pixel_aspect_ratio") or "1:1"
+
+    # FCP7 xmeml encodes "is this an NTSC drop-frame rate" as <ntsc>TRUE</ntsc>
+    # alongside the integer <timebase>. Round to nearest integer for
+    # timebase, mark NTSC for 23.976 / 29.97 / 59.94 / 119.88.
+    timebase = int(round(fps))
+    ntsc_flag = "TRUE" if abs(fps - timebase * 1000.0 / 1001.0) < 0.01 else "FALSE"
+
+    # FCP7 pixel aspect ratio names (square is by far the most common).
+    par_name = "square"
+    if par == "10:11":
+        par_name = "NTSC-601"
+    elif par == "59:54":
+        par_name = "PAL-601"
+    elif par == "40:33":
+        par_name = "NTSC-CCIR601"
+
+    patched = 0
+    for sequence in root.iter("sequence"):
+        media_e = _ensure(sequence, "media")
+
+        # ── Video format ───────────────────────────────────────────────
+        video_e = _ensure(media_e, "video")
+        format_e = _ensure(video_e, "format")
+        sc_e = _ensure(format_e, "samplecharacteristics")
+        _set_text(sc_e, "width", width)
+        _set_text(sc_e, "height", height)
+        _set_text(sc_e, "pixelaspectratio", par_name)
+        _set_text(sc_e, "fielddominance", "none")
+        _set_text(sc_e, "colordepth", 24)
+        # Nested <rate> on the samplecharacteristics so the format
+        # element itself carries fps, not just the parent <sequence>.
+        rate_e = _ensure(sc_e, "rate")
+        _set_text(rate_e, "ntsc", ntsc_flag)
+        _set_text(rate_e, "timebase", timebase)
+
+        # ── Audio format ───────────────────────────────────────────────
+        audio_e = _ensure(media_e, "audio")
+        _set_text(audio_e, "numOutputChannels", a_channels)
+        # Some Premiere versions read <samplerate>/<depth> directly on
+        # <audio>; FCP X uses a <format><samplecharacteristics> child.
+        # Provide BOTH so either importer is satisfied.
+        _set_text(audio_e, "samplerate", a_rate)
+        _set_text(audio_e, "depth", 16)
+        a_format_e = _ensure(audio_e, "format")
+        a_sc_e = _ensure(a_format_e, "samplecharacteristics")
+        _set_text(a_sc_e, "depth", 16)
+        _set_text(a_sc_e, "samplerate", a_rate)
+
+        patched += 1
+
+    if patched == 0:
+        return 0
+
+    try:
+        tree.write(str(out_path), encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        print(f"  warn: xmeml sequence patch built but failed to write back "
+              f"to {out_path.name} ({type(e).__name__}: {e}); the file is "
+              "still valid xmeml, just missing the sequence attrs.",
+              file=sys.stderr)
+        return 0
+
+    return patched
+
+
+def _sequence_meta_from_timeline(timeline) -> dict | None:
+    """Pull the sequence-shape dict we stashed on the Timeline (if any).
+
+    build_timeline() puts the resolved settings under
+    timeline.metadata['video-use-premiere']['sequence']; both writers
+    forward that to their post-write patchers without having to
+    re-resolve the EDL.
+    """
+    try:
+        return (timeline.metadata.get("video-use-premiere") or {}).get("sequence")
+    except Exception:
+        return None
+
+
 def write_fcpxml(timeline, out_path: Path) -> None:
     """Write the timeline as FCPXML 1.10+ (.fcpxml) — Resolve / FCP X path.
 
@@ -682,9 +1088,14 @@ def write_fcpxml(timeline, out_path: Path) -> None:
     "no adapter for extension" message reach the user.
 
     After the adapter writes the file we run _patch_fcpxml_audio_shape()
-    to inject `hasAudio` / `audioSources` / `audioChannels` / `audioRate`
-    attributes on each <asset> so Premiere and Resolve link the audio
-    track without complaining about a channel-count mismatch.
+    to inject:
+      - per-asset hasAudio / audioSources / audioChannels / audioRate
+        so Premiere and Resolve link the audio track without complaining
+        about a channel-count mismatch.
+      - per-format width / height / colorSpace pulled from the sequence
+        settings the timeline was built against, so the imported
+        sequence inherits the source's resolution and color space
+        instead of dropping into the NLE's default 1080p / Rec.709.
     """
     otio = _import_otio()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -697,10 +1108,11 @@ def write_fcpxml(timeline, out_path: Path) -> None:
             "(this pulls in otio-fcpx-xml-adapter for Resolve / FCP X "
             "and otio-fcp-adapter for Premiere Pro)."
         )
-    # Best-effort audio-shape patch. _patch_fcpxml_audio_shape() never
-    # raises — it only prints warnings — so the .fcpxml is always left
-    # in a usable state even if the patch can't run.
-    _patch_fcpxml_audio_shape(out_path)
+    # Best-effort post-write patches. Both helpers swallow their own
+    # exceptions and only print warnings, so the .fcpxml is always left
+    # in a usable state even if the patches can't run.
+    seq_meta = _sequence_meta_from_timeline(timeline)
+    _patch_fcpxml_audio_shape(out_path, sequence_meta=seq_meta)
 
 
 def write_premiere_xml(timeline, out_path: Path) -> None:
@@ -714,6 +1126,11 @@ def write_premiere_xml(timeline, out_path: Path) -> None:
     xmeml supports both natively. End result: Premiere Pro users get
     a one-click File -> Import experience and skip the XtoCC step
     Adobe documents.
+
+    After the adapter writes the file we run _patch_xmeml_sequence_format
+    to inject the sequence's resolution / fps / pixel-aspect / audio
+    shape, so Premiere creates a sequence that matches the source
+    footage instead of falling back to its New Sequence default.
     """
     otio = _import_otio()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -726,6 +1143,8 @@ def write_premiere_xml(timeline, out_path: Path) -> None:
             "(this pulls in otio-fcp-adapter for Premiere Pro's native "
             "xmeml import — no XtoCC required)."
         )
+    seq_meta = _sequence_meta_from_timeline(timeline)
+    _patch_xmeml_sequence_format(out_path, sequence_meta=seq_meta)
 
 
 # ---------------------------------------------------------------------------
@@ -780,9 +1199,11 @@ def main() -> None:
              "`both` writes side-by-side from a single timeline build.",
     )
     ap.add_argument(
-        "--frame-rate", type=float, default=24.0,
-        help="Timeline frame rate. Snap all cuts to whole frames at this "
-             "rate. Default 24. Common: 23.976, 25, 29.97, 30, 60.",
+        "--frame-rate", type=str, default="auto",
+        help="Timeline frame rate. Default 'auto' inherits from the EDL's "
+             "primary source (the one with the most runtime). Pass a "
+             "number (23.976, 24, 25, 29.97, 30, 60) to override. All "
+             "cuts are snapped to whole frames at the chosen rate.",
     )
     args = ap.parse_args()
 
@@ -792,9 +1213,20 @@ def main() -> None:
 
     edl = json.loads(edl_path.read_text(encoding="utf-8"))
 
+    # ── Resolve the sequence shape from the EDL's primary source ──────
+    # Picks the source with the most runtime in the cut, ffprobes it for
+    # resolution / fps / color space / audio shape. The result is fed to
+    # build_timeline (so the cut snap-rate matches), to the post-write
+    # patchers (so the sequence settings in the XML match the source),
+    # and to the CLI banner (so the user can see what they got).
+    seq_meta = _resolve_sequence_settings(edl, args.frame_rate)
+    timeline_fps = float(seq_meta["video_fps"])
+
     # Build ONCE — both writers consume the same otio.schema.Timeline.
     # ffprobe + frame-snapping costs are paid here, not per-dialect.
-    timeline = build_timeline(edl, frame_rate=args.frame_rate)
+    timeline = build_timeline(
+        edl, frame_rate=timeline_fps, sequence_settings=seq_meta,
+    )
 
     fcpx_out, prxml_out = _resolve_output_paths(args.output.resolve(), args.targets)
 
@@ -806,8 +1238,14 @@ def main() -> None:
         1 for t in timeline.tracks for c in t
         if c.__class__.__name__ == "Transition"
     )
-    print(f"timeline built: {n_clips} clips, {n_trans} transitions, "
-          f"{args.frame_rate} fps")
+    primary_label = (seq_meta.get("primary_source")
+                     or "<no primary — using defaults>")
+    print(f"timeline built: {n_clips} clips, {n_trans} transitions")
+    print(f"  sequence:    {seq_meta['video_width']}x{seq_meta['video_height']} "
+          f"@ {timeline_fps:.3f} fps, {seq_meta['fcpxml_color_space']}")
+    print(f"  audio:       {seq_meta['audio_channels']}ch @ "
+          f"{seq_meta['audio_rate']} Hz")
+    print(f"  inherited from primary source: {primary_label}")
 
     # Emit each requested dialect. Failures in one writer don't prevent
     # the other from running — the user shouldn't lose the Premiere file
