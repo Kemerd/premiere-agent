@@ -118,14 +118,25 @@ python helpers/health.py --clear           # wipe cache (next call re-runs)
 
 ## Helpers
 
-### Preprocessing (the three lanes)
+### Preprocessing (Phase A: speech + visual; Phase B: agent-driven CLAP audio events)
 
 > **All helpers live in `helpers/`.** Always invoke them from the skill root as `python helpers/<script>.py …` (the sibling-import pattern they use depends on `helpers/` being the script's own directory, which `sys.path` resolves automatically when you run them by path). Never `cd helpers/` first — `cwd` semantics differ across shells (PowerShell, bash, agentic shells that don't persist `cd`), and the cache layout assumes the project root is the cwd.
 
-- **`helpers/preprocess_batch.py <videos_dir>`** — auto-discover videos, run all three lanes with VRAM-aware scheduling. Default entry point. Flags: `--wealthy` (24GB+ GPU), `--diarize`, `--language en`, `--force`, `--skip-{whisper,audio,visual}`.
+**Phase A — speech + visual (default):**
+
+- **`helpers/preprocess_batch.py <videos_dir>`** — auto-discover videos, run the speech (Parakeet ONNX) + visual (Florence-2) lanes with VRAM-aware scheduling. Default entry point. Flags: `--wealthy` (24GB+ GPU), `--diarize`, `--language en`, `--force`, `--skip-speech`, `--skip-visual`, `--include-audio` (opt into running CLAP inline against the baseline vocab — see Phase B for the recommended path instead).
 - **`helpers/preprocess.py <video1> [<video2> ...]`** — same orchestrator with explicit file list. Use when you want a subset.
-- **`helpers/pack_timelines.py --edit-dir <dir>`** — read the three lane caches (`transcripts/`, `audio_tags/`, `visual_caps/`) and produce `speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`. Add `--merge` for `merged_timeline.md`.
-- **Individual lanes** (rarely needed — the orchestrator wraps them): `helpers/whisper_lane.py`, `helpers/audio_lane.py`, `helpers/visual_lane.py`. Each accepts `--wealthy` and runs standalone.
+- **`helpers/pack_timelines.py --edit-dir <dir>`** — read the available lane caches (`transcripts/`, `audio_tags/`, `visual_caps/`) and produce `speech_timeline.md`, `audio_timeline.md` (only if Phase B has run), `visual_timeline.md`. Add `--merge` for `merged_timeline.md`. Safe to call multiple times — re-running after Phase B picks up the new audio events.
+
+**Phase B — CLAP audio events with an agent-curated vocabulary (recommended):**
+
+The default audio workflow is: read `speech_timeline.md` + `visual_timeline.md` first, then write a project-specific vocabulary to `<edit>/audio_vocab.txt` (one label per line, 200–1000 entries — broad coverage of the actual content + a healthy "negative" set so silence and unrelated sounds don't latch onto a label), then invoke the audio lane against it. This produces dramatically sharper labels than any baked-in 527-class taxonomy because the vocabulary actually matches what's on screen.
+
+- **`helpers/audio_lane.py <video1> [<video2> ...] --vocab <edit>/audio_vocab.txt --edit-dir <edit>`** — run CLAP zero-shot scoring against your custom vocabulary. Caches text embeddings in `audio_vocab_embeds.npz` so subsequent runs are fast. Flags: `--device {cuda,cpu}`, `--model-tier {base,large}`, `--windows-per-batch N`, `--force`. Without `--vocab`, the lane uses the baked-in baseline vocab from `audio_vocab_default.py` — that's the smoke-test / agent-less fallback.
+- After Phase B finishes, re-run `pack_timelines.py` to fold the new audio events into `audio_timeline.md` (and `merged_timeline.md` if you're using it).
+
+**Individual lanes** (rarely needed — the orchestrator wraps them): `helpers/parakeet_onnx_lane.py`, `helpers/parakeet_lane.py` (NeMo fallback), `helpers/audio_lane.py`, `helpers/visual_lane.py`. Each accepts `--wealthy` and runs standalone.
+
 - **`helpers/extract_audio.py <video>`** — manually extract 16kHz mono WAV. Cached. Mainly for debugging.
 - **`helpers/vram.py`** — print detected GPU + the schedule that would be picked. Useful sanity check.
 
@@ -141,16 +152,17 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 ## The process
 
 0. **Health check.** Run `python helpers/health.py --json` first. Cached for 7 days; usually returns instantly. If `status != "ok"`, surface the `advice` strings to the user verbatim and stop. See the "Skill health check" section above.
-1. **Inventory.** `ffprobe` every source. `python helpers/preprocess_batch.py <videos_dir>` to run all three lanes (Whisper + PANNs + Florence-2) — cached by mtime, so this is one-time per source. Then `python helpers/pack_timelines.py --edit-dir <edit>` to produce the three timeline markdowns (and `--merge` if the material is action-heavy and you want all three context streams interleaved).
-2. **Pre-scan for problems.** One pass over `speech_timeline.md` to note verbal slips, mis-speaks, or phrasings to avoid. Then scan `visual_timeline.md` for shot variety, B-roll candidates, and visually continuous actions you'll want to keep whole. `audio_timeline.md` is a *last* pass and only as a rough hint at where non-speech beats might live — verify any PANNs label against the visual lane at the same timestamp before trusting it (the model is noisy, especially on tools, music, and crowd sounds).
-3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs, **delivery target (flattened mp4 vs FCPXML to NLE)**. Do not use a fixed checklist — the right questions are different every time.
-4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate, **delivery format**. **Wait for confirmation.**
-5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments where the visual_timeline caption alone isn't enough. Build animations in parallel sub-agents. Apply grade per-segment.
+1. **Inventory + Phase A preprocess.** `ffprobe` every source. `python helpers/preprocess_batch.py <videos_dir>` to run the speech + visual lanes (Parakeet ONNX + Florence-2) — cached by mtime, so this is one-time per source. Then `python helpers/pack_timelines.py --edit-dir <edit>` to produce `speech_timeline.md` + `visual_timeline.md`.
+2. **Phase B audio (agent-curated CLAP).** Read the speech + visual timelines yourself, infer what kinds of sounds will plausibly appear in this footage (tools, materials, ambience, music, animals, vehicles, environments — be specific to *this* project), and write a vocabulary list of ~200–1000 short labels to `<edit>/audio_vocab.txt`. Include a healthy negative / unrelated set too so silence and out-of-domain sounds don't all latch onto your top labels. Then run `python helpers/audio_lane.py <videos> --vocab <edit>/audio_vocab.txt --edit-dir <edit>` and re-run `pack_timelines.py` to fold the new events into `audio_timeline.md` (and `merged_timeline.md` if you use it). Skip this step only if the user explicitly says they don't care about audio events, or pass `--include-audio` to `preprocess_batch.py` upstream to use the baked-in baseline vocab instead (smoke tests, agent-less batch runs).
+3. **Pre-scan for problems.** One pass over `speech_timeline.md` to note verbal slips, mis-speaks, or phrasings to avoid. Then scan `visual_timeline.md` for shot variety, B-roll candidates, and visually continuous actions you'll want to keep whole. `audio_timeline.md` is a *last* pass and only as a rough hint at where non-speech beats might live — verify any CLAP label against the visual lane at the same timestamp before trusting it (the model is approximate, especially when the vocabulary is too small or too generic).
+4. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs, **delivery target (flattened mp4 vs FCPXML to NLE)**. Do not use a fixed checklist — the right questions are different every time.
+5. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate, **delivery format**. **Wait for confirmation.**
+6. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments where the visual_timeline caption alone isn't enough. Build animations in parallel sub-agents. Apply grade per-segment.
    - **Flat MP4 path:** Compose via `render.py`.
    - **NLE handoff path:** Export via `export_fcpxml.py`. Recipient finishes in Premiere/Resolve/FCP.
    - **Both:** run them both — they consume the same EDL.
-6. **Preview.** `render.py --preview` (or hand the `cut.fcpxml` to the user to open and scrub).
-7. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
+7. **Preview.** `render.py --preview` (or hand the `cut.fcpxml` to the user to open and scrub).
+8. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
    - Visual discontinuity / flash / jump at the cut
    - Waveform spike at the boundary (audio pop that slipped past the 30ms fade)
    - Subtitle hidden behind an overlay (Rule 1 violation)
@@ -159,15 +171,15 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
    Also sample: first 2s, last 2s, and 2–3 mid-points — check grade consistency, subtitle readability, overall coherence. Run `ffprobe` on the output to verify duration matches the EDL expectation.
 
    If anything fails: fix → re-render → re-eval. **Cap at 3 self-eval passes** — if issues remain after 3, flag them to the user rather than looping forever. Only present the preview once the self-eval passes.
-8. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-preprocess unchanged sources. Final render on confirmation. Append to `project.md`.
+9. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-preprocess unchanged sources. Final render on confirmation. Append to `project.md`.
 
 ## Cut craft (techniques)
 
-- **Speech-first.** Candidate cuts from word boundaries and silence gaps in `speech_timeline.md`. Whisper is accurate to the word; this lane is the editorial spine.
+- **Speech-first.** Candidate cuts from word boundaries and silence gaps in `speech_timeline.md`. Parakeet TDT is accurate to the word; this lane is the editorial spine.
 - **Preserve peaks.** Laughs, punchlines, emphasis beats. Extend past punchlines to include reactions — the laugh IS the beat.
 - **Speaker handoffs** benefit from air between utterances. Common values: 400–600ms. Less for fast-paced, more for cinematic. Taste call.
 - **Visual context is the second source of truth.** Before committing to *any* non-trivial cut, read `visual_timeline.md` around the cut point. If captions show a continuous action ("person holding drill") spanning your cut, you're cutting in the middle of a shot — usually fine, but be deliberate. Use the visual lane to find B-roll cutaway candidates, match cuts, shot changes, and to decide whether a moment is worth preserving even when speech is silent.
-- **Audio events are noisy hints, not signals.** `audio_timeline.md` carries `(drill 0.87)`, `(applause 0.92)`, `(laughter)`, `(power_tool)` markers from PANNs. **The model is approximate** — it mis-labels frequently (music tagged as speech, hammers tagged as drums, room tone tagged as applause). Use a marker only as a prompt to *go look* at the visual lane (and if needed `timeline_view`) at that timestamp. **Never cut purely on a PANNs label.** When PANNs and Florence-2 disagree about what's happening, trust Florence-2.
+- **Audio events are noisy hints, not signals.** `audio_timeline.md` carries `(drill 0.87)`, `(applause 0.92)`, `(laughter)`, `(power_tool)` markers from CLAP scored against the agent-curated vocab. **The model is approximate** — it mis-labels (music tagged as speech, hammers tagged as drums, room tone tagged as applause), especially when the vocabulary is too small or too generic. Use a marker only as a prompt to *go look* at the visual lane (and if needed `timeline_view`) at that timestamp. **Never cut purely on a CLAP label.** When CLAP and Florence-2 disagree about what's happening, trust Florence-2.
 - **Silence gaps are cut candidates.** Silences ≥400ms are usually the cleanest. 150–400ms phrase boundaries are usable with a visual check. <150ms is unsafe (mid-phrase).
 - **Example cut padding** (the launch video shipped with this): 50ms before the first kept word, 80ms after the last. Tighter for montage energy, looser for documentary. Stay in the 30–200ms working window (Hard Rule 7).
 - **Never reason audio and video independently.** Every cut must work on both tracks.
@@ -202,7 +214,7 @@ Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but 
 
 `pack_timelines.py` reads each lane's JSON cache and produces three markdowns. They share an addressing scheme: every line carries `[start-end]` (or `[t]` for visual frames) in seconds-from-clip-start, so a line read out of any timeline can be directly addressed in `edl.json` cut ranges.
 
-**`speech_timeline.md`** — phrase-grouped Whisper transcript. Phrases break on silence ≥0.5s OR speaker change. The artifact the editor sub-agent reads to pick cuts.
+**`speech_timeline.md`** — phrase-grouped Parakeet transcript. Phrases break on silence ≥0.5s OR speaker change. The artifact the editor sub-agent reads to pick cuts.
 
 ```
 ## C0103  (duration: 43.0s, 8 phrases)
@@ -210,14 +222,16 @@ Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but 
   [006.08-006.74] S0 We fixed this.
 ```
 
-**`audio_timeline.md`** — Audio Flamingo 3 (NVIDIA, 7B audio-language model) natural-language captions of non-speech audio, one caption per ~30s chunk. Open-vocabulary — the model describes what it actually hears (specific tools, materials, ambience, music character) instead of mapping into a fixed 527-class taxonomy. Use it to find action beats, sync points, ambient transitions, and sounds the visual lane can't see (off-screen tools, room tone changes). When AF3 and Florence-2 disagree about what's on screen, trust Florence-2 — AF3 is the authority on the **soundscape**, not the picture.
+**`audio_timeline.md`** — CLAP zero-shot scoring against the agent-curated vocabulary in `audio_vocab.txt`, one row per ~10s sliding window with the top-K labels above the per-label threshold. Adaptive vocabulary — the labels match the actual project content (specific tools, materials, ambience, music character, animals, vehicles, environments) instead of mapping into a fixed 527-class taxonomy. Use it to find action beats, sync points, ambient transitions, and sounds the visual lane can't see (off-screen tools, room tone changes). When CLAP and Florence-2 disagree about what's on screen, trust Florence-2 — CLAP is the authority on the **soundscape**, not the picture.
 
 ```
-## C0108  (duration: 87.4s, 3 chunks @ 30.0s)
-  [000.00-030.00] A power drill running in short bursts on metal, with a faint shop fan in the background.
-  [030.00-060.00] Hammer strikes on sheet metal, then a man laughs briefly off-mic. Drill resumes at the end.
-  [060.00-087.40] Sandpaper rubbing on wood in long even strokes; quiet otherwise.
+## C0108  (duration: 87.4s, 27 events)
+  [012.04-012.40] drill (0.87), power_tool (0.71)
+  [012.18-012.30] metal_scraping (0.62)
+  [018.50-019.10] hammer (0.55)
 ```
+
+If `audio_timeline.md` doesn't exist or looks coarse, you haven't run Phase B yet — see step 2 of "The process" below for the workflow.
 
 **`visual_timeline.md`** — Florence-2 detailed captions @ 1fps. Consecutive identical captions collapse to `(same)`. Use to spot shots, B-roll candidates, match cuts, action. **This is the second source of truth after speech** — when classifying *what is happening* in a moment, prefer this over the audio events lane.
 
@@ -240,13 +254,14 @@ You are editing a <type> video. Pick the best take of each beat and
 assemble them chronologically by beat, not by source clip order.
 
 INPUTS (in priority order — trust them in this order when they disagree):
-  - speech_timeline.md  (phrase-level Whisper transcripts; ACCURATE, the spine)
+  - speech_timeline.md  (phrase-level Parakeet transcripts; ACCURATE, the spine)
   - visual_timeline.md  (1fps Florence-2 captions; second source of truth for
                          what's on screen / what's happening)
-  - audio_timeline.md   (Audio Flamingo 3 natural-language sound captions per
-                         ~30s chunk; describes the soundscape — tools,
-                         materials, ambience, music. Trust for non-speech
-                         audio; defer to visual_timeline for what's on screen)
+  - audio_timeline.md   (CLAP zero-shot scoring against an agent-curated
+                         vocabulary, top-K labels per ~10s window. Describes
+                         the soundscape — tools, materials, ambience, music.
+                         Trust for non-speech audio; defer to visual_timeline
+                         for what's on screen)
   - Product/narrative context: <2 sentences from the user>
   - Speaker(s): <name, role, delivery style note>
   - Expected structure: <pick an archetype or invent one>
@@ -431,7 +446,7 @@ Things that consistently fail regardless of style:
 
 - **Hierarchical pre-computed codec formats** with USABILITY / tone tags / shot layers. Over-engineering. Derive from the timelines at decision time.
 - **Hand-tuned moment-scoring functions.** The LLM picks better than any heuristic you'll write.
-- **Whisper SRT / phrase-level output.** Loses sub-second gap data. Always word-level verbatim.
+- **SRT / phrase-level lane output.** Loses sub-second gap data. Always word-level verbatim from the speech lane (Parakeet TDT emits per-token timestamps natively — keep them).
 - **Re-running `helpers/preprocess_batch.py --force` reflexively.** The mtime-based cache is correct; bypass only when the source file actually changed or you've upgraded a model.
 - **Reading `transcripts/*.json` directly.** Use `speech_timeline.md`. Same data, 1/10 the tokens, phrase-aligned.
 - **Burning subtitles into base before compositing overlays.** Overlays hide them. (Hard Rule 1.)
