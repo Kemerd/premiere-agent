@@ -328,7 +328,7 @@ PRE-FLIGHT (mandatory — do this before writing a single range):
   If merged_timeline.md is missing from <edit>/, STOP and report — re-run
   `python helpers/pack_timelines.py --edit-dir <edit>` to regenerate it.
   Skipping the merged read and editing from a single per-lane file alone
-  is a Hard Rule violation (#13).
+  is a Hard Rule violation (#15).
 
 INPUTS (in priority order — trust them in this order when they disagree):
   - merged_timeline.md  (DEFAULT reading surface; all 3 lanes interleaved
@@ -553,7 +553,7 @@ Things that consistently fail regardless of style:
 - **SRT / phrase-level lane output.** Loses sub-second gap data. Always word-level verbatim from the speech lane (Parakeet TDT emits per-token timestamps natively — keep them).
 - **Re-running `helpers/preprocess_batch.py --force` reflexively.** The mtime-based cache is correct; bypass only when the source file actually changed or you've upgraded a model.
 - **Reading `transcripts/*.json` directly.** Use `merged_timeline.md` (or `speech_timeline.md` for a speech-only drill-down). Same data, 1/10 the tokens, phrase-aligned.
-- **Reading the three per-lane timelines separately when `merged_timeline.md` exists.** The merged view is the editor's default reading surface — one file, all three lanes interleaved by timestamp. Open the per-lane files only as drill-down references for ambiguous moments (Hard Rule 13).
+- **Reading the three per-lane timelines separately when `merged_timeline.md` exists.** The merged view is the editor's default reading surface — one file, all three lanes interleaved by timestamp. Open the per-lane files only as drill-down references for ambiguous moments (Hard Rule 15).
 - **Burning subtitles into base before compositing overlays.** Overlays hide them. (Hard Rule 1.)
 - **Single-pass filtergraph when you have overlays.** Double re-encodes. Use per-segment extract → concat.
 - **Linear animation easing.** Looks robotic. Always cubic.
@@ -563,4 +563,5 @@ Things that consistently fail regardless of style:
 - **Editing before confirming the strategy.** Never.
 - **Re-preprocessing cached sources.** Immutable outputs of immutable inputs.
 - **Assuming what kind of video it is.** Look first, ask second, edit last.
-- **Using `render.py` for J/L cuts or dissolves.** It flattens them. Use `export_fcpxml.py` for split-edit work and finish in the NLE.
+- **Skipping the pacing prompt or inventing ad-hoc cut-padding numbers.** Hard Rule 13 — every session uses one of the five presets; default is Paced.
+- **Emitting non-zero `audio_lead` / `video_tail` / `transition_in`.** Hard Rule 14 — split edits and dissolves are deferred. The current FCPXML pipeline drifts the audio across long timelines under non-zero values; until the multi-track rebuild lands, hard cuts only.

@@ -137,12 +137,15 @@ def warn_if_jl_cuts(edl: dict) -> None:
     if not has:
         return
     print(
-        f"\n  WARN: {n} range(s) carry J/L-cut or dissolve fields "
+        f"\n  WARN: {n} range(s) carry non-zero J/L-cut or dissolve fields "
         f"({', '.join(JL_CUT_FIELDS)}).\n"
-        "       This ffmpeg renderer flattens them to hard cuts. For\n"
-        "       multi-track J/L cuts and dissolves, export FCPXML:\n"
-        "         python helpers/export_fcpxml.py <edl.json> -o cut.fcpxml\n"
-        "       and finish in Premiere / Resolve / Final Cut Pro.\n",
+        "       Split edits and cross-dissolves are currently DEFERRED\n"
+        "       (see SKILL.md 'Split edits (DEFERRED)' / Hard Rule 14):\n"
+        "       the multi-track audio-drift bug in the FCPXML pipeline\n"
+        "       has not yet been fixed. This renderer flattens them to\n"
+        "       hard cuts; the FCPXML exporter would also drift the audio\n"
+        "       on a long timeline. Re-emit the EDL with audio_lead /\n"
+        "       video_tail / transition_in all set to 0.0.\n",
         file=sys.stderr,
     )
 
