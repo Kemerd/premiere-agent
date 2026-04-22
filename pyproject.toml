@@ -43,10 +43,11 @@ preprocess = [
     # both 4.55+ and 5.x cleanly.
     #
     # Whisper note: on transformers 5.x + Blackwell (sm_120), the sdpa
-    # attention path for whisper-large-v3 silently corrupts the CUDA
-    # context. `_resolve_whisper_attn` in whisper_lane.py picks `eager`
-    # automatically when it detects 5.x — slower but correct. On 4.x
-    # sdpa is selected and runs at full speed.
+    # attention path for whisper-large-v3 / whisper-large-v3-turbo
+    # silently corrupts the CUDA context (same encoder, same broken
+    # kernel selector). `_resolve_whisper_attn` in whisper_lane.py picks
+    # `eager` automatically when it detects 5.x — slower but correct.
+    # On 4.x sdpa is selected and runs at full speed.
     "transformers>=4.55,<6",
 
     "optimum>=1.20",           # BetterTransformer fast-path, IFW-recommended

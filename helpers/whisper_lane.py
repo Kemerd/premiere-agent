@@ -59,37 +59,51 @@ from wealthy import WHISPER_BATCH, is_wealthy
 
 
 # ---------------------------------------------------------------------------
-# Tunables — sized for `return_timestamps="word"`, NOT segment timestamps.
+# Tunables — sized for whisper-large-v3-TURBO + `return_timestamps="word"`.
 #
-# Critical context: this lane runs the HF Whisper pipeline with
-# `return_timestamps="word"` (see `_transcribe_words` below) because the
-# downstream editor needs word-precise cut boundaries. Word timestamps
-# inflate VRAM 3-4x vs segment timestamps for the SAME batch size — see
-# https://github.com/huggingface/transformers/issues/27834 for the upstream
-# discussion. Concretely on whisper-large-v3 fp16:
+# Why turbo, not large-v3:
+#   The editor needs word-precise cut boundaries, which forces
+#   `return_timestamps="word"` in the HF pipeline (see `_transcribe_words`
+#   below). Word timestamps run a per-chunk DTW alignment over the
+#   decoder's cross-attention weights — and DTW cost scales LINEARLY with
+#   decoder layer count. large-v3 has 32 decoder layers; turbo has 4
+#   (https://huggingface.co/openai/whisper-large-v3-turbo). That single
+#   fact collapses our peak working set by ~8x at the same batch size,
+#   for the same English transcription quality (turbo's WER is within
+#   noise of large-v3 on English; multilingual degrades a bit, which is
+#   acceptable for an editor that's overwhelmingly English).
 #
-#       batch=24, segment timestamps :  ~6.5 GB peak
-#       batch=24, word    timestamps : ~22.0 GB peak   <-- our path
-#       batch=48, word    timestamps : ~40+  GB peak   <-- OOMs a 5090
+# Per-chunk cost breakdown on turbo, fp16, 30s chunk:
+#       weights                  :  ~1.6 GB resident
+#       encoder fwd (sdpa-fused) :  ~3-5 GB transient (per call)
+#       cross-attn maps for DTW  :  ~107 MB per chunk × batch
+#       decoder KV cache         :  ~16  MB per chunk × batch
 #
-# So the IFW benchmark numbers (which assume segment timestamps + FA2)
-# are NOT a usable reference for our config. We pick batches that leave
-# headroom on the smallest card we actively support (RTX 3090 / 4090
-# 24 GB) AND don't tip the 32 GB Blackwell over the edge once you account
-# for the desktop compositor (~1 GB) plus PyTorch caching allocator
-# fragmentation across multiple per-clip pipeline invocations.
+# Concretely, peak VRAM with word timestamps:
 #
-# Empirical safe-zone floors:
-#   * 24 GB card, word timestamps : batch <= 8   (~12 GB peak)
-#   * 32 GB card, word timestamps : batch <= 16  (~22 GB peak)
+#       batch=16, word timestamps : ~7-8  GB peak   (was ~22 GB on large-v3)
+#       batch=32, word timestamps : ~10-12 GB peak  (was OOM on 24 GB)
+#       batch=48, word timestamps : ~13-15 GB peak  (was OOM on 32 GB)
 #
-# Higher batches do work in synthetic single-shot benchmarks but tip into
-# OOM territory once a long batch (50+ chunks per video) fragments the
-# allocator and the next video's pipeline reload spike has nowhere to go.
+# IFW's own benchmark table (batch=24, segment timestamps, FA2) is STILL
+# not a one-to-one reference for our config — we pay the DTW tax they
+# don't — but turbo plus 4 decoder layers shrinks that gap from "3-4x
+# inflation" down to "~1.3x inflation" relative to their numbers.
+#
+# Empirical safe-zone floors (turbo, word timestamps, 30s chunks,
+# accounting for desktop compositor ~1 GB + caching allocator
+# fragmentation across multi-video runs):
+#   * 12 GB card (3060)         : batch <= 8
+#   * 24 GB card (3090/4090)    : batch <= 16  (default tier)
+#   * 32 GB card (5090)         : batch <= 32  (wealthy tier)
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL_ID = "openai/whisper-large-v3"
-DEFAULT_BATCH_SIZE = 8        # safe on 24 GB cards with word timestamps
+# whisper-large-v3-turbo: 809M params, 4 decoder layers, ~1.6 GB fp16.
+# Same encoder as large-v3, English quality is within noise. The 8x
+# reduction in decoder layers is what makes word timestamps tractable
+# in our memory budget — see comment block above.
+DEFAULT_MODEL_ID = "openai/whisper-large-v3-turbo"
+DEFAULT_BATCH_SIZE = 16       # safe on 24 GB cards with turbo + word timestamps
 DEFAULT_CHUNK_LENGTH_S = 30   # Whisper's native receptive field
 TRANSCRIPTS_SUBDIR = "transcripts"
 

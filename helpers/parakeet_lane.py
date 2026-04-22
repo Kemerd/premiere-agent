@@ -8,7 +8,7 @@ SAME output JSON shape as `whisper_lane.py` so `pack_timelines.py`,
 different acoustic model produced the words.
 
 Why Parakeet TDT 0.6B v3:
-  * ~10x faster than whisper-large-v3 on the same GPU (RNNT decoder).
+  * ~2-3x faster than whisper-large-v3-turbo on the same GPU (RNNT decoder).
   * Native word-level timestamps (no extra forced-alignment step).
   * English + 24 European languages (sufficient for most editing work).
   * Distributed via NeMo's HuggingFace AND NGC mirrors — even if HF is
@@ -71,12 +71,12 @@ from whisper_lane import _diarize_and_assign, _load_hf_token
 
 # ---------------------------------------------------------------------------
 # Defaults — tuned for an RTX 3060+ baseline. Wealthy mode (24 GB+) uses
-# WHISPER_BATCH (currently 16, see helpers/wealthy.py) which Parakeet
+# WHISPER_BATCH (currently 32, see helpers/wealthy.py) which Parakeet
 # absorbs comfortably; the RNNT decoder is small relative to
-# Whisper-large-v3 so batch headroom is plentiful. We re-use the same
-# constant so the user's --wealthy flag means the same thing across the
-# fallback chain — Parakeet COULD safely run higher batches, but matching
-# Whisper's number keeps logs / VRAM expectations consistent.
+# Whisper-large-v3-turbo so batch headroom is plentiful. We re-use the
+# same constant so the user's --wealthy flag means the same thing across
+# the fallback chain — Parakeet COULD safely run higher batches, but
+# matching Whisper's number keeps logs / VRAM expectations consistent.
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"

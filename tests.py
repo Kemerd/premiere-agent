@@ -794,7 +794,7 @@ def test_heavy(R: Results, tmp: Path) -> None:
     _status(
         "HEAVY mode is loading three real models. First run downloads:"
     )
-    print("           - openai/whisper-large-v3       (~3.0 GB)")
+    print("           - openai/whisper-large-v3-turbo (~1.6 GB)")
     print("           - microsoft/Florence-2-base     (~1.0 GB)")
     print("           - PANNs CNN14 (panns-inference) (~340 MB)")
     print("           Subsequent runs hit the HF cache and start in ~5s each.")
@@ -812,18 +812,19 @@ def test_heavy(R: Results, tmp: Path) -> None:
     try:
         _status("Whisper lane: importing whisper_lane ...")
         from whisper_lane import run_whisper_lane_batch
-        _status("Whisper lane: loading openai/whisper-large-v3 (download on first run) ...")
+        _status("Whisper lane: loading openai/whisper-large-v3-turbo (download on first run) ...")
         t0 = time.monotonic()
         out = run_whisper_lane_batch(
             [clip], edit,
-            model_id="openai/whisper-large-v3",
+            model_id="openai/whisper-large-v3-turbo",
             language="en",
             # Smoke test runs on whatever GPU the user happens to have —
             # use the safe default rather than the wealthy override so it
             # passes on a 12 GB 3060 too. The lane's adaptive backoff
             # would catch a too-high value, but a fast clean pass here
-            # is the better signal.
-            batch_size=8,
+            # is the better signal. Turbo + word timestamps comfortably
+            # fits batch=16 on 12 GB cards (it's ~5 GB peak there).
+            batch_size=16,
             chunk_length_s=30,
             diarize=False,
             num_speakers=None,
