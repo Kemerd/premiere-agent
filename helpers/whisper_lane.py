@@ -301,6 +301,46 @@ def _load_hf_token() -> str | None:
 # Pipeline construction — one-time per process, model stays resident.
 # ---------------------------------------------------------------------------
 
+def _resolve_whisper_attn(device: str) -> str:
+    """Pick the safest attention implementation for Whisper.
+
+    Background — why eager is the default:
+        transformers 5.x + sdpa + Whisper-large-v3 + Blackwell (sm_120)
+        is a known-broken combination. Symptoms: cryptic "CUDA error:
+        out of memory" raised on `inputs.to(device)` of a tiny mel-spec
+        tensor, with the "CUDA kernel errors might be asynchronously
+        reported" preamble — i.e. an earlier kernel failed silently and
+        poisoned the CUDA context. The retry-loop sees identical fake
+        OOMs at every batch size from 24 down to 1 and bails. See:
+            https://github.com/huggingface/transformers/issues/38662
+        and r/CUDA threads on PyTorch sm_120 + Whisper interactions.
+
+        Florence-2 in the same process runs fine on the same card
+        because its broken sdpa/flash flags are already monkey-patched
+        off in visual_lane.py — meaning Florence runs eager too. We're
+        just making Whisper consistent with that.
+
+    Performance tradeoff: eager vs sdpa is roughly 1.5-2x slower on
+    Whisper-large-v3 long-form. On a 5090 that's still ~50x realtime,
+    which is fine for batch preprocessing. Once HF / PyTorch ships a
+    fix for the sdpa-on-Blackwell path, set `VIDEO_USE_WHISPER_ATTN=sdpa`
+    (or `flash_attention_2`) to opt back in without code changes.
+
+    MPS path is unchanged: MPS doesn't support FA2 and our eager
+    default is already valid there.
+    """
+    # Env var override comes first — power users / future-us can flip
+    # this once the underlying bug is fixed without redeploying code.
+    forced = os.environ.get("VIDEO_USE_WHISPER_ATTN", "").strip().lower()
+    if forced in ("eager", "sdpa", "flash_attention_2"):
+        return forced
+
+    # Default policy: eager. Safe on every device + transformers combo
+    # we've seen in the wild. The perf hit is a deliberate tradeoff for
+    # not silently poisoning CUDA contexts on Blackwell.
+    return "eager"
+
+
 def _build_pipeline(
     model_id: str,
     device: str,
@@ -308,10 +348,12 @@ def _build_pipeline(
 ):
     """Build the transformers ASR pipeline with the IFW recipe.
 
-    Resolved attention implementation (in priority order):
-        1. flash_attention_2 — IFW's headline path, ~3-5x faster
-        2. sdpa             — PyTorch native, ~1.5-2x faster than eager
-        3. eager            — fallback (won't reach here on torch >=2.1)
+    Attention implementation is resolved by `_resolve_whisper_attn` —
+    see that function's docstring for why we default to `eager` rather
+    than the IFW-recommended `flash_attention_2` / `sdpa` paths. The
+    short version: those paths are broken on transformers 5.x +
+    Blackwell, silently corrupting CUDA state and surfacing as fake
+    OOMs that no batch-size retry can fix.
     """
     import torch
     from transformers import pipeline
@@ -327,21 +369,12 @@ def _build_pipeline(
         raise ValueError(f"unknown dtype '{dtype_name}' (use fp16/fp32/bf16)")
     torch_dtype = dtype_map[dtype_name]
 
-    # Probe FA2 by attempting the import. transformers exposes a helper but
-    # it's been moved across versions; doing the import ourselves is more
-    # robust to version drift.
-    attn_impl = "sdpa"
-    try:
-        import flash_attn  # noqa: F401
-        attn_impl = "flash_attention_2"
-    except ImportError:
-        pass
-
-    # MPS doesn't support FA2 yet (transformers will raise) — force SDPA.
-    if device.startswith("mps") and attn_impl == "flash_attention_2":
-        attn_impl = "sdpa"
-
-    print(f"  whisper: model={model_id}  device={device}  dtype={dtype_name}  attn={attn_impl}")
+    attn_impl = _resolve_whisper_attn(device)
+    print(
+        f"  whisper: model={model_id}  device={device}  "
+        f"dtype={dtype_name}  attn={attn_impl}"
+        + ("  (override via VIDEO_USE_WHISPER_ATTN env)" if attn_impl == "eager" else "")
+    )
 
     return pipeline(
         task="automatic-speech-recognition",

@@ -108,11 +108,40 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
     except ValueError:
         raise RuntimeError(f"could not probe dimensions of {video_path}")
 
+    # ------------------------------------------------------------------
+    # Square center-crop, baked into the ffmpeg filter chain.
+    #
+    # Why: Florence-2's vision tower has a hard assertion that the
+    # encoded feature map is square (`assert h * w == num_tokens, 'only
+    # support square feature maps for now'` — `modeling_florence2.py`
+    # line ~2610). With non-square pixel_values (e.g. 16:9 4K DJI
+    # footage) the embedding produces a non-square map and the
+    # assertion explodes mid-generate.
+    #
+    # Why ffmpeg-side crop instead of PIL post-decode:
+    #   1. ffmpeg crops BEFORE rgb24 conversion, so the pipe carries
+    #      `square^2 * 3` bytes per frame instead of `width * height * 3`.
+    #      For 4K 16:9 input that's a ~33% reduction in pipe bandwidth
+    #      and Python-side memory churn — meaningful at 1 fps over a
+    #      multi-hour shoot.
+    #   2. PIL.Image.crop() would force a temporary copy in user-space
+    #      Python; ffmpeg's `crop` filter does it inside the decoder
+    #      with zero extra allocation.
+    #
+    # We center-crop to `min(width, height)` so portrait, landscape,
+    # and already-square footage all become square. ffmpeg's `crop`
+    # filter defaults to centered when x/y are omitted.
+    # ------------------------------------------------------------------
+    square_dim = min(width, height)
+
     ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_bin, "-loglevel", "error",
         "-i", str(video_path),
-        "-vf", f"fps={fps}",
+        # Filter chain order matters: fps decimation FIRST (cheap, drops
+        # ~95% of frames before we pay the crop cost), THEN crop. Output
+        # of crop is `square_dim x square_dim` regardless of source AR.
+        "-vf", f"fps={fps},crop={square_dim}:{square_dim}",
         "-pix_fmt", "rgb24",
         "-f", "rawvideo", "-",
     ]
@@ -120,14 +149,19 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
     # Subprocess.Popen so we can stream stdout in frame-sized chunks.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    frame_size = width * height * 3
+    # Per-frame size now reflects the post-crop dimensions, not the
+    # source. Misreading this would mis-frame every chunk and yield
+    # garbage / a hang on the final partial chunk.
+    frame_size = square_dim * square_dim * 3
     t = 0
     try:
         while True:
             buf = proc.stdout.read(frame_size)
             if not buf or len(buf) < frame_size:
                 break
-            arr = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(
+                square_dim, square_dim, 3
+            )
             # Florence-2 takes PIL images. Conversion is cheap (no copy).
             yield t, Image.fromarray(arr, mode="RGB")
             t += 1
