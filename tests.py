@@ -278,18 +278,15 @@ def test_pack_timelines(R: Results, tmp: Path) -> None:
             ],
         }), encoding="utf-8")
 
-        # Synthetic PANNs output
+        # Synthetic PANNs output — flat one-event-per-label shape (matches
+        # the real `audio_lane.py` emit format, see lines 24-26 of that file).
         (edit / "audio_tags" / "C0001.json").write_text(json.dumps({
             "source_path": "/tmp/C0001.mp4",
             "duration": 10.0,
             "events": [
-                {"start": 3.0, "end": 4.5, "tags": [
-                    {"label": "drill", "score": 0.87},
-                    {"label": "power_tool", "score": 0.71},
-                ]},
-                {"start": 7.0, "end": 7.5, "tags": [
-                    {"label": "laughter", "score": 0.55},
-                ]},
+                {"start": 3.0, "end": 4.5, "label": "drill",      "score": 0.87},
+                {"start": 3.0, "end": 4.5, "label": "power_tool", "score": 0.71},
+                {"start": 7.0, "end": 7.5, "label": "laughter",   "score": 0.55},
             ],
         }), encoding="utf-8")
 
@@ -356,10 +353,16 @@ def test_fcpxml_roundtrip(R: Results, tmp: Path) -> None:
     try:
         from export_fcpxml import build_timeline, write_fcpxml
 
-        # Fake source files — they don't need to exist for FCPXML write,
-        # the exporter only stores file:// URIs. NLEs would relink.
+        # FCPXML adapter requires `available_range` on each external ref,
+        # which we populate via ffprobe. Generate a tiny REAL clip (20s)
+        # so the probe path is exercised end-to-end (not just the sentinel
+        # fallback). 20s is enough to cover all 4 ranges in the synth EDL.
         src = tmp / "C0001.mp4"
-        src.write_bytes(b"")
+        try:
+            _make_synthetic_clip(src, seconds=20.0)
+        except Exception as e:
+            R.fail("synthetic source for FCPXML test", str(e))
+            return
 
         edl = {
             "name": "test_cut",

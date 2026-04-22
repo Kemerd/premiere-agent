@@ -43,8 +43,64 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Source-media probing — the FCPXML adapter requires every external media
+# reference to have an `available_range` so it can write the asset's full
+# duration into the FCPXML <asset>/<format> declaration. NLEs use this to
+# pre-allocate the timeline view and to reject obviously corrupt imports.
+#
+# We ffprobe each unique source ONCE and cache the result so a 60-clip EDL
+# referencing 4 source files only costs 4 ffprobe calls.
+# ---------------------------------------------------------------------------
+
+# Be generous on ffprobe failure — a long fake duration is preferable to
+# refusing to write the file. NLEs will still relink on the actual source
+# and use that source's real duration at conform time.
+_FFPROBE_FALLBACK_DURATION_S = 24 * 60 * 60.0  # 24 h sentinel
+
+_PROBE_CACHE: dict[str, float] = {}
+
+
+def _probe_source_duration_s(path: Path) -> float:
+    """Return the source media duration in seconds, ffprobe + cached.
+
+    On any failure (missing ffprobe, unreadable file, malformed output)
+    return a 24h sentinel so the FCPXML still writes — Premiere will
+    reconcile against the real file at relink time.
+    """
+    key = str(path)
+    if key in _PROBE_CACHE:
+        return _PROBE_CACHE[key]
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             str(path)],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout.strip()
+        dur = float(out)
+        if dur <= 0:
+            raise ValueError("non-positive duration")
+    except Exception as e:
+        # Don't crash the export — the alternative is no FCPXML at all.
+        # Mention the fallback in stderr so the user can investigate if
+        # they care; most won't, the 24h sentinel works in every NLE
+        # we've tested.
+        print(
+            f"  warn: ffprobe failed for {path.name} ({type(e).__name__}: "
+            f"{e}); using {_FFPROBE_FALLBACK_DURATION_S/3600:.0f}h sentinel "
+            "available_range. NLE will relink to actual source duration.",
+            file=sys.stderr,
+        )
+        dur = _FFPROBE_FALLBACK_DURATION_S
+    _PROBE_CACHE[key] = dur
+    return dur
 
 
 # ---------------------------------------------------------------------------
@@ -176,14 +232,31 @@ def build_timeline(edl: dict, frame_rate: float):
         # NLEs follow the path on import; if the user moves the masters,
         # they'll get the standard "missing media" relink dialog, same as
         # for any imported XML.
-        media_ref = otio.schema.ExternalReference(
-            target_url=Path(src_path).resolve().as_uri(),
+        #
+        # available_range is REQUIRED by the FCPXML adapter — it writes
+        # this into the <asset> declaration. We ffprobe the source once
+        # and cache. See _probe_source_duration_s().
+        src_path_resolved = Path(src_path).resolve()
+        media_dur_s = _probe_source_duration_s(src_path_resolved)
+        media_avail_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, frame_rate),
+            duration=_rt(media_dur_s, frame_rate),
         )
+
+        def _new_media_ref():
+            """Each clip gets its own ExternalReference because the FCPXML
+            adapter sometimes writes per-asset state; sharing one ref
+            across clips has caused 'asset already declared' errors in
+            past adapter versions. Cheap enough to construct per-clip."""
+            return otio.schema.ExternalReference(
+                target_url=src_path_resolved.as_uri(),
+                available_range=media_avail_range,
+            )
 
         # Video clip
         v_clip = otio.schema.Clip(
             name=f"{src_name}_v_{i:02d}",
-            media_reference=media_ref,
+            media_reference=_new_media_ref(),
             source_range=_range(v_start, v_dur, frame_rate),
         )
         # Stash editorial metadata so the user can see WHY this cut was
@@ -195,12 +268,10 @@ def build_timeline(edl: dict, frame_rate: float):
         }
 
         # Audio clip — independent source_range to support split edits.
-        # Same media reference (NLE will only pull the audio track from it).
+        # Same source media (NLE will only pull the audio track from it).
         a_clip = otio.schema.Clip(
             name=f"{src_name}_a_{i:02d}",
-            media_reference=otio.schema.ExternalReference(
-                target_url=Path(src_path).resolve().as_uri(),
-            ),
+            media_reference=_new_media_ref(),
             source_range=_range(a_src_start, a_dur, frame_rate),
         )
 
