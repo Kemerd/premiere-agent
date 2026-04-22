@@ -21,16 +21,7 @@ Per-lane wealthy overrides:
                 relative to encoder-decoder ASR stacks so batch=32
                 fits comfortably in 24 GB+ envelopes.
 
-    Florence:  batch_size 8  →  32   (caption batch fed to a single
-                ORT vision_encoder call -- no per-image padding overhead
-                like the old torch path had).
-                pool size 1  →  2    (independent FlorenceCaptioner
-                instances running in parallel; each holds 4 ONNX
-                sessions internally for vision/embed/encoder/decoder).
-                Wealthy gets the extra parallel instance because the
-                decoder loop is autoregressive and the GPU has spare
-                SMs while one beam-3 forward is waiting on the next
-                token's KV update.
+    Florence:  batch_size 8  →  32   (caption batch)
 
     CLAP audio lane :  windows_per_batch 16 → 64   (audio encoder batch)
                + model tier "base" → "large" (Xenova/larger_clap_general)
@@ -151,73 +142,6 @@ PARAKEET_POOL_SIZE_WEALTHY = 8
 # Set via env var: VIDEO_USE_PARAKEET_QUANT=int8
 PARAKEET_QUANTIZATION_DEFAULT = "fp16"
 PARAKEET_QUANTIZATION_ENV = "VIDEO_USE_PARAKEET_QUANT"
-
-
-# ---------------------------------------------------------------------------
-# Florence-2 ONNX captioner pool sizing.
-#
-# The visual lane (helpers/visual_lane.py) loads N independent
-# `FlorenceCaptioner` instances in one process -- each instance owns its
-# own four `onnxruntime.InferenceSession` handles (vision_encoder,
-# embed_tokens, encoder_model, decoder_model_merged). ORT releases the
-# GIL during native Run() so a `ThreadPoolExecutor(max_workers=N)` fans
-# frame batches out to N truly-parallel native inferences on a single
-# GPU.
-#
-# Why parallel instances help even on a single GPU:
-#   - The vision encoder is compute-heavy but short-lived (~30 ms per
-#     batch of 8 on a 5090).
-#   - The autoregressive decoder loop is the bottleneck (~150-300 ms
-#     per caption) and spends most of its time waiting on small kernel
-#     launches with low SM occupancy. Two captioners sharing the GPU
-#     overlap nicely -- one loops the decoder while the other runs its
-#     vision encoder, and the next-token kernels for two streams pack
-#     better into the SMs than one stream alone.
-#
-# VRAM math, Florence-2-base ONNX, fp16 weights, batch=8, beam=3:
-#
-#   per-instance resident   : ~1.0 GB (all four subgraphs co-resident)
-#   per-instance transient  : ~0.6 GB (vision activations + decoder KV
-#                                       cache + beam=3 batch overhead)
-#   total at N=1 (default)  : ~1.6 GB peak
-#   total at N=2 (wealthy)  : ~3.2 GB peak
-#
-# The default tier (N=1) keeps the visual lane safely inside an 8 GB
-# card alongside Parakeet ONNX (~6 GB) and the desktop compositor.
-# Wealthy tier (N=2) consumes ~3.2 GB which fits comfortably with the
-# Parakeet wealthy pool (~12 GB) on a 24 GB+ card.
-#
-# Override at runtime:
-#   VIDEO_USE_FLORENCE_POOL_SIZE=<int>    (forces a specific N, ignores tier)
-#
-# `FlorenceCaptionerPool` ALSO clamps N down at load time if
-# `vram.detect_gpu().free_gb` is too small to fit the pool, so passing
-# an oversized N on a small card silently degrades to whatever fits.
-# ---------------------------------------------------------------------------
-FLORENCE_POOL_SIZE = 1
-FLORENCE_POOL_SIZE_WEALTHY = 2
-
-
-def florence_pool_size(cli_flag: bool = False) -> int:
-    """Resolve the Florence-2 ONNX captioner-pool size for this process.
-
-    Resolution order (first match wins):
-        1. VIDEO_USE_FLORENCE_POOL_SIZE env var (explicit override)
-        2. FLORENCE_POOL_SIZE_WEALTHY if `is_wealthy(cli_flag)` else FLORENCE_POOL_SIZE
-
-    The pool clamps the returned value against available VRAM at
-    captioner-construction time -- this function only resolves the
-    *intended* size, not the *achievable* one.
-    """
-    raw = os.environ.get("VIDEO_USE_FLORENCE_POOL_SIZE", "").strip()
-    if raw:
-        try:
-            n = int(raw)
-            if n >= 1:
-                return n
-        except ValueError:
-            pass
-    return FLORENCE_POOL_SIZE_WEALTHY if is_wealthy(cli_flag) else FLORENCE_POOL_SIZE
 
 
 def parakeet_pool_size(cli_flag: bool = False) -> int:
