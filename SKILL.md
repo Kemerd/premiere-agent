@@ -7,7 +7,7 @@ description: Edit any video by conversation. Local two-phase preprocessing — P
 
 ## Principle
 
-1. **LLM reasons from raw transcript + sound captions + visual captions + on-demand drill-down.** Three lightweight markdown views (`speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`) are the entire reading surface. Everything else — filler tagging, retake detection, shot classification, B-roll spotting, emphasis scoring — you derive at decision time.
+1. **LLM reasons from one interleaved markdown view + on-demand drill-down.** `merged_timeline.md` is the editor's default reading surface — speech phrases, audio events, and visual captions for every source, all interleaved chronologically by timestamp in a single file. The three per-lane views (`speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`) are kept on disk as drill-down references for the moments where the merged view is ambiguous and you need to zoom in on one lane. Everything else — filler tagging, retake detection, shot classification, B-roll spotting, emphasis scoring — you derive at decision time.
 2. **Speech is primary, visuals are secondary, audio events are tertiary.** Cut candidates come from Parakeet ONNX speech boundaries and silence gaps — that lane is highly accurate and is the editorial spine. Visual captions (Florence-2) are the second source of truth: they answer "what's actually on screen here?" and resolve ambiguous decision points (B-roll spotting, shot continuity, action beats). Audio events (CLAP, zero-shot scoring against a vocabulary) tag non-speech sounds per ~10s window (tools, materials, ambience, music, animals, vehicles). Vocabulary is **agent-curated per project** by reading the speech + visual timelines first — see Phase B below. When audio and visual disagree about *what is happening on screen*, **trust the visual lane.**
 3. **Ask → confirm → execute → iterate → persist.** Never touch the cut until the user has confirmed the strategy in plain English.
 4. **Generalize.** Do not assume what kind of video this is. Look at the material, ask the user, then edit.
@@ -31,7 +31,7 @@ These are the things where deviation produces silent failures or broken output. 
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
 12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use-premiere/` project directory.
-13. **Editor sub-agent must read ALL THREE timelines end-to-end before emitting a single EDL range** — `speech_timeline.md` first (the spine), then `visual_timeline.md` (shot continuity / B-roll), then `audio_timeline.md` (soundscape hints). Never edit from a single lane. A cut chosen from one timeline alone is a cut made blind to the other two — you will land mid-shot, mid-action, or on a CLAP mis-label. The brief in "Editor sub-agent brief" enforces this with a mandatory PRE-FLIGHT block; do not strip it when spawning.
+13. **Editor sub-agent must read `merged_timeline.md` end-to-end before emitting a single EDL range.** The merged view interleaves all three lanes by timestamp — speech (the spine), visual captions (shot continuity / B-roll), and audio events (soundscape hints) — so a single full-file read gives the editor the same triangulated picture it would get from reading each lane separately, in one pass. Never edit from a single lane in isolation. A cut chosen blind to the other lanes will land mid-shot, mid-action, or on a CLAP mis-label. If something in the merged view is ambiguous (e.g. you need word-level timing detail not captured in the phrase grouping, or a denser CLAP scoring than the merged stream shows), drill into the corresponding per-lane file (`speech_timeline.md`, `visual_timeline.md`, `audio_timeline.md`) for that specific moment. The brief in "Editor sub-agent brief" enforces this with a mandatory PRE-FLIGHT block; do not strip it when spawning.
 
 Everything else in this document is a worked example. Deviate whenever the material calls for it.
 
@@ -44,10 +44,11 @@ The skill lives in `video-use-premiere/`. User footage lives wherever they put i
 ├── <source files, untouched>
 └── edit/
     ├── project.md               ← memory; appended every session
-    ├── speech_timeline.md       ← Parakeet phrase-level transcripts  (lane 1)
-    ├── audio_timeline.md        ← CLAP audio events, coalesced       (lane 2, Phase B)
-    ├── visual_timeline.md       ← Florence-2 captions @ 1fps         (lane 3)
-    ├── merged_timeline.md       ← optional, all three interleaved by ts
+    ├── merged_timeline.md       ← DEFAULT reading surface — all 3 lanes
+    │                              interleaved chronologically by timestamp
+    ├── speech_timeline.md       ← Parakeet phrase-level transcripts  (lane 1, drill-down)
+    ├── audio_timeline.md        ← CLAP audio events, coalesced       (lane 2, drill-down, Phase B)
+    ├── visual_timeline.md       ← Florence-2 captions @ 1fps         (lane 3, drill-down)
     ├── edl.json                 ← cut decisions
     ├── transcripts/<name>.json  ← cached raw Parakeet words
     ├── audio_tags/<name>.json   ← cached raw CLAP (label, score) events
@@ -130,14 +131,14 @@ python helpers/health.py --clear           # wipe cache (next call re-runs)
 
 - **`helpers/preprocess_batch.py <videos_dir>`** — auto-discover videos, run the speech (Parakeet ONNX) + visual (Florence-2) lanes with VRAM-aware scheduling. Default entry point. Flags: `--wealthy` (24GB+ GPU), `--diarize`, `--language en`, `--force`, `--skip-speech`, `--skip-visual`, `--include-audio` (opt into running CLAP inline against the baseline vocab — see Phase B for the recommended path instead).
 - **`helpers/preprocess.py <video1> [<video2> ...]`** — same orchestrator with explicit file list. Use when you want a subset.
-- **`helpers/pack_timelines.py --edit-dir <dir>`** — read the available lane caches (`transcripts/`, `audio_tags/`, `visual_caps/`) and produce `speech_timeline.md`, `audio_timeline.md` (only if Phase B has run), `visual_timeline.md`. Add `--merge` for `merged_timeline.md`. Safe to call multiple times — re-running after Phase B picks up the new audio events.
+- **`helpers/pack_timelines.py --edit-dir <dir>`** — read the available lane caches (`transcripts/`, `audio_tags/`, `visual_caps/`) and produce `merged_timeline.md` (the editor's default reading surface, all three lanes interleaved by timestamp) plus the three per-lane drill-down views: `speech_timeline.md`, `audio_timeline.md` (only if Phase B has run), `visual_timeline.md`. Pass `--no-merge` to skip the merged view (rare). Safe to call multiple times — re-running after Phase B picks up the new audio events into both the merged file and `audio_timeline.md`.
 
 **Phase B — CLAP audio events with an agent-curated vocabulary (recommended):**
 
 The default audio workflow is: read `speech_timeline.md` + `visual_timeline.md` first, then write a project-specific vocabulary to `<edit>/audio_vocab.txt` (one label per line, 200–1000 entries — broad coverage of the actual content + a healthy "negative" set so silence and unrelated sounds don't latch onto a label), then invoke the audio lane against it. This produces dramatically sharper labels than any baked-in 527-class taxonomy because the vocabulary actually matches what's on screen.
 
 - **`helpers/audio_lane.py <video1> [<video2> ...] --vocab <edit>/audio_vocab.txt --edit-dir <edit>`** — run CLAP zero-shot scoring against your custom vocabulary. Caches text embeddings in `audio_vocab_embeds.npz` so subsequent runs are fast. Flags: `--device {cuda,cpu}`, `--model-tier {base,large}`, `--windows-per-batch N`, `--force`. Without `--vocab`, the lane uses the baked-in baseline vocab from `audio_vocab_default.py` — that's the smoke-test / agent-less fallback.
-- After Phase B finishes, re-run `pack_timelines.py` to fold the new audio events into `audio_timeline.md` (and `merged_timeline.md` if you're using it).
+- After Phase B finishes, re-run `pack_timelines.py` to fold the new audio events into both `merged_timeline.md` (default) and `audio_timeline.md`.
 
 **Individual lanes** (rarely needed — the orchestrator wraps them): `helpers/parakeet_onnx_lane.py`, `helpers/parakeet_lane.py` (NeMo fallback), `helpers/audio_lane.py`, `helpers/visual_lane.py`. Each accepts `--wealthy` and runs standalone.
 
@@ -156,16 +157,16 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 ## The process
 
 0. **Health check.** Run `python helpers/health.py --json` first. Cached for 7 days; usually returns instantly. If `status != "ok"`, surface the `advice` strings to the user verbatim and stop. See the "Skill health check" section above.
-1. **Inventory + Phase A preprocess.** `ffprobe` every source. `python helpers/preprocess_batch.py <videos_dir>` to run the speech + visual lanes (Parakeet ONNX + Florence-2) — cached by mtime, so this is one-time per source. Then `python helpers/pack_timelines.py --edit-dir <edit>` to produce `speech_timeline.md` + `visual_timeline.md`.
-2. **Phase B audio (agent-curated CLAP).** Read the speech + visual timelines yourself, infer what kinds of sounds will plausibly appear in this footage (tools, materials, ambience, music, animals, vehicles, environments — be specific to *this* project), and write a vocabulary list of ~200–1000 short labels to `<edit>/audio_vocab.txt`. Include a healthy negative / unrelated set too so silence and out-of-domain sounds don't all latch onto your top labels. Then run `python helpers/audio_lane.py <videos> --vocab <edit>/audio_vocab.txt --edit-dir <edit>` and re-run `pack_timelines.py` to fold the new events into `audio_timeline.md` (and `merged_timeline.md` if you use it). Skip this step only if the user explicitly says they don't care about audio events, or pass `--include-audio` to `preprocess_batch.py` upstream to use the baked-in baseline vocab instead (smoke tests, agent-less batch runs).
-3. **Pre-scan for problems.** One pass over `speech_timeline.md` to note verbal slips, mis-speaks, or phrasings to avoid. Then scan `visual_timeline.md` for shot variety, B-roll candidates, and visually continuous actions you'll want to keep whole. `audio_timeline.md` is a *last* pass and only as a rough hint at where non-speech beats might live — verify any CLAP label against the visual lane at the same timestamp before trusting it (the model is approximate, especially when the vocabulary is too small or too generic).
+1. **Inventory + Phase A preprocess.** `ffprobe` every source. `python helpers/preprocess_batch.py <videos_dir>` to run the speech + visual lanes (Parakeet ONNX + Florence-2) — cached by mtime, so this is one-time per source. Then `python helpers/pack_timelines.py --edit-dir <edit>` to produce `merged_timeline.md` (the default reading surface) plus the per-lane drill-down views `speech_timeline.md` and `visual_timeline.md`.
+2. **Phase B audio (agent-curated CLAP).** Read `merged_timeline.md` yourself (or `speech_timeline.md` + `visual_timeline.md` if you want the per-lane view), infer what kinds of sounds will plausibly appear in this footage (tools, materials, ambience, music, animals, vehicles, environments — be specific to *this* project), and write a vocabulary list of ~200–1000 short labels to `<edit>/audio_vocab.txt`. Include a healthy negative / unrelated set too so silence and out-of-domain sounds don't all latch onto your top labels. Then run `python helpers/audio_lane.py <videos> --vocab <edit>/audio_vocab.txt --edit-dir <edit>` and re-run `pack_timelines.py` to fold the new events into `merged_timeline.md` and `audio_timeline.md`. Skip this step only if the user explicitly says they don't care about audio events, or pass `--include-audio` to `preprocess_batch.py` upstream to use the baked-in baseline vocab instead (smoke tests, agent-less batch runs).
+3. **Pre-scan for problems.** One pass over `merged_timeline.md` end-to-end — every speech phrase, every audio event, every visual caption, all interleaved by timestamp. Note verbal slips, mis-speaks, or phrasings to avoid (from the `"..."` lines). Note shot variety, B-roll candidates, and visually continuous actions you'll want to keep whole (from the `visual:` lines). Treat `(audio: ...)` lines as the lowest-priority hints — verify any CLAP label against the visual line at the same timestamp before trusting it (the model is approximate, especially when the vocabulary is too small or too generic). Drill into the per-lane files only when the merged view leaves you guessing about word-level timing or denser audio scoring than the merged stream shows.
 4. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs, **delivery target (flattened mp4 vs FCPXML to NLE)**. Do not use a fixed checklist — the right questions are different every time.
 5. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate, **delivery format**. **Wait for confirmation.**
 6. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments where the visual_timeline caption alone isn't enough. Build animations in parallel sub-agents. Apply grade per-segment.
    - **Flat MP4 path:** Compose via `render.py`.
    - **NLE handoff path:** Export via `export_fcpxml.py`. Default emits both `cut.fcpxml` (Resolve / FCP X) and `cut.xml` (Premiere Pro native xmeml) from one build — recipient picks. Tell Premiere users to `File → Import → cut.xml` (the `.fcpxml` does **not** work natively in Premiere — that's the file Adobe wants you to run through XtoCC, which we sidestep entirely).
    - **Both:** run them both — they consume the same EDL.
-7. **Preview.** `render.py --preview` (or hand the `cut.fcpxml` to the user to open and scrub).
+7. **Preview.** `render.py --preview` (or hand `cut.fcpxml` / `cut.xml` to the user to open and scrub in their NLE — the `.xml` for Premiere, the `.fcpxml` for Resolve / FCP X).
 8. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
    - Visual discontinuity / flash / jump at the cut
    - Waveform spike at the boundary (audio pop that slipped past the 30ms fade)
@@ -179,11 +180,11 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 
 ## Cut craft (techniques)
 
-- **Speech-first.** Candidate cuts from word boundaries and silence gaps in `speech_timeline.md`. Parakeet TDT is accurate to the word; this lane is the editorial spine.
+- **Speech-first.** Candidate cuts from word boundaries and silence gaps. Parakeet TDT is accurate to the word; the speech lane is the editorial spine. Read it interleaved in `merged_timeline.md`; drill into `speech_timeline.md` when you need word-level timing detail.
 - **Preserve peaks.** Laughs, punchlines, emphasis beats. Extend past punchlines to include reactions — the laugh IS the beat.
 - **Speaker handoffs** benefit from air between utterances. Common values: 400–600ms. Less for fast-paced, more for cinematic. Taste call.
-- **Visual context is the second source of truth.** Before committing to *any* non-trivial cut, read `visual_timeline.md` around the cut point. If captions show a continuous action ("person holding drill") spanning your cut, you're cutting in the middle of a shot — usually fine, but be deliberate. Use the visual lane to find B-roll cutaway candidates, match cuts, shot changes, and to decide whether a moment is worth preserving even when speech is silent.
-- **Audio events are noisy hints, not signals.** `audio_timeline.md` carries `(drill 0.87)`, `(applause 0.92)`, `(laughter)`, `(power_tool)` markers from CLAP scored against the agent-curated vocab. **The model is approximate** — it mis-labels (music tagged as speech, hammers tagged as drums, room tone tagged as applause), especially when the vocabulary is too small or too generic. Use a marker only as a prompt to *go look* at the visual lane (and if needed `timeline_view`) at that timestamp. **Never cut purely on a CLAP label.** When CLAP and Florence-2 disagree about what's happening, trust Florence-2.
+- **Visual context is the second source of truth.** Before committing to *any* non-trivial cut, check the `visual:` lines around the cut point in `merged_timeline.md`. If captions show a continuous action ("person holding drill") spanning your cut, you're cutting in the middle of a shot — usually fine, but be deliberate. Use the visual lane to find B-roll cutaway candidates, match cuts, shot changes, and to decide whether a moment is worth preserving even when speech is silent. Drill into `visual_timeline.md` when you need the full 1-fps caption stream (the merged view drops `(same)` repeats).
+- **Audio events are noisy hints, not signals.** The `(audio: ...)` lines in `merged_timeline.md` carry `(drill 0.87)`, `(applause 0.92)`, `(laughter)`, `(power_tool)` markers from CLAP scored against the agent-curated vocab. **The model is approximate** — it mis-labels (music tagged as speech, hammers tagged as drums, room tone tagged as applause), especially when the vocabulary is too small or too generic. Use a marker only as a prompt to *go look* at the visual line (and if needed `timeline_view`) at that timestamp. **Never cut purely on a CLAP label.** When CLAP and Florence-2 disagree about what's happening, trust Florence-2. Drill into `audio_timeline.md` when you want the full per-window scoring instead of the collapsed merged form.
 - **Silence gaps are cut candidates.** Silences ≥400ms are usually the cleanest. 150–400ms phrase boundaries are usable with a visual check. <150ms is unsafe (mid-phrase).
 - **Example cut padding** (the launch video shipped with this): 50ms before the first kept word, 80ms after the last. Tighter for montage energy, looser for documentary. Stay in the 30–200ms working window (Hard Rule 7).
 - **Never reason audio and video independently.** Every cut must work on both tracks.
@@ -214,11 +215,24 @@ Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but 
 
 **Workflow:** if the user wants J/L cuts or dissolves, build the EDL with those fields populated and run BOTH `render.py` (gives them a flattened preview MP4 to evaluate cuts) and `export_fcpxml.py` (gives them the editor file with the split edits intact). Tell them the MP4 is for reviewing cut points, the FCPXML is for finishing.
 
-## The three timelines (primary reading view)
+## The timelines (primary reading view)
 
-`pack_timelines.py` reads each lane's JSON cache and produces three markdowns. They share an addressing scheme: every line carries `[start-end]` (or `[t]` for visual frames) in seconds-from-clip-start, so a line read out of any timeline can be directly addressed in `edl.json` cut ranges.
+`pack_timelines.py` reads each lane's JSON cache and produces four markdowns: one unified view (`merged_timeline.md`, the editor's default reading surface) plus three per-lane drill-down files. They share an addressing scheme: every line carries `[start-end]` (or `[t]` for visual frames) in seconds-from-clip-start (the per-lane files) or `[HH:MM:SS]` (the merged file), so a line read out of any timeline can be directly addressed in `edl.json` cut ranges.
 
-**`speech_timeline.md`** — phrase-grouped Parakeet transcript. Phrases break on silence ≥0.5s OR speaker change. The artifact the editor sub-agent reads to pick cuts.
+**`merged_timeline.md`** — the **default reading surface for the editor sub-agent.** All three lanes interleaved chronologically by timestamp into a single per-source section. Speech phrases as `"..."`, audio events as `(audio: label1, label2, ...)`, visual captions as `visual: ...`. One file, one full read, every event in order — the editor gets the same triangulated picture it would get from reading three lanes in parallel, without the three-way cross-reference cost.
+
+```
+## C0108  (duration: 87.4s, ...)
+  [00:00:02] visual: a workbench with hand tools laid out on a brown wooden surface
+  [00:00:03] "okay so today we're going to drill the pilot holes"
+  [00:00:12] (audio: drill 0.87, power_tool 0.71)
+  [00:00:12] visual: a person holding a cordless drill above a metal panel with rivet holes
+  [00:00:18] "good, pass me the deburring tool"
+```
+
+The three per-lane files below remain on disk for **drill-down only** — read them when the merged view is ambiguous and you need word-level timing, the dedup'd 1-fps caption stream, or the full per-window CLAP scoring.
+
+**`speech_timeline.md`** — phrase-grouped Parakeet transcript. Phrases break on silence ≥0.5s OR speaker change. Drill in here when you need word-level timing detail beyond what the phrase grouping in the merged view shows.
 
 ```
 ## C0103  (duration: 43.0s, 8 phrases)
@@ -226,7 +240,7 @@ Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but 
   [006.08-006.74] S0 We fixed this.
 ```
 
-**`audio_timeline.md`** — CLAP zero-shot scoring against the agent-curated vocabulary in `audio_vocab.txt`, one row per ~10s sliding window with the top-K labels above the per-label threshold. Adaptive vocabulary — the labels match the actual project content (specific tools, materials, ambience, music character, animals, vehicles, environments) instead of mapping into a fixed 527-class taxonomy. Use it to find action beats, sync points, ambient transitions, and sounds the visual lane can't see (off-screen tools, room tone changes). When CLAP and Florence-2 disagree about what's on screen, trust Florence-2 — CLAP is the authority on the **soundscape**, not the picture.
+**`audio_timeline.md`** — CLAP zero-shot scoring against the agent-curated vocabulary in `audio_vocab.txt`, one row per ~10s sliding window with the top-K labels above the per-label threshold. Adaptive vocabulary — the labels match the actual project content (specific tools, materials, ambience, music character, animals, vehicles, environments) instead of mapping into a fixed 527-class taxonomy. Drill in here when you want every per-window CLAP row instead of the collapsed "(audio: ...)" lines in the merged view, or to find sounds the visual lane can't see (off-screen tools, room tone changes). When CLAP and Florence-2 disagree about what's on screen, trust Florence-2 — CLAP is the authority on the **soundscape**, not the picture.
 
 ```
 ## C0108  (duration: 87.4s, 27 events)
@@ -237,7 +251,7 @@ Modern NLE-style cuts that don't render cleanly in flat single-track ffmpeg but 
 
 If `audio_timeline.md` doesn't exist or looks coarse, you haven't run Phase B yet — see step 2 of "The process" below for the workflow.
 
-**`visual_timeline.md`** — Florence-2 detailed captions @ 1fps. Consecutive identical captions collapse to `(same)`. Use to spot shots, B-roll candidates, match cuts, action. **This is the second source of truth after speech** — when classifying *what is happening* in a moment, prefer this over the audio events lane.
+**`visual_timeline.md`** — Florence-2 detailed captions @ 1fps. Consecutive identical captions collapse to `(same)`. Drill in here when you need the full 1-fps caption stream (the merged view drops the `(same)` repeats) or to spot shots, B-roll candidates, match cuts, action with no surrounding speech. **This is the second source of truth after speech** — when classifying *what is happening* in a moment, prefer this over the audio events lane.
 
 ```
 ## C0108  (duration: 87.4s, 87 caps @ 1 fps)
@@ -258,26 +272,40 @@ You are editing a <type> video. Pick the best take of each beat and
 assemble them chronologically by beat, not by source clip order.
 
 PRE-FLIGHT (mandatory — do this before writing a single range):
-  1. Read speech_timeline.md  END-TO-END.  This is the editorial spine — every
-     cut start/end must land on a word boundary from this file.
-  2. Read visual_timeline.md  END-TO-END.  Verify shot continuity at every cut
-     point. A clean audio cut that lands mid-action visually is still a bad cut.
-  3. Read audio_timeline.md   END-TO-END.  Lowest-priority lane — CLAP labels
-     are noisy hints, never primary signal. When CLAP and Florence-2 disagree
-     about what's happening on screen, trust Florence-2.
-  If any of the three is missing from <edit>/, STOP and report — do not proceed
-  with partial inputs. Reading only one lane (especially audio_timeline.md
-  alone) is a Hard Rule violation (#13). All three, every time, full read.
+  1. Read merged_timeline.md  END-TO-END.  This is your default reading
+     surface — speech phrases ("..."), audio events ((audio: ...)), and
+     visual captions (visual: ...) for every source, all interleaved
+     chronologically by timestamp. One file, one full read; you get the
+     same triangulated picture you would from reading the three per-lane
+     files separately, in a single pass.
+  2. Internalize the priority order: speech is the spine (every cut
+     start/end must land on a word boundary), visual is the second source
+     of truth for shot continuity / what's on screen, audio events are
+     noisy hints only. When (audio: ...) and visual: disagree about what's
+     happening on screen at the same timestamp, trust visual.
+  3. Drill into the per-lane files (speech_timeline.md / visual_timeline.md
+     / audio_timeline.md) ONLY for moments where the merged view is
+     ambiguous and you need word-level timing, the full 1-fps caption
+     stream (with `(same)` repeats), or per-window CLAP scoring detail.
+  If merged_timeline.md is missing from <edit>/, STOP and report — re-run
+  `python helpers/pack_timelines.py --edit-dir <edit>` to regenerate it.
+  Skipping the merged read and editing from a single per-lane file alone
+  is a Hard Rule violation (#13).
 
 INPUTS (in priority order — trust them in this order when they disagree):
-  - speech_timeline.md  (phrase-level Parakeet transcripts; ACCURATE, the spine)
-  - visual_timeline.md  (1fps Florence-2 captions; second source of truth for
-                         what's on screen / what's happening)
-  - audio_timeline.md   (CLAP zero-shot scoring against an agent-curated
-                         vocabulary, top-K labels per ~10s window. Describes
-                         the soundscape — tools, materials, ambience, music.
-                         Trust for non-speech audio; defer to visual_timeline
-                         for what's on screen)
+  - merged_timeline.md  (DEFAULT reading surface; all 3 lanes interleaved
+                         by timestamp; one file, full read)
+  - speech_timeline.md  (drill-down: phrase-level Parakeet transcripts;
+                         ACCURATE, the spine. Word-boundary precision)
+  - visual_timeline.md  (drill-down: 1fps Florence-2 captions, full stream
+                         including `(same)` repeats; second source of truth
+                         for what's on screen / what's happening)
+  - audio_timeline.md   (drill-down: CLAP zero-shot scoring against an
+                         agent-curated vocabulary, top-K labels per ~10s
+                         window. Describes the soundscape — tools,
+                         materials, ambience, music. Trust for non-speech
+                         audio; defer to visual_timeline for what's on
+                         screen)
   - Product/narrative context: <2 sentences from the user>
   - Speaker(s): <name, role, delivery style note>
   - Expected structure: <pick an archetype or invent one>
@@ -351,7 +379,7 @@ Alignment=2,MarginV=35
 
 Invent a third style if neither fits. Hard rules: subtitles LAST (Rule 1), output-timeline offsets (Rule 5).
 
-For FCPXML delivery: ship `master.srt` alongside `cut.fcpxml`. Most NLEs import SRT as a captions track that the editor can restyle.
+For FCPXML / xmeml delivery: ship `master.srt` alongside `cut.fcpxml` and `cut.xml`. Most NLEs import SRT as a captions track that the editor can restyle.
 
 ## Animations (when requested)
 
@@ -464,7 +492,8 @@ Things that consistently fail regardless of style:
 - **Hand-tuned moment-scoring functions.** The LLM picks better than any heuristic you'll write.
 - **SRT / phrase-level lane output.** Loses sub-second gap data. Always word-level verbatim from the speech lane (Parakeet TDT emits per-token timestamps natively — keep them).
 - **Re-running `helpers/preprocess_batch.py --force` reflexively.** The mtime-based cache is correct; bypass only when the source file actually changed or you've upgraded a model.
-- **Reading `transcripts/*.json` directly.** Use `speech_timeline.md`. Same data, 1/10 the tokens, phrase-aligned.
+- **Reading `transcripts/*.json` directly.** Use `merged_timeline.md` (or `speech_timeline.md` for a speech-only drill-down). Same data, 1/10 the tokens, phrase-aligned.
+- **Reading the three per-lane timelines separately when `merged_timeline.md` exists.** The merged view is the editor's default reading surface — one file, all three lanes interleaved by timestamp. Open the per-lane files only as drill-down references for ambiguous moments (Hard Rule 13).
 - **Burning subtitles into base before compositing overlays.** Overlays hide them. (Hard Rule 1.)
 - **Single-pass filtergraph when you have overlays.** Double re-encodes. Use per-segment extract → concat.
 - **Linear animation easing.** Looks robotic. Always cubic.

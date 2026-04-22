@@ -6,15 +6,22 @@ After preprocess[_batch].py finishes, every video has THREE JSON files:
     <edit>/audio_tags/<stem>.json    — audio_lane         (CLAP vocab events)
     <edit>/visual_caps/<stem>.json   — visual_lane        (Florence-2 captions)
 
-This script fans those out into THREE markdown timelines that the SKILL
+This script fans those out into FOUR markdown timelines that the SKILL
 points Claude at:
 
     <edit>/speech_timeline.md   — phrase-grouped transcripts (per file)
     <edit>/audio_timeline.md    — vocab-scored sound events  (per file)
     <edit>/visual_timeline.md   — 1-second captions, dedup'd (per file)
+    <edit>/merged_timeline.md   — all three lanes interleaved by timestamp
 
-And, optionally with --merge, a unified merged_timeline.md that
-interleaves all three by timestamp:
+`merged_timeline.md` is the **default reading surface** for the editor
+sub-agent: one file, every event in chronological order, so the agent
+can plan cuts in a single pass instead of cross-referencing three lanes
+by hand. The per-lane files remain on disk as drill-down references
+(use them when you need only one lane, or when an ambiguity in the
+merged view warrants zooming in on the raw per-lane data).
+
+The interleaved merged view looks like:
 
     [00:12:04] "okay now we're going to drill the pilot holes"
     [00:12:09] (audio: cordless drill 0.42, drill press 0.31)
@@ -32,7 +39,10 @@ Audio Flamingo 3 migration, a separate caption-shape renderer is kept
 behind a `model` sniff and removed once those caches age out.
 
 CLI:
-    python helpers/pack_timelines.py --edit-dir <dir> [--merge]
+    python helpers/pack_timelines.py --edit-dir <dir> [--no-merge]
+
+By default emits all four files. Pass `--no-merge` to skip the unified
+view (rare — only useful when the per-lane files are all you want).
 """
 
 from __future__ import annotations
@@ -525,9 +535,19 @@ def main() -> None:
                          "audio_tags/, visual_caps/")
     ap.add_argument("--silence-threshold", type=float, default=0.5,
                     help="Break speech phrases on silences >= this (default 0.5s)")
-    ap.add_argument("--merge", action="store_true",
-                    help="Also emit merged_timeline.md (all 3 lanes "
-                         "interleaved by timestamp)")
+    # merged_timeline.md is the editor sub-agent's default reading
+    # surface (one file, all three lanes interleaved by timestamp), so
+    # we emit it by default. `--no-merge` is the opt-out for the rare
+    # case where only the per-lane files are wanted.
+    ap.add_argument("--no-merge", dest="merge", action="store_false",
+                    default=True,
+                    help="Skip merged_timeline.md (the unified, "
+                         "timestamp-interleaved view of all 3 lanes). "
+                         "Default is to emit it.")
+    ap.add_argument("--merge", dest="merge", action="store_true",
+                    help="(deprecated, no-op) merged_timeline.md is now "
+                         "emitted by default; this flag is kept for "
+                         "backward compatibility.")
     args = ap.parse_args()
 
     edit_dir = args.edit_dir.resolve()
