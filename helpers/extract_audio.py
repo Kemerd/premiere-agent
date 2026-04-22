@@ -91,6 +91,13 @@ def extract_audio_for(
 
     # Atomic write: extract to .tmp then rename. Prevents a partial WAV from
     # being left around when ffmpeg crashes / the user CTRL-C's mid-extract.
+    #
+    # Muxer note: the temp filename ends in ".wav.tmp", which ffmpeg cannot
+    # auto-detect a muxer for (it probes by extension, and ".tmp" isn't a
+    # known container). Without an explicit `-f wav` ffmpeg returns
+    # AVERROR(EINVAL) = -22 and refuses to open the output file. So we pin
+    # the muxer here instead of renaming the temp pattern — keeps the
+    # atomic-write semantics simple and matches the codec we asked for.
     tmp_path = wav_path.with_suffix(".wav.tmp")
     cmd = [
         "ffmpeg", "-y",
@@ -99,15 +106,34 @@ def extract_audio_for(
         "-ac", str(CHANNELS),
         "-ar", str(SAMPLE_RATE),
         "-c:a", "pcm_s16le",
+        "-f", "wav",
         str(tmp_path),
     ]
     if verbose:
         print(f"  audio_16k extract: {source_path.name}")
 
-    subprocess.run(
-        cmd, check=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    # We capture stderr (rather than DEVNULL it) so that on a non-zero exit
+    # we can re-raise with the actual ffmpeg diagnostic attached. Bare
+    # `check=True` only surfaces the exit code, which for ffmpeg is opaque
+    # (e.g. AVERROR(EINVAL) = -22 → 4294967274 on Windows) and forces the
+    # caller to re-run by hand to learn what actually went wrong.
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
     )
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stderr.splitlines()[-12:]) if proc.stderr else "(no stderr)"
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd,
+            output=None,
+            stderr=(
+                f"ffmpeg failed (exit {proc.returncode}) extracting audio from\n"
+                f"  {source_path}\n"
+                f"last lines of ffmpeg stderr:\n{tail}"
+            ),
+        )
 
     # On Windows you can't atomically rename onto an existing file with
     # os.rename if the destination exists. Path.replace handles that.
