@@ -2,16 +2,16 @@
 
 For an LLM editor to spot match cuts, identify shots, find B-roll
 candidates, or react to "show the part where they're using the drill",
-it needs *describable* visual context -- not raw frames. Florence-2-base
+it needs *describable* visual context — not raw frames. Florence-2-base
 (230M params, MIT Microsoft Research License) is the speed champion:
 
-    RTX 4090: 50-100 fps with batching, ~5 minutes for 10k frames
+    RTX 4090: 50–100 fps with batching, ~5 minutes for 10k frames
     RTX 3060: ~20 fps, ~10 minutes for 10k frames
 
 Sampling at 1 fps means a 3-hour shoot is ~10,800 frames. That's a 5-15
 min preprocess on consumer hardware which is the right ballpark.
 
-We use the `<MORE_DETAILED_CAPTION>` task -- Florence-2's most descriptive
+We use the `<MORE_DETAILED_CAPTION>` task — Florence-2's most descriptive
 mode. Sample output:
 
     "a person holding a cordless drill above a metal panel with visible
@@ -19,7 +19,7 @@ mode. Sample output:
 
 JSON shape:
     {
-      "model": "onnx-community/Florence-2-base",
+      "model": "microsoft/Florence-2-base",
       "fps": 1,
       "duration": 43.0,
       "captions": [
@@ -29,23 +29,6 @@ JSON shape:
         ...
       ]
     }
-
-Backend
--------
-ONNX Runtime via :mod:`florence_onnx` (custom 4-subgraph orchestrator
-with real beam=3, no_repeat_ngram=3, forced BOS/EOS -- algorithmically
-identical to the previous torch path) plus an optional multi-instance
-pool from :mod:`_florence_pool` for intra-batch parallelism on
-high-VRAM cards.
-
-Why not torch + transformers anymore: the ONNX path eliminates the
-torch + transformers + accelerate + optimum + timm + einops + flash-attn
-install set entirely (~3 GB of wheels, ~5s of cold-start eager
-imports), gives us 1.3-1.8x faster per-frame latency on a CUDA EP,
-and lets us opt into a TensorRT decoder for another ~1.5-2x via
-``VIDEO_USE_FLORENCE_TRT=1``.  Caption text is bit-for-bit identical
-within fp16 numerical noise -- same model weights, same logits
-processors, same beam scorer, same prompt strings.
 
 License note: Florence-2 ships under the MS Research License which is
 non-commercial. README documents this. SigLIP / BLIP-2 are drop-in
@@ -62,56 +45,44 @@ import sys
 import time
 from pathlib import Path
 
-# NOTE: no _hf_env import here -- the visual lane no longer touches
-# transformers (the previous torch path needed `USE_TF=0` guards to
-# avoid eager TensorFlow probe at import time; the ONNX path doesn't
-# import transformers at all).  audio_lane.py keeps the guard for CLAP.
+# CRITICAL: this import MUST come before anything that could pull in
+# `transformers` (directly OR transitively via timm, einops, etc.). It
+# sets `USE_TF=0` / `USE_FLAX=0` so transformers' module-load probe
+# doesn't eagerly import a possibly-broken TensorFlow install (classic
+# protobuf-version-mismatch crash on Windows). See `_hf_env.py` for
+# the full rationale.
+from _hf_env import HF_ENV_GUARDS_INSTALLED  # noqa: F401  - import for side effect
 
 # Sibling helpers folder is on sys.path when invoked from the orchestrator.
-# extract_audio is NOT used here -- visual lane is fully independent of
+# extract_audio is NOT used here — visual lane is fully independent of
 # the audio extraction step.
 from progress import install_lane_prefix, lane_progress
-from wealthy import (
-    FLORENCE_BATCH,
-    florence_pool_size,
-    is_wealthy,
-)
+from wealthy import FLORENCE_BATCH, is_wealthy
 
 
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
 
-# HF community ONNX export of Florence-2-base.  Same weights, same MIT
-# license, same task prompts as the original microsoft repo -- but
-# pre-converted to four ONNX subgraphs (vision_encoder, embed_tokens,
-# encoder_model, decoder_model_merged) for ORT consumption.  This is
-# the only Florence-2 repo on the Hub whose ONNX I/O contract matches
-# what the :mod:`florence_onnx` orchestrator expects, which is why the
-# default isn't user-configurable through the orchestrator -- changing
-# repos silently produces gibberish captions.
-DEFAULT_MODEL_ID = "onnx-community/Florence-2-base"
-
-# Legacy model ids users / scripts may still pass through.  Silently
-# remapped to DEFAULT_MODEL_ID with a one-time print warning so old
-# tests / cached configs don't crash on the rename.  The actual weights
-# are pretrained-equivalent; the ONNX repo just exports them with
-# identical numerics.
-_LEGACY_MODEL_REMAP: dict[str, str] = {
-    "microsoft/Florence-2-base":         DEFAULT_MODEL_ID,
-    "florence-community/Florence-2-base": DEFAULT_MODEL_ID,
-}
-
+# HF community port of Florence-2-base. Same weights / same MIT license /
+# same task prompts as `microsoft/Florence-2-base`, but uses the NATIVE
+# `Florence2ForConditionalGeneration` class shipped in transformers 4.55+
+# instead of the abandoned trust_remote_code modeling file. The original
+# microsoft repo's remote code broke against transformers' new attention
+# dispatcher contract (`_supports_sdpa` requirement) and HF themselves
+# now point users at this checkpoint as the canonical replacement —
+# see https://github.com/huggingface/transformers/issues/41622.
+DEFAULT_MODEL_ID = "florence-community/Florence-2-base"
 DEFAULT_FPS = 1
-DEFAULT_BATCH_SIZE = 8           # safe on 8 GB; orchestrator bumps via --wealthy
+DEFAULT_BATCH_SIZE = 8           # safe on 4 GB; orchestrator can override
 DEFAULT_TASK_PROMPT = "<MORE_DETAILED_CAPTION>"
 VISUAL_CAPS_SUBDIR = "visual_caps"
 
 
 # ---------------------------------------------------------------------------
-# Frame extraction -- 1 fps via ffmpeg, decoded to in-memory raw RGB.
-# For very long shoots, writing 10k PNGs to disk would be wasteful --
-# we stream raw rgb24 buffers through a Popen pipe instead.
+# Frame extraction — 1 fps via ffmpeg, decoded to in-memory PNGs (or PIL
+# Images via the imageio-ffmpeg generator). For very long shoots, writing
+# 10k PNGs to disk would be wasteful — we stream instead.
 # ---------------------------------------------------------------------------
 
 def _video_duration_s(video_path: Path) -> float:
@@ -128,25 +99,17 @@ def _video_duration_s(video_path: Path) -> float:
 
 
 def _iter_frames_at_fps(video_path: Path, fps: int):
-    """Yield (timestamp_s, ndarray uint8) for each sampled frame.
+    """Yield (timestamp_s, PIL.Image) for each sampled frame.
 
-    Yields raw NumPy arrays of shape ``(768, 768, 3) uint8`` -- exactly
-    the format :class:`florence_onnx.FlorenceCaptioner.caption_batch`
-    expects (the ONNX path bypasses PIL entirely; the previous torch
-    path needed PIL.Image instances for the HF processor's resize +
-    rescale chain, but our pure-NumPy
-    :class:`_florence_processor.FlorenceImageProcessor` operates on
-    ndarrays directly, saving a Python-side allocation per frame).
-
-    Uses imageio_ffmpeg's bundled ffmpeg binary to stream raw RGB out
-    of ffmpeg without writing PNGs to disk.  ~3x faster than the disk
-    roundtrip for long shoots and avoids leaving thousands of stale
-    PNGs in the edit dir.
+    Uses imageio_ffmpeg to stream raw RGB out of ffmpeg without writing
+    PNGs to disk. This is ~3x faster than the disk roundtrip for long
+    shoots and avoids leaving thousands of stale PNGs in the edit dir.
     """
     import numpy as np
+    from PIL import Image
     import imageio_ffmpeg
 
-    # Probe size first -- imageio_ffmpeg needs explicit (w, h) for raw read.
+    # Probe size first — imageio_ffmpeg needs explicit (w, h) for raw read.
     probe_cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -168,35 +131,39 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
     # Why crop:
     #   Florence-2's vision tower has a hard assertion that the encoded
     #   feature map is square (`assert h * w == num_tokens, 'only
-    #   support square feature maps for now'` -- `modeling_florence2.py`
-    #   line ~2610).  With non-square pixel_values (e.g. 16:9 4K DJI
+    #   support square feature maps for now'` — `modeling_florence2.py`
+    #   line ~2610). With non-square pixel_values (e.g. 16:9 4K DJI
     #   footage) the embedding produces a non-square map and the
-    #   assertion explodes mid-generate.  Same constraint applies to
-    #   the ONNX export -- the vision_encoder.onnx graph carries the
-    #   same fixed-size positional embedding lookup.
+    #   assertion explodes mid-generate.
     #
     # Why scale to 768:
     #   Florence-2-base ships with a fixed-size learned positional
-    #   embedding table sized for 768x768 / patch_size=32 -> 24x24=576
-    #   tokens.  Hand it any other resolution and the patch embedding
-    #   indexes out-of-bounds -> device-side assert (which surfaces as
-    #   a misleading async CUDA error on the next op).
+    #   embedding table sized for 768x768 / patch_size=32 → 24x24=576
+    #   tokens. Hand it any other resolution and `image_pos_embed(x)`
+    #   indexes out-of-bounds → device-side assert (which surfaces as a
+    #   misleading async CUDA error on the next op). transformers 5.x's
+    #   CLIPImageProcessor *should* resize for us via its `do_resize`
+    #   path, but the size-dict-vs-shortest-edge interpretation got
+    #   reshuffled in the 5.x rewrite and the resize is silently a
+    #   no-op on already-square inputs at non-default resolutions. We
+    #   short-circuit the ambiguity by handing the processor exactly
+    #   what its embedding table expects.
     #
     # Why ffmpeg-side crop+scale instead of PIL post-decode:
     #   1. ffmpeg does both ops BEFORE rgb24 conversion, so the pipe
     #      carries `768*768*3 = 1.7 MB` per frame instead of
-    #      `width * height * 3` (4K = ~25 MB).  ~14x reduction in pipe
+    #      `width * height * 3` (4K = ~25 MB). ~14x reduction in pipe
     #      bandwidth + Python-side allocator churn at 1 fps over a
     #      multi-hour shoot.
     #   2. PIL.Image.{crop,resize} would force temporary copies in
     #      user-space Python; ffmpeg's filter graph does both inside
     #      the decoder with zero extra allocation.
     #   3. ffmpeg's `lanczos` resampler is higher quality than PIL's
-    #      default (bilinear) for big downscales -- meaningful for
+    #      default (bilinear) for big downscales — meaningful for
     #      detail-rich captioning targets.
     #
     # We center-crop to `min(width, height)` so portrait, landscape,
-    # and already-square footage all become square.  ffmpeg's `crop`
+    # and already-square footage all become square. ffmpeg's `crop`
     # filter defaults to centered when x/y are omitted.
     # ------------------------------------------------------------------
     square_dim = min(width, height)
@@ -209,7 +176,7 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
         # Filter chain order matters: fps decimation FIRST (cheap, drops
         # ~95% of frames before we pay the crop+scale cost), THEN crop
         # to square, THEN scale to Florence's native size with lanczos
-        # for sharp downscaling.  Order of crop->scale (rather than the
+        # for sharp downscaling. Order of crop->scale (rather than the
         # reverse) saves ffmpeg a needless aspect-preserving resize.
         "-vf",
         f"fps={fps},crop={square_dim}:{square_dim},"
@@ -221,8 +188,8 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
     # Subprocess.Popen so we can stream stdout in frame-sized chunks.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    # Per-frame size reflects the FINAL output of the filter chain --
-    # post-crop, post-scale.  Misreading this would mis-frame every
+    # Per-frame size reflects the FINAL output of the filter chain —
+    # post-crop, post-scale. Misreading this would mis-frame every
     # chunk and yield garbage / a hang on the final partial chunk.
     frame_size = target_dim * target_dim * 3
     t = 0
@@ -231,16 +198,11 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
             buf = proc.stdout.read(frame_size)
             if not buf or len(buf) < frame_size:
                 break
-            # `frombuffer` returns a read-only view onto the bytes
-            # buffer.  `.copy()` materializes our own writable buffer
-            # so the next `proc.stdout.read()` doesn't reuse the same
-            # underlying memory and silently mutate frames we've
-            # already yielded.  np.frombuffer is the fast path here
-            # (no Python-level loop, just a buffer protocol cast).
             arr = np.frombuffer(buf, dtype=np.uint8).reshape(
-                target_dim, target_dim, 3,
-            ).copy()
-            yield t, arr
+                target_dim, target_dim, 3
+            )
+            # Florence-2 takes PIL images. Conversion is cheap (no copy).
+            yield t, Image.fromarray(arr, mode="RGB")
             t += 1
     finally:
         try:
@@ -251,128 +213,115 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
 
 
 # ---------------------------------------------------------------------------
-# Florence-2 ONNX captioner construction.
+# Florence-2 model construction.
 #
-# Replaces the old `_build_florence` torch path.  The new flow:
+# We use `florence-community/Florence-2-base` — the HF-format port of
+# `microsoft/Florence-2-base` that ships with the NATIVE
+# `Florence2ForConditionalGeneration` class (added to transformers in
+# 4.55). No `trust_remote_code`, no remote modeling file, no monkey
+# patches required for the four 5.x dispatcher / cache / tokenizer
+# breakages we used to carry. HF themselves point users at the
+# community port now; see issue #41622.
 #
-#   1. download_florence_onnx() -- HF snapshot_download of the four
-#      ONNX subgraphs + tokenizer.json + config.json, cached in
-#      ~/.cache/huggingface.  Idempotent; subsequent calls hit cache.
-#   2. FlorenceCaptionerPool(model_dir, desired_size=N, dtype=...,
-#      quantized_decoder=...) -- builds N independent captioner
-#      instances, each with its own four ORT sessions.  VRAM-clamped
-#      so passing N=4 on an 8 GB card silently degrades to N=2.
-#
-# The pool is built ONCE per process and reused across every video in
-# the batch.  Same pattern as the old torch model load -- amortizing
-# the ~3-5s load cost is what makes batching across many videos worth
-# it vs. one-process-per-video.
+# Same weights, same MIT license, same task prompts (`<MORE_DETAILED_CAPTION>`
+# etc.) as the original microsoft repo — just the loading mechanics changed.
 # ---------------------------------------------------------------------------
 
+def _build_florence(model_id: str, device: str, dtype_name: str):
+    """Construct Florence-2 from the HF community port.
 
-def _resolve_model_id(model_id: str) -> str:
-    """Map legacy / torch-era model ids to the ONNX-community equivalent.
-
-    The visual lane previously defaulted to ``microsoft/Florence-2-base``
-    or ``florence-community/Florence-2-base``; both are the same weights
-    in different HF repo layouts.  The ONNX path needs the
-    ``onnx-community/Florence-2-base`` repo (which has the four
-    pre-exported ONNX subgraphs).  We remap silently with a one-time
-    notice so old test scripts and cached env vars don't crash.
+    Uses the native `Florence2ForConditionalGeneration` class shipped in
+    transformers 4.55+ — no `trust_remote_code`, no remote modeling file,
+    no monkey patches. Falls back to `AutoModelForImageTextToText` if the
+    explicit class import fails (forward-compatible with transformers
+    moving the class around in future minor releases).
     """
-    if model_id in _LEGACY_MODEL_REMAP:
-        new_id = _LEGACY_MODEL_REMAP[model_id]
-        if model_id != new_id:
-            print(
-                f"  visual_lane: remapping legacy model id "
-                f"{model_id!r} -> {new_id!r} (ONNX export of the same weights)"
-            )
-        return new_id
-    return model_id
+    import torch
+    from transformers import AutoProcessor
+
+    # Tiny version sniff to pick the right dtype kwarg name.
+    # transformers 5.x renamed `torch_dtype` -> `dtype` and emits a
+    # DeprecationWarning on every load if the old name is used. 4.x
+    # still requires `torch_dtype`. One cheap probe at load time
+    # silences the noise on 5.x without breaking the 4.55-4.x range.
+    import transformers as _tf
+    _tf_major = int(_tf.__version__.split(".", 1)[0])
+
+    dtype_map = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
+    if dtype_name not in dtype_map:
+        raise ValueError(f"unknown dtype '{dtype_name}'")
+    torch_dtype = dtype_map[dtype_name]
+    dtype_kwarg = {"dtype": torch_dtype} if _tf_major >= 5 else {"torch_dtype": torch_dtype}
+
+    # Prefer the explicit class import — it's the path the model card
+    # documents and gives us a clear ImportError if the user's
+    # transformers is too old (< 4.55, before the class was added).
+    # Fall back to AutoModelForImageTextToText, which is Florence-2's
+    # registered Auto class per its config.json. Both paths are
+    # zero-cost — they resolve to the same class object.
+    try:
+        from transformers import Florence2ForConditionalGeneration as _ModelCls
+    except ImportError:
+        from transformers import AutoModelForImageTextToText as _ModelCls
+
+    print(f"  florence: model={model_id}  device={device}  dtype={dtype_name}")
+
+    # No trust_remote_code — community port ships native HF code.
+    # `.to(device)` after `.from_pretrained()` is fine here; we don't
+    # use device_map="auto" because we want hard, predictable placement
+    # for the multi-process VRAM accounting in the orchestrator.
+    model = _ModelCls.from_pretrained(model_id, **dtype_kwarg).to(device).eval()
+    processor = AutoProcessor.from_pretrained(model_id)
+    return model, processor, torch_dtype
 
 
-def _build_pool(
-    model_id: str,
-    *,
-    dtype_name: str,
-    quantized_decoder: bool,
-    pool_size: int,
-):
-    """Download the ONNX snapshot + build a FlorenceCaptionerPool.
+# ---------------------------------------------------------------------------
+# Batched inference
+# ---------------------------------------------------------------------------
 
-    Args:
-        model_id: HF Hub repo id.  Auto-remapped via
-            :func:`_resolve_model_id` if the caller passed a legacy
-            torch-era id.
-        dtype_name: ``"mixed"`` (default, recommended), ``"fp16"``
-            (CURRENTLY BROKEN -- the upstream onnx-community fp16
-            decoder graph won't load on ORT >= 1.16; kept for the
-            day they re-export it cleanly), or ``"fp32"`` (the
-            paranoid quality reference, matches the transformers.js
-            README example exactly).  ``"bf16"`` is silently mapped
-            to ``"mixed"`` for backward compat with the old torch
-            CLI -- ORT's CUDA EP doesn't carry a bf16 path for
-            Florence-2's ops at the time of writing.
-        quantized_decoder: When True, use the q4f16 decoder weights.
-            **Currently broken upstream** with the same outer-scope
-            subgraph bug as the fp16 decoder; kept wired for the day
-            it gets re-exported cleanly.
-        pool_size: Number of parallel captioner instances.  Pool clamps
-            this down if VRAM is tight.
+def _caption_batch(model, processor, images, *, device: str, torch_dtype, task: str) -> list[str]:
+    """Run Florence-2 on a list of PIL images, return parsed captions."""
+    import torch
 
-    Returns:
-        A ready-to-use :class:`_florence_pool.FlorenceCaptionerPool`.
-        Caller is responsible for ``.close()`` (or use the returned
-        object as a context manager).
-    """
-    # Lazy imports keep module load cheap.  The orchestrator's import
-    # probe just wants to confirm `import visual_lane` works -- it
-    # shouldn't pay the ORT-init cost until an actual run starts.
-    from florence_onnx import download_florence_onnx
-    from _florence_pool import FlorenceCaptionerPool
+    inputs = processor(
+        text=[task] * len(images),
+        images=images,
+        return_tensors="pt",
+        padding=True,
+    ).to(device, dtype=torch_dtype)
 
-    resolved_id = _resolve_model_id(model_id)
+    # input_ids must remain int — only the visual / float tensors get
+    # promoted to fp16. Restore them after the .to() above moved everything.
+    if "input_ids" in inputs:
+        inputs["input_ids"] = inputs["input_ids"].long()
+    if "attention_mask" in inputs:
+        inputs["attention_mask"] = inputs["attention_mask"].long()
 
-    # Coerce dtype_name to the captioner's accepted set.  bf16 maps
-    # to "mixed" because the ONNX exports are fp16/fp32-only and the
-    # mixed mode gives the closest "fast but functional" experience
-    # to the old torch bf16 path.  Anything else falls through to
-    # the captioner's strict ValueError.
-    if dtype_name == "bf16":
-        print(
-            "  visual_lane: dtype 'bf16' is not supported by the ONNX path; "
-            "falling back to 'mixed' (fp16 vision/encoder + fp32 decoder)"
+    with torch.inference_mode():
+        generated_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=256,
+            do_sample=False,
+            num_beams=3,
         )
-        dtype_name = "mixed"
-    if dtype_name not in ("mixed", "fp16", "fp32"):
-        raise ValueError(
-            f"unknown dtype '{dtype_name}'; valid: mixed, fp16, fp32"
+
+    raw_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
+    out: list[str] = []
+    for raw, img in zip(raw_texts, images):
+        parsed = processor.post_process_generation(
+            raw, task=task, image_size=(img.width, img.height),
         )
-
-    print(
-        f"  florence-onnx: model={resolved_id}  dtype={dtype_name}  "
-        f"quantized_decoder={quantized_decoder}  pool_size={pool_size}"
-    )
-
-    model_dir = download_florence_onnx(
-        model_id=resolved_id,
-        dtype=dtype_name,
-        quantized_decoder=quantized_decoder,
-    )
-
-    pool = FlorenceCaptionerPool(
-        model_dir,
-        desired_size=pool_size,
-        dtype=dtype_name,
-        quantized_decoder=quantized_decoder,
-    )
-    return pool
+        # post_process_generation returns {task: caption_str} for caption tasks.
+        text = parsed.get(task, "") if isinstance(parsed, dict) else str(parsed)
+        out.append(str(text).strip())
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Dedup: collapse consecutive identical (or near-identical) captions to
-# "(same)" markers in the markdown view.  Saves ~30-50% on tokens for
-# static / slow-moving footage.  We keep all raw text in the JSON cache
+# "(same)" markers in the markdown view. Saves ~30-50% on tokens for
+# static / slow-moving footage. We keep all raw text in the JSON cache
 # so re-rendering with a different dedup policy is just a pack-step rerun.
 # ---------------------------------------------------------------------------
 
@@ -401,36 +350,24 @@ def _dedup_consecutive(captions: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _process_one(
-    pool,
+    model,
+    processor,
+    torch_dtype,
     video_path: Path,
     edit_dir: Path,
     *,
     model_id: str,
     fps: int,
     batch_size: int,
+    device: str,
     task: str,
-    num_beams: int,
-    max_new_tokens: int,
     force: bool,
 ) -> Path:
-    """Caption one video with an already-built FlorenceCaptionerPool.
+    """Caption one video with already-built Florence model + processor.
 
-    Split out so the batch entry point can amortize the ~3-5s pool load
+    Split out so the batch entry point can amortize the ~3s Florence load
     across many videos in one Python process.
-
-    Memory strategy
-    ---------------
-    We accumulate frames into a buffer of at most
-    ``batch_size * pool.size`` ndarrays before dispatching to
-    ``pool.caption_batch``.  Each frame is ~1.7 MB (768*768*3 uint8)
-    so even with batch=32 and pool=2 the buffer ceiling is ~110 MB --
-    safe even for hour-long shoots.  Bounded buffer means hour-long
-    inputs don't blow up Python heap; the trade-off is that the pool
-    sits idle for ~50 ms while we extract the next chunk.  Acceptable
-    overhead at our caption latency (~300-600 ms per chunk).
     """
-    import numpy as np  # noqa: F401  - kept for downstream symmetry
-
     out_dir = (edit_dir / VISUAL_CAPS_SUBDIR).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{video_path.stem}.json"
@@ -445,94 +382,56 @@ def _process_one(
 
     duration = _video_duration_s(video_path)
     expected_frames = max(1, int(math.ceil(duration * fps)))
-    buffer_cap = max(1, batch_size * pool.size)
-    print(
-        f"  florence: {video_path.name}  duration={duration:.1f}s  "
-        f"frames~{expected_frames} @ {fps}fps  batch={batch_size}  "
-        f"pool={pool.size}  buffer={buffer_cap}"
-    )
+    print(f"  florence: {video_path.name}  duration={duration:.1f}s  "
+          f"frames~{expected_frames} @ {fps}fps  batch={batch_size}")
 
     captions: list[dict] = []
-    # buffer_imgs / buffer_ts grow together; we never index one without
-    # the other, and they get cleared in lockstep after each dispatch.
-    buffer_imgs: list = []
-    buffer_ts: list[int] = []
+    batch_imgs: list = []
+    batch_ts: list[int] = []
     t0 = time.time()
 
-    # Per-frame progress is genuinely informative here -- Florence is
-    # the slow lane, so users want to see frames-per-second crawl
-    # forward.  We tick once per BATCH (not per frame) to keep emit
-    # volume sane.  When pool.size > 1 the chunk-complete callback
-    # advances by chunk size as each worker finishes, so progress
-    # updates feel smoother than a single end-of-buffer jump.
+    # Per-frame progress is genuinely informative here — Florence is the
+    # slow lane, so users want to see frames-per-second crawl forward.
+    # We tick once per BATCH (not per frame) to keep emit volume sane,
+    # advancing by `len(batch)` each time.
     with lane_progress(
         "visual",
         total=expected_frames,
         unit="frame",
         desc=f"florence captions: {video_path.name}",
     ) as fbar:
-
-        # Closure: pool.caption_batch fires this from worker threads
-        # as each chunk finishes.  lane_progress.update is thread-safe
-        # (counter increment + structured print), so calling from
-        # multiple workers concurrently is fine.
-        def _on_chunk_done(_chunk_idx: int, n_frames: int, _captions: list[str]) -> None:
-            fbar.update(advance=n_frames)
-
-        def _flush() -> None:
-            """Send accumulated buffer through the pool, drain results, repeat."""
-            if not buffer_imgs:
-                return
-            # `chunk_size=batch_size` slices the buffer into pool.size
-            # equal chunks of <= batch_size each so every worker gets
-            # a full chunk in parallel.  When pool.size == 1 this is
-            # a single-chunk dispatch (one worker submit + join, ~50us
-            # of overhead -- negligible vs. caption latency).
-            texts = pool.caption_batch(
-                buffer_imgs,
-                task=task,
-                num_beams=num_beams,
-                max_new_tokens=max_new_tokens,
-                chunk_size=batch_size,
-                on_chunk_complete=_on_chunk_done,
-            )
-            # Splat results back into the per-frame caption list,
-            # preserving the input order (pool guarantees this even
-            # though chunks may complete out-of-order across workers).
-            for tt, txt in zip(buffer_ts, texts):
-                captions.append({"t": tt, "text": txt})
-            buffer_imgs.clear()
-            buffer_ts.clear()
-
         for ts, img in _iter_frames_at_fps(video_path, fps):
-            buffer_imgs.append(img)
-            buffer_ts.append(ts)
-            if len(buffer_imgs) >= buffer_cap:
-                _flush()
+            batch_imgs.append(img)
+            batch_ts.append(ts)
+            if len(batch_imgs) >= batch_size:
+                texts = _caption_batch(
+                    model, processor, batch_imgs,
+                    device=device, torch_dtype=torch_dtype, task=task,
+                )
+                for tt, txt in zip(batch_ts, texts):
+                    captions.append({"t": tt, "text": txt})
+                fbar.update(advance=len(batch_imgs))
+                batch_imgs.clear()
+                batch_ts.clear()
 
-        # Trailing partial buffer.  Dispatch even if it's < buffer_cap
-        # so we don't drop the tail of the video.
-        _flush()
+        # Flush trailing partial batch.
+        if batch_imgs:
+            texts = _caption_batch(
+                model, processor, batch_imgs,
+                device=device, torch_dtype=torch_dtype, task=task,
+            )
+            for tt, txt in zip(batch_ts, texts):
+                captions.append({"t": tt, "text": txt})
+            fbar.update(advance=len(batch_imgs))
 
     dt = time.time() - t0
 
     captions_md = _dedup_consecutive(captions)
     payload = {
-        # Use the pool's effective model_id (which encodes the
-        # quantized-decoder suffix when the q4f16 variant is loaded)
-        # so the JSON sidecar accurately identifies which Florence
-        # variant produced these captions.  Falls back to the
-        # caller-provided model_id if the pool didn't expose one.
-        "model": getattr(pool, "model_id", model_id),
+        "model": model_id,
         "task": task,
         "fps": fps,
         "duration": round(duration, 3),
-        # Generation knobs preserved in the sidecar so a downstream
-        # consumer can verify the captions were produced with beam-3
-        # (vs. greedy beam=1 from --num-beams 1).  Cheap to record
-        # and useful for debugging caption-quality regressions.
-        "num_beams": num_beams,
-        "max_new_tokens": max_new_tokens,
         "captions": captions,            # raw
         "captions_dedup": captions_md,   # display copy
     }
@@ -542,7 +441,7 @@ def _process_one(
 
     rate = len(captions) / max(1e-3, dt)
     print(f"  visual_lane done: {len(captions)} captions, {dt:.1f}s wall "
-          f"({rate:.1f} fps) -> {out_path.name}")
+          f"({rate:.1f} fps) → {out_path.name}")
     return out_path
 
 
@@ -553,86 +452,14 @@ def run_visual_lane_batch(
     model_id: str = DEFAULT_MODEL_ID,
     fps: int = DEFAULT_FPS,
     batch_size: int = DEFAULT_BATCH_SIZE,
-    device: str | None = "cuda:0",       # kept for backward compat (no-op on ONNX path)
-    # "mixed" = fp16 vision/embed/encoder + fp32 decoder.  Default
-    # because the upstream onnx-community fp16 decoder export is
-    # structurally invalid and won't load on ORT >= 1.16 (see
-    # florence_onnx.py module-top docs for the full story).
-    dtype_name: str = "mixed",
+    device: str = "cuda:0",
+    dtype_name: str = "fp16",
     task: str = DEFAULT_TASK_PROMPT,
-    num_beams: int | None = None,
-    max_new_tokens: int | None = None,
-    quantized: bool = False,
-    pool_size: int | None = None,
-    wealthy: bool = False,
     force: bool = False,
 ) -> list[Path]:
-    """Run the visual lane on N videos with Florence-2 loaded ONCE.
-
-    Args:
-        video_paths: Source videos.  All sidecar JSONs land in
-            ``edit_dir / visual_caps / <stem>.json``.
-        edit_dir: Per-project edit directory.
-        model_id: HF Hub repo.  Defaults to the ONNX community port;
-            legacy torch-era ids (``microsoft/Florence-2-base``,
-            ``florence-community/Florence-2-base``) are remapped
-            silently for backward compatibility.
-        fps: Sampling rate.  1 fps is the recommended default.
-        batch_size: Per-captioner batch size for the vision encoder
-            and beam-search dispatch.  Bigger = better GPU utilization
-            but more VRAM peak.  Default 8 fits on 8 GB cards;
-            ``--wealthy`` bumps to 32.
-        device: LEGACY no-op kwarg.  The ONNX path picks the device
-            from the EP ladder (``CUDAExecutionProvider`` on NVIDIA,
-            ``DmlExecutionProvider`` on Windows non-NVIDIA, etc.) --
-            see :mod:`_onnx_providers`.  Kept on the signature so the
-            orchestrator's ``--device cuda:0`` flag passthrough doesn't
-            crash; ignored at runtime.
-        dtype_name: ``"mixed"`` (default, recommended), ``"fp16"``
-            (broken upstream until they re-export the decoder), or
-            ``"fp32"`` (paranoid quality reference).  ``"bf16"``
-            silently maps to ``"mixed"`` (no ONNX bf16 export
-            available).
-        task: Florence task token.  ``<MORE_DETAILED_CAPTION>`` is the
-            default; OD/OCR/region tasks intentionally raise.
-        num_beams: Beam width override.  ``None`` -> Florence default
-            (3).  Set to 1 for greedy decoding (~1.5-2x faster, slight
-            quality drop on detailed captions).
-        max_new_tokens: Hard generation cap override.  ``None`` ->
-            Florence default (256).  Smaller caps speed up worst-case
-            beams that would otherwise generate to the limit.
-        quantized: Use the q4f16 decoder weight variant (~1.5-2x
-            decoder speedup, very minor caption drift on long
-            generations).
-        pool_size: Override the auto-resolved pool size.  ``None``
-            falls through to ``florence_pool_size(wealthy)``.
-        wealthy: Forwarded to ``florence_pool_size`` and used as a
-            second source of truth for ``is_wealthy``.  The
-            orchestrator already propagates ``VIDEO_USE_WEALTHY=1``
-            via env so passing ``wealthy=True`` here is rarely needed.
-        force: Bypass the per-video sidecar cache and re-caption.
-
-    Returns:
-        List of output JSON paths in the same order as ``video_paths``.
-    """
-    # `device` is intentionally accepted but ignored.  The lane's
-    # subprocess shim (`preprocess.py::_run_lane`) passes
-    # `--device cuda:0` blindly for every lane; failing on it would
-    # break the orchestrator without giving us anything in return.
-    del device
-
-    # Lazy imports inside this function so just `import visual_lane`
-    # (the orchestrator's import probe) doesn't pay the ORT init cost.
-    from florence_onnx import DEFAULT_NUM_BEAMS, DEFAULT_MAX_NEW_TOKENS
-
+    """Run the visual lane on N videos with Florence-2 loaded ONCE."""
     out_dir = (edit_dir / VISUAL_CAPS_SUBDIR).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # All-cache-hit short-circuit: if every output is fresh we skip
-    # the expensive pool load entirely.  Same logic as the old torch
-    # path -- still worth it because the ONNX pool load (~3-5s for 4
-    # sessions x N instances) is faster than the old torch load (~5-8s)
-    # but still meaningful when running orchestrator dry-runs.
     if not force:
         all_fresh = True
         for v in video_paths:
@@ -645,46 +472,14 @@ def run_visual_lane_batch(
                 all_fresh = False
                 break
         if all_fresh:
-            print(
-                f"  visual_lane: all {len(video_paths)} cache hits, "
-                f"skipping model load"
-            )
+            print(f"  visual_lane: all {len(video_paths)} cache hits, skipping model load")
             return [out_dir / f"{v.stem}.json" for v in video_paths]
 
-    # Resolve generation hyperparameters with Florence defaults if
-    # caller didn't override.  Done here (not at the kwarg default)
-    # so the caller can pass `num_beams=None` to get the model default
-    # without us having to introspect the captioner.
-    eff_beams = DEFAULT_NUM_BEAMS if num_beams is None else int(num_beams)
-    eff_max_new = (
-        DEFAULT_MAX_NEW_TOKENS if max_new_tokens is None else int(max_new_tokens)
-    )
-    if eff_beams < 1:
-        raise ValueError(f"num_beams must be >= 1, got {num_beams}")
-    if eff_max_new < 1:
-        raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
-
-    # Resolve pool size.  Explicit `pool_size` arg wins; else the
-    # wealthy-tier resolver (which checks env + CLI flag).  The pool
-    # itself further clamps to fit available VRAM at construction.
-    eff_pool_size = (
-        int(pool_size)
-        if pool_size is not None and pool_size >= 1
-        else florence_pool_size(wealthy)
-    )
-
-    # Build the pool ONCE per process.  Single load amortizes across
-    # every video in this batch.
-    pool = _build_pool(
-        model_id,
-        dtype_name=dtype_name,
-        quantized_decoder=bool(quantized),
-        pool_size=eff_pool_size,
-    )
+    model, processor, torch_dtype = _build_florence(model_id, device, dtype_name)
     out_paths: list[Path] = []
     try:
         # Outer bar tracks video-of-N progress; inner per-frame bar
-        # (in _process_one) tracks current-video frame progress.  Both
+        # (in _process_one) tracks current-video frame progress. Both
         # emit their own structured PROGRESS lines so the orchestrator
         # / Claude can render either granularity.
         with lane_progress(
@@ -696,22 +491,18 @@ def run_visual_lane_batch(
             for v in video_paths:
                 vbar.start_item(v.name)
                 out_paths.append(_process_one(
-                    pool, v, edit_dir,
-                    model_id=model_id,
-                    fps=fps,
-                    batch_size=batch_size,
-                    task=task,
-                    num_beams=eff_beams,
-                    max_new_tokens=eff_max_new,
-                    force=force,
+                    model, processor, torch_dtype, v, edit_dir,
+                    model_id=model_id, fps=fps, batch_size=batch_size,
+                    device=device, task=task, force=force,
                 ))
                 vbar.update(advance=1, item=v.name)
     finally:
         try:
-            pool.close()
+            import torch
+            del model, processor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception:
-            # Pool close is best-effort; a leak here would be cleaned
-            # up by the subprocess teardown anyway.
             pass
     return out_paths
 
@@ -731,7 +522,7 @@ def run_visual_lane(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Visual lane: Florence-2 ONNX captions at N fps",
+        description="Visual lane: Florence-2 captions at N fps",
     )
     ap.add_argument("video", type=Path, help="Path to source video file")
     ap.add_argument(
@@ -743,44 +534,14 @@ def main() -> None:
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS,
                     help=f"Sample rate in frames/sec (default: {DEFAULT_FPS})")
     ap.add_argument("--batch-size", type=int, default=None,
-                    help=f"Per-captioner batch size (default: {DEFAULT_BATCH_SIZE}, "
+                    help=f"Inference batch size (default: {DEFAULT_BATCH_SIZE}, "
                          f"or {FLORENCE_BATCH} with --wealthy)")
-    ap.add_argument("--num-beams", type=int, default=None,
-                    help="Beam search width (default: 3 to match Florence-2's "
-                         "training config; pass 1 for greedy decoding -- "
-                         "~1.5-2x faster, slight caption-quality drop)")
-    ap.add_argument("--max-new-tokens", type=int, default=None,
-                    help="Hard cap on generated tokens per caption "
-                         "(default: 256)")
-    ap.add_argument("--quantized", action="store_true",
-                    help="Use the q4f16 decoder weight variant. ~1.5-2x "
-                         "faster decoder step on a CUDA EP, very minor "
-                         "caption drift on long generations. Vision + text "
-                         "encoder stay fp16.")
-    ap.add_argument("--pool-size", type=int, default=None,
-                    help="Number of parallel FlorenceCaptioner instances "
-                         "(default: 1, or 2 with --wealthy). The pool clamps "
-                         "this down if VRAM is tight; override with "
-                         "VIDEO_USE_FLORENCE_POOL_SIZE=<N> too.")
     ap.add_argument("--wealthy", action="store_true",
-                    help="Speed knob for 24GB+ cards (4090/5090). Bigger "
-                         "batch + parallel captioner pool, same model + "
-                         "outputs. Also reads VIDEO_USE_WEALTHY=1.")
-    # `--device` retained for backward compat with the orchestrator's
-    # subprocess shim, which passes `--device cuda:0` to every lane.
-    # The ONNX path resolves the device via the EP ladder, not this
-    # flag; we accept and ignore.
-    ap.add_argument("--device", default=None,
-                    help="LEGACY: ignored on the ONNX path. EP selection "
-                         "lives in helpers/_onnx_providers.py "
-                         "(VIDEO_USE_FLORENCE_TRT=1 opts into TensorRT).")
-    ap.add_argument("--dtype", default="mixed",
-                    choices=["mixed", "fp16", "fp32", "bf16"],
-                    help="ONNX dtype mode. 'mixed' (default) = fp16 "
-                         "vision/encoder + fp32 decoder; 'fp16' is broken "
-                         "upstream right now (decoder graph rejects on ORT); "
-                         "'fp32' is the paranoid reference; 'bf16' falls "
-                         "back to 'mixed'.")
+                    help="Speed knob for 24GB+ cards (4090/5090). Bigger batch, "
+                         "same model + outputs. Also reads VIDEO_USE_WEALTHY=1.")
+    ap.add_argument("--device", default="cuda:0",
+                    help="Torch device: cuda:0, mps, cpu (default: cuda:0)")
+    ap.add_argument("--dtype", default="fp16", choices=["fp16", "fp32", "bf16"])
     ap.add_argument("--task", default=DEFAULT_TASK_PROMPT,
                     help="Florence task prompt (default: <MORE_DETAILED_CAPTION>)")
     ap.add_argument("--force", action="store_true",
@@ -812,11 +573,6 @@ def main() -> None:
         device=args.device,
         dtype_name=args.dtype,
         task=args.task,
-        num_beams=args.num_beams,
-        max_new_tokens=args.max_new_tokens,
-        quantized=args.quantized,
-        pool_size=args.pool_size,
-        wealthy=args.wealthy,
         force=args.force,
     )
 

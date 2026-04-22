@@ -2,22 +2,12 @@
 # ---------------------------------------------------------------------------
 # video-use-premiere bootstrap (Linux / macOS).
 #
-# Idempotent. As of the Florence-2 ONNX port, the default [preprocess]
-# install is torch-FREE — both the speech lane (Parakeet ONNX) and the
-# visual lane (Florence-2 ONNX, helpers/florence_onnx.py) run on
-# ONNX Runtime via the bundled CUDA / TensorRT EPs.
+# Idempotent. Honors TORCH_INDEX env var so CPU-only / ROCm users can swap:
+#   TORCH_INDEX=https://download.pytorch.org/whl/cpu     ./install.sh
+#   TORCH_INDEX=https://download.pytorch.org/whl/rocm6.0 ./install.sh
 #
-# TORCH_INDEX is now LEGACY — only consulted if the user opts into the
-# [diarize] extra (which pulls pyannote.audio, the only remaining
-# torch-dependent component) via INSTALL_DIARIZE=1.
-#
-#   INSTALL_DIARIZE=1 ./install.sh                                # default torch index
-#   INSTALL_DIARIZE=1 TORCH_INDEX=https://download.pytorch.org/whl/cpu \
-#       ./install.sh                                              # CPU-only diarize
-#
-# Default ONNX Runtime CUDA EP target is CUDA 12.x via the cuDNN
-# bundled with onnxruntime-gpu>=1.22 — no separate torch CUDA install
-# is required for the speech / visual lanes.
+# Default is CUDA 12.1 wheels which match the cuDNN bundled with the
+# ONNX Runtime CUDA EP shipped in the onnxruntime-gpu>=1.22 wheel matrix.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -35,41 +25,26 @@ fi
 
 # ---------------------------------------------------------------------------
 # 1. Pip itself first. An old pip refuses modern wheel selectors and you'll
-#    end up downloading years-old wheels that can't load Florence-2 ONNX.
+#    end up downloading a years-old transformers that can't load Florence-2.
 # ---------------------------------------------------------------------------
 echo "[video-use-premiere] upgrading pip"
 "$PYTHON" -m pip install --upgrade pip
 
 # ---------------------------------------------------------------------------
-# 2. The package itself + the heavy preprocess + fcpxml extras. We don't
-#    pull [diarize] by default because pyannote pulls torch (the ONLY
-#    remaining torch-dependent component) and most users won't need
-#    speaker IDs.
-#
-#    The [preprocess] extra now installs:
-#      - onnx-asr[gpu,hub] + onnxruntime-gpu (speech + visual ONNX runtime)
-#      - tensorrt-cu12-libs (opt-in TensorRT EP for both lanes)
-#      - tokenizers + huggingface_hub (Florence-2 BART tokenizer + weights)
-#      - imageio-ffmpeg (frame extraction for visual_lane)
-#      - transformers (CLAP audio lane processor only — no torch needed
-#        for transformers' tokenizer/feature-extractor code paths)
-#      - soundfile + soxr (WAV I/O + fast resample)
+# 2. PyTorch from the right index. Done explicitly because pip can't pick
+#    CUDA vs CPU vs ROCm from PyPI alone.
+# ---------------------------------------------------------------------------
+TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu121}"
+echo "[video-use-premiere] installing torch from $TORCH_INDEX"
+"$PYTHON" -m pip install torch torchvision torchaudio --index-url "$TORCH_INDEX"
+
+# ---------------------------------------------------------------------------
+# 3. The package itself + the heavy preprocess + fcpxml extras. We don't pull
+#    [diarize] by default because pyannote pulls a lot and most users won't
+#    need speaker IDs.
 # ---------------------------------------------------------------------------
 echo "[video-use-premiere] installing package + preprocess + fcpxml extras"
 "$PYTHON" -m pip install -e ".[preprocess,fcpxml]"
-
-# ---------------------------------------------------------------------------
-# 3. Optional torch install for the [diarize] extra. Skipped by default.
-#    User opts in via INSTALL_DIARIZE=1 (then the script pulls torch from
-#    TORCH_INDEX and adds [diarize] to the pip install).
-# ---------------------------------------------------------------------------
-if [ "${INSTALL_DIARIZE:-0}" = "1" ]; then
-  TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu121}"
-  echo "[video-use-premiere] [diarize] opt-in: installing torch from $TORCH_INDEX"
-  "$PYTHON" -m pip install torch torchvision torchaudio --index-url "$TORCH_INDEX"
-  echo "[video-use-premiere] installing [diarize] extra (pyannote.audio)"
-  "$PYTHON" -m pip install -e ".[diarize]"
-fi
 
 # ---------------------------------------------------------------------------
 # 4. ffmpeg PATH check. Not fatal — user might have it in a non-standard
@@ -84,28 +59,21 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. ONNX Runtime providers smoke test. Doesn't fail the install if no GPU
-#    EP is available — the CPU EP is a working fallback. Reports which
-#    EPs the freshly-installed onnxruntime-gpu wheel can actually load
-#    on this host. Useful for spotting cuDNN / CUDA version mismatches
-#    BEFORE the user kicks off a 30-min preprocess.
+# 5. CUDA smoke test. Doesn't fail the install if CUDA is missing — there is
+#    a working CPU fallback path. Just informs the user what they'll get.
 # ---------------------------------------------------------------------------
-echo "[video-use-premiere] ONNX Runtime providers:"
+echo "[video-use-premiere] CUDA smoke test:"
 "$PYTHON" - <<'PY'
-import onnxruntime as ort
-eps = ort.get_available_providers()
-print("  available EPs :", eps)
-print(f"  CUDA EP       : {'CUDAExecutionProvider' in eps}")
-print(f"  TensorRT EP   : {'TensorrtExecutionProvider' in eps}")
-print(f"  CoreML EP     : {'CoreMLExecutionProvider' in eps}")
-print(f"  DirectML EP   : {'DmlExecutionProvider' in eps}")
-print(f"  ORT version   : {ort.__version__}")
+import torch
+ok = torch.cuda.is_available()
+name = torch.cuda.get_device_name(0) if ok else "n/a"
+total_gb = (torch.cuda.get_device_properties(0).total_memory / (1024**3)) if ok else 0.0
+print(f"  cuda available : {ok}")
+print(f"  device         : {name}")
+print(f"  total VRAM     : {total_gb:.1f} GB")
 PY
 
 echo ""
 echo "[video-use-premiere] install complete."
 echo "  next: cp .env.example .env   (only needed for --diarize)"
 echo "        python helpers/preprocess_batch.py /path/to/your/videos"
-echo ""
-echo "  To opt into speaker diarization (adds torch + pyannote.audio):"
-echo "        INSTALL_DIARIZE=1 ./install.sh"

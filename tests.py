@@ -228,85 +228,32 @@ def test_environment(R: Results) -> None:
     except Exception as e:
         R.fail("ffmpeg on PATH", f"{e} — install with winget/brew/apt")
 
-    # ── ONNX Runtime — the new core inference backbone for ALL three lanes
-    # (Parakeet ASR, CLAP audio events, Florence-2 visual captions). This
-    # used to be a torch.cuda check, but the Florence-2 ONNX port made
-    # torch optional (only the [diarize] extra still pulls it). The smoke
-    # test below is what actually proves a working GPU EP for the
-    # preprocess install -- if onnxruntime can't see CUDA / DirectML /
-    # CoreML, the lanes will silently CPU-fall-back and run 50x slower.
-    try:
-        import onnxruntime as ort
-        # `available_providers` enumerates EVERY EP compiled into the
-        # wheel that successfully loaded its native dependencies (cuDNN,
-        # cuBLAS, NVRTC, etc). On a healthy GPU install this contains
-        # CUDAExecutionProvider; on a CPU-only wheel or a broken CUDA
-        # install it'll just be CPUExecutionProvider.
-        eps = list(ort.get_available_providers())
-        print(f"  ort:       {ort.__version__}  providers={eps}")
-        gpu_eps = [
-            ep for ep in eps
-            if ep in {
-                "TensorrtExecutionProvider",
-                "CUDAExecutionProvider",
-                "DmlExecutionProvider",
-                "CoreMLExecutionProvider",
-            }
-        ]
-        if gpu_eps:
-            R.ok(f"onnxruntime GPU EP available ({gpu_eps[0]})")
-        else:
-            R.skip(
-                "onnxruntime GPU EP available",
-                "only CPU EP detected — driver/CUDA stack may need updating",
-            )
-    except ImportError:
-        R.fail(
-            "onnxruntime import",
-            "onnxruntime not installed — run install.bat / install.sh "
-            "(installs onnxruntime-gpu by default)",
-        )
-    except Exception as e:
-        R.fail("onnxruntime probe", f"{type(e).__name__}: {e}")
-
-    # ── GPU detection through vram.detect_gpu() — torch-FREE path
-    # uses pynvml -> nvidia-smi -> torch in that order, so it gives us
-    # device name + free VRAM regardless of whether torch happens to
-    # be installed alongside the [diarize] extra.
-    try:
-        from vram import detect_gpu
-        gpu = detect_gpu()
-        if gpu.available:
-            print(
-                f"  device:    {gpu.device_name}  "
-                f"VRAM={gpu.free_gb:.1f}/{gpu.total_gb:.1f} GB free"
-            )
-            R.ok("GPU detected (pynvml/nvidia-smi/torch)")
-        else:
-            R.skip("GPU detected", "no CUDA-capable device found — CPU fallback path")
-    except Exception as e:
-        R.fail("vram.detect_gpu", f"{type(e).__name__}: {e}")
-
-    # ── PyTorch — opportunistic, ONLY surfaced if installed. Default
-    # preprocess install no longer pulls torch since the Florence-2 ONNX
-    # port; users get torch transitively from the [diarize] extra (which
-    # depends on pyannote.audio). Reporting the version is still nice
-    # so users with a [diarize] install can confirm the wheel matched
-    # their CUDA stack.
+    # PyTorch + CUDA — most important for the wealthy 5090 path
     try:
         import torch
-        cu = getattr(torch.version, "cuda", None) or "cpu-only"
-        print(f"  torch:     {torch.__version__}  cuda={cu}  (optional, [diarize])")
-        # NOTE: we don't add a PASS or FAIL for torch -- it's purely
-        # informational. The GPU probe above is what gates the suite.
+        print(f"  torch:     {torch.__version__}  cuda={torch.version.cuda}")
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            cap = torch.cuda.get_device_capability(0)
+            free, total = torch.cuda.mem_get_info(0)
+            free_gb = free / (1024 ** 3)
+            total_gb = total / (1024 ** 3)
+            print(
+                f"  device:    {name}  sm_{cap[0]}{cap[1]}  "
+                f"VRAM={free_gb:.1f}/{total_gb:.1f} GB free"
+            )
+            R.ok("CUDA available")
+            # Blackwell / Ada / Ampere all expose mem_get_info; if you got
+            # this far without an exception you're golden.
+            if cap[0] >= 12:
+                print(f"  note:      Blackwell (sm_{cap[0]}{cap[1]}) — wealthy mode is your default tier")
+            R.ok("CUDA capability detected")
+        else:
+            R.skip("CUDA available", "torch didn't see a GPU")
     except ImportError:
-        # Default install posture; perfectly fine. Print one line so the
-        # user can see the install is the lean ONNX-only flavor.
-        print("  torch:     not installed (default ONNX-only preprocess install)")
+        R.fail("torch import", "torch not installed — run install.bat / install.sh")
     except Exception as e:
-        # Most commonly: torch installed but libcudart mismatch. Worth
-        # surfacing as a SKIP so [diarize] users notice.
-        R.skip("torch import", f"installed but failed: {type(e).__name__}: {e}")
+        R.fail("CUDA probe", str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -820,11 +767,11 @@ def test_heavy(R: Results, tmp: Path) -> None:
     _status(
         "HEAVY mode is loading three real models. First run downloads:"
     )
-    print("           - nvidia/parakeet-tdt-0.6b-v2 (ONNX)   (~600 MB)")
-    print("           - onnx-community/Florence-2-base (ONNX) (~620 MB)")
-    print("           - Xenova/clap-htsat-unfused (ONNX)     (~150 MB)")
+    print("           - nvidia/parakeet-tdt-0.6b-v2 (ONNX) (~600 MB)")
+    print("           - florence-community/Florence-2-base   (~1.0 GB)")
+    print("           - Xenova/clap-htsat-unfused           (~150 MB ONNX)")
     print("           Subsequent runs hit the HF cache and start in ~5s each.")
-    print("           huggingface_hub + onnxruntime print their own progress.")
+    print("           HF transformers prints its own download bars to stderr.")
 
     try:
         _status("generating synthetic 2s clip via ffmpeg ...")
@@ -908,52 +855,25 @@ def test_heavy(R: Results, tmp: Path) -> None:
         traceback.print_exc()
         R.fail("audio lane", f"{type(e).__name__}: {e}")
 
-    # ── Florence-2 (ONNX) ─────────────────────────────────────────────
-    # The visual lane is now driven by helpers/florence_onnx.py against
-    # the onnx-community/Florence-2-base repo (4 ONNX subgraphs +
-    # tokenizer.json, no torch/transformers needed). Runs the real
-    # beam-3 search to mirror the production caption quality on every
-    # smoke run -- using num_beams=1 here would silently mask any beam
-    # search regressions.
+    # ── Florence-2 ────────────────────────────────────────────────────
     try:
-        _status("Visual lane: importing visual_lane + loading "
-                "onnx-community/Florence-2-base ...")
+        _status("Visual lane: importing visual_lane + loading Florence-2-base ...")
         from visual_lane import run_visual_lane_batch
         t0 = time.monotonic()
         out = run_visual_lane_batch(
             [clip], edit,
-            # Canonical ONNX repo. visual_lane.py also accepts the legacy
-            # microsoft/florence-community ids and remaps internally for
-            # backward compatibility, but pinning the new id directly
-            # documents the post-port truth in the smoke suite.
-            model_id="onnx-community/Florence-2-base",
+            model_id="microsoft/Florence-2-base",
             fps=1, batch_size=2,
             task="<MORE_DETAILED_CAPTION>",
-            # Pool size 1 keeps the smoke test deterministic on small
-            # cards (the multi-instance pool only adds throughput, not
-            # quality, and would otherwise eat 1.6 GB extra VRAM).
-            pool_size=1,
-            num_beams=3,
             force=False,
         )
         _status(f"Visual lane: done in {time.monotonic()-t0:.1f}s")
         if out and out[0].exists():
             data = json.loads(out[0].read_text(encoding="utf-8"))
             n_caps = len(data.get("captions", []))
-            model = data.get("model", "")
             sample = (data.get("captions") or [{}])[0].get("text", "")
-            print(f"  florence:  model={model}  {n_caps} caption(s); "
-                  f"first: {sample[:80]!r}")
-            # Make sure the lane actually wrote the new ONNX repo id to
-            # disk -- catches accidental regressions where the legacy
-            # remap silently substitutes the wrong model.
-            if model and model != "onnx-community/Florence-2-base":
-                R.fail(
-                    "visual lane model id",
-                    f"expected 'onnx-community/Florence-2-base', got {model!r}",
-                )
-            else:
-                R.ok("visual lane ran (Florence-2 ONNX, beam=3)")
+            print(f"  florence:  {n_caps} caption(s); first: {sample[:80]!r}")
+            R.ok("visual lane ran")
         else:
             R.fail("visual lane", "no output file")
     except Exception as e:

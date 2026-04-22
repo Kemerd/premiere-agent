@@ -23,12 +23,7 @@ Designed for Claude Code skill startup:
 
 Cache invalidates on:
   - older than --ttl-days (default 7)
-  - any of {python, onnxruntime, tokenizers, huggingface_hub, transformers,
-    torch, opentimelineio, platform} version-string changed (torch +
-    transformers stay in the matrix as opportunistic version trackers --
-    the default preprocess install is torch-FREE since the Florence-2
-    ONNX port, but they're recorded if present so the [diarize] /
-    audio-lane combos still trigger a re-run on upgrade)
+  - any of {python, torch, transformers, platform} version-string changed
   - --force flag
   - --clear flag (deletes cache, no run)
 
@@ -61,22 +56,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "helpers"))
 
-# Install the HF backend guards BEFORE any code path here can probe
-# `transformers` (we do `__import__("transformers")` in `env_fingerprint`
-# to read its version string, which triggers the eager TF/JAX import
-# path in 4.x). Must come AFTER the sys.path setup above so the
-# helpers/ folder is actually importable.
-#
-# Wrapped in a try/except because _hf_env itself imports nothing heavy --
-# but it's a sibling helpers/ file and on some installs (e.g. someone
-# running health.py from a wheel without the helpers/ dir on path) the
-# module won't be findable.  Falling through is fine: the env vars it
-# would have set are only consulted if `transformers` is imported, and
-# `__import__("transformers")` below is wrapped in try/except too.
-try:
-    from _hf_env import HF_ENV_GUARDS_INSTALLED  # noqa: F401  - import for side effect
-except ImportError:
-    pass
+# CRITICAL: install the HF backend guards BEFORE any code path here can
+# probe `transformers` (we do `__import__("transformers")` in
+# `env_fingerprint` to read its version string, which triggers the
+# eager TF/JAX import path in 4.x). Must come AFTER the sys.path setup
+# above so the helpers/ folder is actually importable.
+from _hf_env import HF_ENV_GUARDS_INSTALLED  # noqa: F401  - import for side effect
 
 
 CACHE_VERSION = 1
@@ -111,46 +96,18 @@ def env_fingerprint() -> dict:
 
     Any change here re-runs the smoke tests. Order is stable so dict
     equality works for comparison.
-
-    The matrix tracks every library whose ABI / behaviour change could
-    silently shift either lane's outputs.  Modules absent from the
-    install map to ``"missing"`` so flipping between the default
-    (torch-free) preprocess install and the [diarize] (+torch) install
-    invalidates the cache cleanly.
     """
     fp = {
         "python": sys.version.split()[0],
         "platform": platform.system().lower(),
     }
-    # Required for the new ONNX preprocess path (visual + speech lanes
-    # both run on these), then the older torch-era libs as
-    # opportunistic trackers.  Missing modules are NOT a failure --
-    # we record "missing" so the cache key reflects the actual
-    # install posture and re-runs when it changes.
-    tracked_modules = (
-        # ONNX preprocess core -- visual + speech lanes
-        "onnxruntime",
-        "tokenizers",
-        "huggingface_hub",
-        # Audio lane (CLAP) processor -- soft dep
-        "transformers",
-        # Diarization extra (only torch consumer in the install matrix)
-        "torch",
-        # FCPXML export
-        "opentimelineio",
-    )
-    for mod_name in tracked_modules:
+    # Versions of the libraries most likely to break on upgrade.
+    for mod_name in ("torch", "transformers", "opentimelineio"):
         try:
             mod = __import__(mod_name)
             fp[mod_name] = getattr(mod, "__version__", "?")
         except ImportError:
             fp[mod_name] = "missing"
-        except Exception:
-            # Some libs (notably torch with a mismatched libcuda) raise
-            # arbitrary errors on import.  Don't let env_fingerprint
-            # crash the whole health check -- fall back to a sentinel
-            # the diff code recognizes.
-            fp[mod_name] = "import-error"
     return fp
 
 
@@ -168,16 +125,15 @@ ADVICE_RULES: list[tuple[str, str]] = [
      "Win `winget install Gyan.FFmpeg`, "
      "macOS `brew install ffmpeg`, "
      "Linux `apt install ffmpeg`. Restart the shell after."),
-    # The torch import / cuda-available advice rules from the pre-ONNX-port
-    # era are intentionally GONE -- the default preprocess install no
-    # longer requires torch.  GPU advice for the new install path is
-    # routed through the onnxruntime / providers rules below.
-    ("onnxruntime",
-     "ONNX Runtime not installed (or no GPU EP available). Run install.bat "
-     "(Windows) or install.sh (Linux/macOS) from the project root. If the "
-     "install reported only the CPU EP, your GPU driver / CUDA version may "
-     "be older than what onnxruntime-gpu>=1.22 expects -- update the NVIDIA "
-     "driver, then rerun the installer."),
+    ("torch import",
+     "PyTorch not installed. Run install.bat (Windows) or install.sh "
+     "(Linux/macOS) from the project root, OR "
+     "`pip install torch --index-url https://download.pytorch.org/whl/cu128` "
+     "for an RTX 50-series."),
+    ("cuda available",
+     "PyTorch can't see your GPU. Check `nvidia-smi`. If your GPU is an "
+     "RTX 50-series (sm_120), reinstall torch with the cu128 wheel: "
+     "`pip install --upgrade --index-url https://download.pytorch.org/whl/cu128 torch`."),
     ("import parakeet_onnx_lane",
      "Parakeet ONNX lane import failed — usually missing onnxruntime / "
      "onnx-asr. Run `pip install -e \".[preprocess]\"` from the project root."),
@@ -197,10 +153,8 @@ ADVICE_RULES: list[tuple[str, str]] = [
      "Audio lane import failed — install CLAP deps: "
      "`pip install -e \".[preprocess]\"` (pulls onnxruntime-gpu + transformers + soxr)."),
     ("import visual_lane",
-     "Visual lane import failed — install Florence-2 ONNX deps: "
-     "`pip install -e \".[preprocess]\"` (pulls onnxruntime-gpu + tokenizers "
-     "+ huggingface_hub + imageio-ffmpeg). The lane no longer needs torch / "
-     "transformers / einops / timm — those were dropped with the ONNX port."),
+     "Visual lane import failed — install Florence-2 deps: "
+     "`pip install -e \".[preprocess]\"` (transformers, einops, timm)."),
     ("import export_fcpxml",
      "FCPXML export deps missing. Install: `pip install -e \".[fcpxml]\"` "
      "(opentimelineio + otio-fcpx-xml-adapter)."),
@@ -372,26 +326,11 @@ def print_human(payload: dict, *, from_cache: bool, why_run: str = "") -> None:
           f"{payload.get('failed')} fail / {payload.get('skipped')} skip "
           f"({payload.get('elapsed_s')}s)")
     fp = payload.get("env_fingerprint") or {}
-    # The env line lists the libs that actually drive cache invalidation.
-    # onnxruntime is the new backbone for both Parakeet (ASR), CLAP
-    # (audio events) and Florence-2 (visual captions); torch / transformers
-    # are now opportunistic ([diarize] + CLAP processor) and only printed
-    # when a non-"missing" version is detected so the line stays tight.
-    env_bits: list[str] = [f"python {fp.get('python')}"]
-    env_bits.append(f"onnxruntime {fp.get('onnxruntime')}")
-    env_bits.append(f"tokenizers {fp.get('tokenizers')}")
-    env_bits.append(f"hf_hub {fp.get('huggingface_hub')}")
-    # Only surface torch / transformers when the user has them installed --
-    # default ONNX-only installs would otherwise just say "missing" twice.
-    _torch_v = fp.get("torch")
-    if _torch_v and _torch_v not in {"missing", "import-error"}:
-        env_bits.append(f"torch {_torch_v}")
-    _tf_v = fp.get("transformers")
-    if _tf_v and _tf_v not in {"missing", "import-error"}:
-        env_bits.append(f"transformers {_tf_v}")
-    env_bits.append(f"otio {fp.get('opentimelineio')}")
-    env_bits.append(f"platform {fp.get('platform')}")
-    print(f"  env:        {', '.join(env_bits)}")
+    print(f"  env:        python {fp.get('python')}, "
+          f"torch {fp.get('torch')}, "
+          f"transformers {fp.get('transformers')}, "
+          f"otio {fp.get('opentimelineio')}, "
+          f"platform {fp.get('platform')}")
 
     fallbacks = payload.get("fallbacks_active") or []
     if fallbacks:

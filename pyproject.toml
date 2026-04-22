@@ -23,11 +23,8 @@ dependencies = [
 # Heavy ML preprocessing stack. Pulled in by install.sh / install.bat so a
 # `pip install -e .` for a renderer-only deployment stays minimal.
 #
-# As of the ONNX Florence-2 port, torch is no longer required by the default
-# preprocess install — both the speech lane (Parakeet ONNX) and the visual
-# lane (Florence-2 ONNX, see helpers/florence_onnx.py) run on ONNX Runtime.
-# The only place torch still lives is the optional [diarize] extra
-# (pyannote.audio) which the user opts into separately.
+# torch is NOT listed here because the user typically wants a specific CUDA
+# index URL (cu121, cpu, rocm6.0…). The install scripts handle that.
 # ---------------------------------------------------------------------------
 preprocess = [
     # ── Speech (PRIMARY): ONNX Runtime Parakeet TDT ──
@@ -48,57 +45,43 @@ preprocess = [
     "onnx-asr[gpu,hub]>=0.11.0",
     "onnxruntime-gpu>=1.22.0",  # CUDA + TensorRT EP support
     # tensorrt-cu12-libs is OPTIONAL — only needed when the user opts
-    # into the TensorRT execution provider via VIDEO_USE_PARAKEET_TRT=1
-    # (speech) or VIDEO_USE_FLORENCE_TRT=1 (visual). Pre-shipped here so
-    # the wheel cache primes on first install; the provider ladder in
-    # `_onnx_providers.py` falls through to CUDA EP gracefully if the
-    # import fails (corporate proxies, custom torch).
+    # into the TensorRT execution provider via VIDEO_USE_PARAKEET_TRT=1.
+    # Pre-shipped here so the wheel cache primes on first install; the
+    # provider ladder in `_onnx_providers.py` falls through to CUDA EP
+    # gracefully if the import fails (corporate proxies, custom torch).
     "tensorrt-cu12-libs;platform_system!='Darwin'",
 
-    # ── Visuals (Florence-2 ONNX) ──
-    # The visual lane (helpers/visual_lane.py + helpers/florence_onnx.py)
-    # uses the `onnx-community/Florence-2-base` repo's pre-exported four
-    # ONNX subgraphs (vision_encoder, embed_tokens, encoder_model,
-    # decoder_model_merged) driven by a hand-rolled NumPy beam-search
-    # orchestrator. This replaces the old torch + transformers +
-    # optimum + accelerate + einops + timm stack which was ~3 GB of
-    # wheels and ~5s of cold-start eager imports.
+    # ── transformers (Florence-2 + CLAP processors) ──
+    # Kept for the visual lane (Florence-2) and the CLAP processor /
+    # tokenizer used by the audio lane (the audio lane itself runs
+    # inference on ONNX Runtime — transformers is only loaded for
+    # the audio + text feature extraction front-end).
     #
-    # `tokenizers` (Rust BART tokenizer, no torch dep) replaces
-    # `transformers.AutoTokenizer` for the visual lane. It's also a
-    # transitive dep of `transformers` (kept below for CLAP) and of
-    # `onnx-asr` so it's already in the install set — promoting to a
-    # direct dep just makes the contract explicit.
-    "tokenizers>=0.20",
-    # `huggingface_hub` was previously pulled transitively through
-    # `transformers`; with the visual lane no longer importing
-    # transformers we list it explicitly so `snapshot_download` of the
-    # Florence-2 ONNX weights still works on minimal installs.
-    "huggingface_hub>=0.24",
-    "imageio-ffmpeg",          # in-memory frame extraction for visual_lane
+    # Lower bound 4.55 is where the native `Florence2ForConditionalGeneration`
+    # class was added to transformers (we use the
+    # `florence-community/Florence-2-base` HF-format checkpoint, NOT
+    # the original `microsoft/Florence-2-base` which uses
+    # trust_remote_code and broke against the new attention dispatcher
+    # contract). Upper bound <6 leaves headroom for the entire 5.x
+    # line — the community checkpoint is maintained against both
+    # 4.55+ and 5.x cleanly.
+    "transformers>=4.55,<6",
 
-    # ── Audio events (LAION CLAP via ONNX Runtime + transformers) ──
+    "optimum>=1.20",           # BetterTransformer fast-path for Florence-2
+    "accelerate>=0.30",        # device_map + dtype routing for the pipeline
+    # ── Audio events (LAION CLAP via ONNX Runtime) ──
     # The CLAP audio lane (helpers/audio_lane.py) uses Xenova's
     # pre-converted ONNX exports of the LAION CLAP weights, fetched on
-    # first run via `huggingface_hub`. `transformers.AutoProcessor`
-    # handles the audio + text preprocessing so the lane stays
-    # ORT-only at inference time.
-    #
-    # We keep `transformers` as a soft dep specifically for CLAP's
-    # mel-spectrogram + tokenizer feature extractor — porting that to
-    # pure NumPy is doable but high-risk for quality drift on the audio
-    # encoder side, and the audio lane is opt-in (Phase B) rather than
-    # default-on like the visual lane was.
-    #
-    # The heavy torch-era companions (optimum, accelerate, einops, timm,
-    # flash-attn) were dropped along with the Florence-2 torch path —
-    # transformers itself without those is ~50 MB of pure-Python wheels.
-    "transformers>=4.55,<6",
-    # `soxr` is optional but used for fast 16kHz->48kHz resampling on
-    # the WAV cache; if missing the lane falls back to `librosa.resample`
-    # (slower, also OK).
+    # first run via `huggingface_hub` (transitive through transformers).
+    # `transformers.AutoProcessor` handles the audio + text preprocessing
+    # so the lane stays ORT-only at inference time. `soxr` is optional
+    # but used for fast 16kHz->48kHz resampling on the WAV cache; if
+    # missing the lane falls back to `librosa.resample` (slower, also OK).
     "soxr",                    # fast libsoxr resampling for CLAP's 48kHz path
-
+    # ── Visuals ──
+    "einops",                  # Florence-2 transitive
+    "timm",                    # Florence-2 transitive
+    "imageio-ffmpeg",          # in-memory frame extraction for visual_lane
     # ── Shared I/O ──
     "soundfile",               # WAV reading for audio_lane + extract_audio cache
 ]
@@ -123,14 +106,21 @@ onnx = [
 ]
 
 # ---------------------------------------------------------------------------
+# Optional Flash Attention 2. Modest speedup for Florence-2 visual captioning
+# but the wheel build is fiddly on Windows (needs MSVC + CUDA toolkit) so it's
+# strictly opt-in. install.sh / install.bat do NOT pull this. Users who want
+# it run `pip install -e .[flash]` after a successful base install. Florence
+# transparently falls back to SDPA when FA2 isn't found.
+# ---------------------------------------------------------------------------
+flash = [
+    "flash-attn>=2.5.0",
+]
+
+# ---------------------------------------------------------------------------
 # Optional speaker diarization for the speech lane. pyannote.audio needs an
 # HF_TOKEN with model-card acceptance. Gated so users without speakers don't
 # pay the cost (~600MB of extra deps + a model download on first run). See
 # `helpers/diarize.py` for the lane-agnostic dispatch.
-#
-# This is the ONLY remaining extra that pulls torch into the install
-# (pyannote.audio depends on it) — the default [preprocess] install is
-# torch-free as of the Florence-2 ONNX port.
 # ---------------------------------------------------------------------------
 diarize = [
     "pyannote.audio>=3.1",
@@ -171,7 +161,7 @@ animations = ["manim"]
 # Convenience meta-extra: install absolutely everything.
 # ---------------------------------------------------------------------------
 all = [
-    "video-use-premiere[preprocess,onnx,diarize,fcpxml,animations,parakeet]",
+    "video-use-premiere[preprocess,onnx,diarize,fcpxml,animations,flash,parakeet]",
 ]
 
 [build-system]
