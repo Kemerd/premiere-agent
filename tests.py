@@ -50,7 +50,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "helpers"))
 #      defaults to cp1252 which mangles unicode in HF model names).
 #   2. Replace builtins.print with a flush=True version. Calls in this file
 #      still pass through normally; calls in transitively-imported helper
-#      modules (whisper_lane, etc) ALSO get the flush behaviour for free.
+#      modules (parakeet_onnx_lane, audio_lane, etc) ALSO get the flush
+#      behaviour for free.
 # ---------------------------------------------------------------------------
 
 def _enable_live_output() -> None:
@@ -766,9 +767,9 @@ def test_heavy(R: Results, tmp: Path) -> None:
     _status(
         "HEAVY mode is loading three real models. First run downloads:"
     )
-    print("           - openai/whisper-large-v3-turbo  (~1.6 GB)")
-    print("           - florence-community/Florence-2-base (~1.0 GB)")
-    print("           - Xenova/clap-htsat-unfused      (~150 MB ONNX)")
+    print("           - nvidia/parakeet-tdt-0.6b-v2 (ONNX) (~600 MB)")
+    print("           - florence-community/Florence-2-base   (~1.0 GB)")
+    print("           - Xenova/clap-htsat-unfused           (~150 MB ONNX)")
     print("           Subsequent runs hit the HF cache and start in ~5s each.")
     print("           HF transformers prints its own download bars to stderr.")
 
@@ -780,39 +781,34 @@ def test_heavy(R: Results, tmp: Path) -> None:
         R.fail("synthetic clip ffmpeg", str(e))
         return
 
-    # ── Whisper ───────────────────────────────────────────────────────
+    # ── Speech (Parakeet ONNX) ────────────────────────────────────────
+    # The default speech lane: NVIDIA Parakeet TDT through ONNX Runtime.
+    # First run downloads the istupakov-converted ONNX repo (~600 MB)
+    # plus the bundled mel preprocessor and TDT decoder graphs.
     try:
-        _status("Whisper lane: importing whisper_lane ...")
-        from whisper_lane import run_whisper_lane_batch
-        _status("Whisper lane: loading openai/whisper-large-v3-turbo (download on first run) ...")
+        _status("Speech lane: importing parakeet_onnx_lane ...")
+        from parakeet_onnx_lane import run_parakeet_onnx_lane_batch
+        _status("Speech lane: loading nvidia/parakeet-tdt-0.6b-v2 (ONNX) — "
+                "downloads on first run ...")
         t0 = time.monotonic()
-        out = run_whisper_lane_batch(
+        out = run_parakeet_onnx_lane_batch(
             [clip], edit,
-            model_id="openai/whisper-large-v3-turbo",
             language="en",
-            # Smoke test runs on whatever GPU the user happens to have —
-            # use the safe default rather than the wealthy override so it
-            # passes on a 12 GB 3060 too. The lane's adaptive backoff
-            # would catch a too-high value, but a fast clean pass here
-            # is the better signal. Turbo + word timestamps comfortably
-            # fits batch=16 on 12 GB cards (it's ~5 GB peak there).
-            batch_size=16,
-            chunk_length_s=30,
             diarize=False,
             num_speakers=None,
             force=False,
         )
-        _status(f"Whisper lane: done in {time.monotonic()-t0:.1f}s")
+        _status(f"Speech lane: done in {time.monotonic()-t0:.1f}s")
         if out and out[0].exists():
             data = json.loads(out[0].read_text(encoding="utf-8"))
             n_words = sum(1 for w in data.get("words", []) if w.get("type") == "word")
-            print(f"  whisper:   {n_words} word(s) in 2s sine — expect 0 (silence)")
-            R.ok("whisper lane ran")
+            print(f"  speech:    {n_words} word(s) in 2s sine — expect 0 (silence)")
+            R.ok("speech lane ran (Parakeet ONNX)")
         else:
-            R.fail("whisper lane", "no output file")
+            R.fail("speech lane", "no output file")
     except Exception as e:
         traceback.print_exc()
-        R.fail("whisper lane", f"{type(e).__name__}: {e}")
+        R.fail("speech lane", f"{type(e).__name__}: {e}")
 
     # ── CLAP audio lane ───────────────────────────────────────────────
     # CLAP is a small dual-encoder model (~150 MB ONNX for the base

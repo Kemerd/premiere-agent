@@ -1,6 +1,6 @@
 ---
 name: video-use-premiere
-description: Edit any video by conversation. Local three-lane preprocessing (Whisper speech + CLAP zero-shot audio events + Florence-2 visual captions), cut, color grade, generate overlay animations, burn subtitles, OR export FCPXML to Premiere/Resolve/FCP with split edits. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
+description: Edit any video by conversation. Local two-phase preprocessing — Phase A runs Parakeet ONNX speech + Florence-2 visual captions in parallel; Phase B runs CLAP zero-shot audio events against an agent-curated vocabulary derived from the speech + visual timelines. Cut, color grade, generate overlay animations, burn subtitles, OR export FCPXML to Premiere/Resolve/FCP with split edits. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
 ---
 
 # Video Use Premiere
@@ -8,7 +8,7 @@ description: Edit any video by conversation. Local three-lane preprocessing (Whi
 ## Principle
 
 1. **LLM reasons from raw transcript + sound captions + visual captions + on-demand drill-down.** Three lightweight markdown views (`speech_timeline.md`, `audio_timeline.md`, `visual_timeline.md`) are the entire reading surface. Everything else — filler tagging, retake detection, shot classification, B-roll spotting, emphasis scoring — you derive at decision time.
-2. **Speech is primary, visuals are secondary, audio events are tertiary.** Cut candidates come from Whisper speech boundaries and silence gaps — that lane is highly accurate and is the editorial spine. Visual captions (Florence-2) are the second source of truth: they answer "what's actually on screen here?" and resolve ambiguous decision points (B-roll spotting, shot continuity, action beats). Audio events (CLAP, zero-shot scoring against a vocabulary) tag non-speech sounds per ~10s window (tools, materials, ambience, music, animals, vehicles). Vocabulary is editable per project — see Phase B below for the agent-curated workflow that makes labels much sharper. When audio and visual disagree about *what is happening on screen*, **trust the visual lane.**
+2. **Speech is primary, visuals are secondary, audio events are tertiary.** Cut candidates come from Parakeet ONNX speech boundaries and silence gaps — that lane is highly accurate and is the editorial spine. Visual captions (Florence-2) are the second source of truth: they answer "what's actually on screen here?" and resolve ambiguous decision points (B-roll spotting, shot continuity, action beats). Audio events (CLAP, zero-shot scoring against a vocabulary) tag non-speech sounds per ~10s window (tools, materials, ambience, music, animals, vehicles). Vocabulary is **agent-curated per project** by reading the speech + visual timelines first — see Phase B below. When audio and visual disagree about *what is happening on screen*, **trust the visual lane.**
 3. **Ask → confirm → execute → iterate → persist.** Never touch the cut until the user has confirmed the strategy in plain English.
 4. **Generalize.** Do not assume what kind of video this is. Look at the material, ask the user, then edit.
 5. **Artistic freedom is the default.** Every specific value, preset, font, color, duration, pitch structure, and technique in this document is a *worked example* from one proven video — not a mandate. Read them to understand what's possible and why each worked. Then make your own taste calls based on what the material actually is and what the user actually wants. **The only things you MUST do are in the Hard Rules section below.** Everything else is yours.
@@ -24,9 +24,9 @@ These are the things where deviation produces silent failures or broken output. 
 3. **30ms audio fades at every segment boundary** (`afade=t=in:st=0:d=0.03,afade=t=out:st={dur-0.03}:d=0.03`). Otherwise audible pops at every cut.
 4. **Overlays use `setpts=PTS-STARTPTS+T/TB`** to shift the overlay's frame 0 to its window start. Otherwise you see the middle of the animation during the overlay window.
 5. **Master SRT uses output-timeline offsets**: `output_time = word.start - segment_start + segment_offset`. Otherwise captions misalign after segment concat.
-6. **Never cut inside a word.** Snap every cut edge to a word boundary from the Whisper word-level transcript.
-7. **Pad every cut edge.** Working window: 30–200ms. Whisper timestamps drift 50–100ms — padding absorbs the drift. Tighter for fast-paced, looser for cinematic.
-8. **Word-level verbatim ASR only.** Whisper is invoked with `return_timestamps="word"` — never SRT/phrase mode (loses sub-second gap data). Never normalized fillers (loses editorial signal).
+6. **Never cut inside a word.** Snap every cut edge to a word boundary from the Parakeet word-level transcript.
+7. **Pad every cut edge.** Working window: 30–200ms. ASR timestamps drift 50–100ms — padding absorbs the drift. Tighter for fast-paced, looser for cinematic.
+8. **Word-level verbatim ASR only.** Parakeet TDT emits per-token timestamps natively — keep them; never collapse to phrase / SRT shape on the lane output (that loses sub-second gap data). Never normalize fillers either (loses editorial signal — the editor uses `umm` / `uh` / false starts to find candidate cuts).
 9. **Cache lane outputs per source.** Never re-run a lane unless the source file itself changed (mtime). The orchestrator handles this; do not pass `--force` reflexively.
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
@@ -43,14 +43,14 @@ The skill lives in `video-use-premiere/`. User footage lives wherever they put i
 ├── <source files, untouched>
 └── edit/
     ├── project.md               ← memory; appended every session
-    ├── speech_timeline.md       ← Whisper phrase-level transcripts (lane 1)
-    ├── audio_timeline.md        ← CLAP audio events, coalesced   (lane 2)
-    ├── visual_timeline.md       ← Florence-2 captions @ 1fps     (lane 3)
+    ├── speech_timeline.md       ← Parakeet phrase-level transcripts  (lane 1)
+    ├── audio_timeline.md        ← CLAP audio events, coalesced       (lane 2, Phase B)
+    ├── visual_timeline.md       ← Florence-2 captions @ 1fps         (lane 3)
     ├── merged_timeline.md       ← optional, all three interleaved by ts
     ├── edl.json                 ← cut decisions
-    ├── transcripts/<name>.json  ← cached raw Whisper words
+    ├── transcripts/<name>.json  ← cached raw Parakeet words
     ├── audio_tags/<name>.json   ← cached raw CLAP (label, score) events
-    ├── audio_vocab.txt          ← optional: agent-curated vocab for Phase B
+    ├── audio_vocab.txt          ← agent-curated CLAP vocabulary (Phase B)
     ├── audio_vocab_embeds.npz   ← cached CLAP text embeddings for that vocab
     ├── visual_caps/<name>.json  ← cached raw Florence-2 captions
     ├── audio_16k/<name>.wav     ← shared 16kHz mono PCM (speech lane + CLAP)
@@ -67,8 +67,8 @@ The skill lives in `video-use-premiere/`. User footage lives wherever they put i
 
 - **`HF_TOKEN` in `.env` at project root** — only required for speaker diarization (pyannote). Skip if single-speaker.
 - **`ffmpeg` + `ffprobe` on PATH.** Hard requirement. Win: `winget install Gyan.FFmpeg`. macOS: `brew install ffmpeg`. Linux: `apt install ffmpeg`.
-- **Python deps**: run `install.sh` (Linux/macOS) or `install.bat` (Windows). Installs PyTorch + the `[preprocess,fcpxml]` extras. Optional: `pip install -e .[flash]` for Flash Attention 2 (~3-5x Whisper speedup), `pip install -e .[diarize]` for pyannote, `pip install -e .[parakeet]` to pre-install the NVIDIA Parakeet fallback (auto-installs on first blocked-Whisper detection otherwise).
-- **Speech lane fallback**: if HuggingFace is unreachable from this machine (corporate proxy / NVIDIA intranet / restricted network), `whisper_lane.py` auto-falls-back to NVIDIA Parakeet TDT v3 — local, ~10x faster, English + 24 European languages. Decision cached 7 days at `~/.video-use-premiere/whisper_blocked`. The output JSON shape is identical, so cuts, diarization, FCPXML export all work unchanged. `helpers/health.py --json` surfaces `"fallbacks_active": ["parakeet"]` so you know which backend is running before the lane fires. **Fully air-gapped?** Set `PARAKEET_MODEL_PATH=/path/to/parakeet-tdt-0.6b-v3.nemo` (download from NGC) and the lane skips network entirely via `ASRModel.restore_from()`.
+- **Python deps**: run `install.sh` (Linux/macOS) or `install.bat` (Windows). Installs PyTorch + the `[preprocess,fcpxml]` extras. Optional: `pip install -e .[flash]` for Flash Attention 2 (Florence-2 speedup), `pip install -e .[diarize]` for pyannote speaker diarization, `pip install -e .[parakeet]` to pre-install the NVIDIA Parakeet NeMo fallback (only needed when ONNX Runtime can't load on the host).
+- **Speech lane backends**: the default is `parakeet_onnx_lane.py` — NVIDIA Parakeet TDT 0.6B running on ONNX Runtime through a multi-session pool (TensorRT / CUDA / DirectML / CPU EP ladder, English v2 / multilingual v3 auto-routed by language). The only sanctioned alternative is `parakeet_lane.py` (NeMo torch-mode Parakeet) for hosts where ORT can't load — pin via `VIDEO_USE_SPEECH_LANE=nemo`. Output JSON shape is byte-identical between the two so cuts, diarization, and FCPXML export are lane-agnostic. `helpers/health.py --json` surfaces non-default backends in `fallbacks_active` so you know which one is running before the lane fires. **Fully air-gapped?** Pre-download the ONNX directory and set `PARAKEET_ONNX_DIR=/path/to/parakeet-onnx`; the lane skips all network calls. There is no Whisper backend in this codebase by design — Whisper hallucinates on silence and has a known word-timestamp memory regression that crashes long-form runs.
 - **`yt-dlp`, `manim`, Remotion** installed only on first use.
 - This skill vendors `skills/manim-video/`. Read its SKILL.md when building a Manim slot.
 
@@ -114,7 +114,7 @@ python helpers/health.py --force --json    # ignore cache, run now
 python helpers/health.py --clear           # wipe cache (next call re-runs)
 ```
 
-**Optional heavy-tier verification** (~4.5 GB downloads on first run, exercises real Whisper-large-v3 + Florence-2 + PANNs on a synthetic 2s clip): tell the user to run `python tests.py --heavy` once after install. Cached separately under the same TTL. Don't trigger this autonomously — it's an explicit user action.
+**Optional heavy-tier verification** (~2 GB downloads on first run, exercises real Parakeet ONNX + Florence-2 + CLAP on a synthetic 2s clip): tell the user to run `python tests.py --heavy` once after install. Cached separately under the same TTL. Don't trigger this autonomously — it's an explicit user action.
 
 ## Helpers
 

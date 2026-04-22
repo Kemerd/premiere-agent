@@ -56,9 +56,13 @@ import os
 import sys
 from typing import Any
 
-# Truthy values for env-var gating. Same vocabulary as wealthy.py /
-# vram.py so users only have to learn one set of "yes" strings.
+# Truthy / falsy values for env-var gating. Same vocabulary as
+# wealthy.py / vram.py so users only have to learn one set of strings.
+# We support BOTH so users can force-disable an EP that's auto-on by
+# default (e.g. set VIDEO_USE_PARAKEET_TRT=0 to skip the engine compile
+# step on a one-shot transcribe even though the host has TRT installed).
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
+_FALSY  = {"0", "false", "no", "off", "n", "f"}
 
 
 # ---------------------------------------------------------------------------
@@ -99,18 +103,44 @@ _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
 _NVIDIA_DLL_BOOTSTRAP_DONE = False
 
+# Capabilities discovered by `_bootstrap_nvidia_dlls()`. Populated once at
+# module import and consumed by both `_trt_enabled()` and `resolve_providers()`
+# so we never claim an EP we couldn't actually instantiate. The shape stays
+# tiny on purpose — booleans + a debug list of which dirs we wired up. It is
+# NOT a per-EP option dict; per-EP options live in `_trt_options()` etc.
+_CAPS: dict[str, Any] = {
+    "platform": sys.platform,    # for diagnostic output only
+    "tensorrt": False,           # nvinfer_10.dll reachable
+    "cuda":     False,           # cudart64_12.dll reachable
+    "cudnn":    False,           # cudnn64_9.dll reachable
+    "msvc":     False,           # vcruntime140*.dll reachable in System32
+    "added_dirs": [],            # dirs we prepended to PATH (debug)
+}
+
 
 def _bootstrap_nvidia_dlls() -> None:
-    """Make pip-shipped NVIDIA runtime DLLs visible to the OS loader.
+    """Make NVIDIA runtime DLLs visible to the OS loader AND populate `_CAPS`.
 
-    Without this, ORT's CUDA/TensorRT EPs silently fail to load on
-    Windows installs that rely on the `tensorrt-cu12-libs` and
-    `nvidia-cudnn-cu12` pip wheels (the recommended install path —
-    no system-wide CUDA / cuDNN required).
+    Walks two parallel sources for each DLL family:
 
-    Idempotent. Safe to call before or after `import onnxruntime` —
-    ORT only loads the EP-specific DLLs at `InferenceSession()` time,
-    not at module import.
+        1. Pip wheels (tensorrt-cu12-libs, nvidia-cudnn-cu12, etc.) —
+           the recommended path, lives under site-packages and is the
+           only thing a clean `pip install -e .` produces.
+
+        2. System CUDA Toolkit (`%CUDA_PATH%`, `%CUDA_HOME%`, and the
+           globbed `C:\\Program Files\\NVIDIA GPU Computing Toolkit\\
+           CUDA\\v12.*\\bin\\`). Required for `cudart64_12.dll`,
+           `cufft64_11.dll`, `nvrtc64_120_0.dll`, `nvJitLink_120_0.dll`
+           — these are NEVER shipped by any pip wheel.
+
+    A given EP is only marked capable in `_CAPS` when EVERY DLL that
+    EP needs at runtime resolves under the bootstrapped PATH. Cloud /
+    CPU-only machines without CUDA Toolkit therefore see `cuda=False`
+    and `tensorrt=False`, and `resolve_providers()` skips both tiers
+    cleanly (no warning, no crash, no silent CPU fallback after a
+    failed EP load).
+
+    Idempotent. Safe to call before or after `import onnxruntime`.
     """
     global _NVIDIA_DLL_BOOTSTRAP_DONE
     if _NVIDIA_DLL_BOOTSTRAP_DONE:
@@ -118,86 +148,222 @@ def _bootstrap_nvidia_dlls() -> None:
 
     # Non-Windows: POSIX dynamic linker uses LD_LIBRARY_PATH /
     # rpath semantics that the wheels handle correctly via auditwheel.
-    # Nothing for us to do — bail early so we don't pollute env on
-    # Linux/macOS containers where the same code might run.
+    # We still probe ORT's available providers later (since CUDA EP is
+    # very real on Linux), but skip the PATH dance.
     if sys.platform != "win32":
+        # Coarse probe — assume the wheels' linker rpath handles it on
+        # Linux. resolve_providers() will still defer to ORT's own
+        # `get_available_providers()` for the final yes/no.
+        _CAPS["cuda"] = _try_import("nvidia.cudnn") or _try_import("torch")
+        _CAPS["tensorrt"] = _try_import("tensorrt") or _try_import("tensorrt_libs")
+        _CAPS["msvc"] = True  # not applicable; pretend OK so we don't gate on it
         _NVIDIA_DLL_BOOTSTRAP_DONE = True
         return
 
-    # Walk a list of (probe_module, sub_path) candidates. Each probe is
-    # an importable module whose __file__ tells us where pip extracted
-    # the wheel; sub_path is the directory under it where the actual
-    # DLLs live (some wheels nest under bin/, some don't).
-    #
-    # We probe lazily — a missing wheel is not an error here, it just
-    # means that EP won't be available. resolve_providers() handles
-    # the "EP not available" path gracefully by falling through.
-    candidates: list[tuple[str, str]] = [
-        # TensorRT runtime — nvinfer_10.dll lives at the package root.
-        ("tensorrt_libs", ""),
-        # cuDNN — cudnn64_9.dll lives under the bin/ subfolder.
-        ("nvidia.cudnn", "bin"),
-        # CUDA runtime (cudart64_12.dll) — newer ORT builds want this
-        # too for arena allocator init. Some installs get it via the
-        # `nvidia-cuda-runtime-cu12` wheel; others bundle it inside
-        # cuDNN's bin/. Probe both names so we don't miss it.
-        ("nvidia.cuda_runtime", "bin"),
-        ("nvidia.cublas", "bin"),
+    # ── Phase 1: collect candidate DLL directories ──────────────────────
+    # Each entry is a directory we'll add to PATH/add_dll_directory if
+    # it exists. Order matters only for deterministic logging.
+    candidate_dirs: list[str] = []
+
+    # Pip-wheel sources. Each is `(import_name, optional_subdir)`.
+    pip_candidates: list[tuple[str, str]] = [
+        ("tensorrt_libs",       ""),    # nvinfer_10.dll + plugins at root
+        ("nvidia.cudnn",        "bin"), # cudnn64_9.dll
+        ("nvidia.cublas",       "bin"), # cublas64_12.dll, cublasLt64_12.dll
+        ("nvidia.cuda_runtime", "bin"), # cudart64_12.dll (when wheel present)
+        ("nvidia.cufft",        "bin"), # cufft64_11.dll (when wheel present)
+        ("nvidia.cuda_nvrtc",   "bin"), # nvrtc64_120_0.dll (when wheel present)
+        ("nvidia.nvjitlink",    "bin"), # nvJitLink_120_0.dll (when wheel present)
     ]
+    for mod_name, sub_path in pip_candidates:
+        d = _wheel_dir(mod_name, sub_path)
+        if d is not None and d not in candidate_dirs:
+            candidate_dirs.append(d)
 
-    found_dirs: list[str] = []
-    for mod_name, sub_path in candidates:
-        try:
-            mod = __import__(mod_name, fromlist=["__file__"])
-        except ImportError:
-            # Wheel not installed — skip silently. Each EP that needed
-            # it will fall through to the next tier in resolve_providers.
-            continue
-        mod_file = getattr(mod, "__file__", None)
-        if not mod_file:
-            continue
-        base_dir = os.path.dirname(mod_file)
-        target = os.path.join(base_dir, sub_path) if sub_path else base_dir
-        if os.path.isdir(target):
-            found_dirs.append(target)
+    # System CUDA Toolkit. Many DLLs the CUDA EP needs (cudart, cufft,
+    # nvrtc, nvJitLink) ship ONLY with the toolkit installer — no pip
+    # wheel covers them on Windows today. Probe in priority order:
+    #   1. CUDA_PATH / CUDA_HOME env vars (whatever the user picked)
+    #   2. globbed install dirs, highest-version-first
+    # We keep ALL matching dirs (not just the highest) so users with
+    # multiple toolkit versions side-by-side don't get silently bound
+    # to the wrong one.
+    for cuda_root in _system_cuda_roots():
+        bin_dir = os.path.join(cuda_root, "bin")
+        if os.path.isdir(bin_dir) and bin_dir not in candidate_dirs:
+            candidate_dirs.append(bin_dir)
 
-    if not found_dirs:
-        # No NVIDIA wheels installed — user is presumably on a machine
-        # with system-wide CUDA / cuDNN, or running CPU-only. Either
-        # way we have nothing to add and resolve_providers() is fine.
-        _NVIDIA_DLL_BOOTSTRAP_DONE = True
-        return
+    # ── Phase 2: register every candidate dir with the OS loader ────────
+    if candidate_dirs:
+        # Prepend (not append) so our pinned versions win against any
+        # older system-wide install of cuDNN/CUDA still on PATH.
+        current_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join(
+            candidate_dirs + ([current_path] if current_path else [])
+        )
+        for d in candidate_dirs:
+            try:
+                os.add_dll_directory(d)
+            except (OSError, AttributeError):
+                # Either the dir was already registered (harmless) or
+                # add_dll_directory is missing on this Python (we require
+                # 3.10 so this branch won't fire in practice).
+                pass
 
-    # Prong 1: prepend to PATH so the OS loader finds the DLLs no
-    # matter which LoadLibrary variant ORT's bridge ends up using.
-    # Prepend (not append) so our DLLs win against any conflicting
-    # system-wide install of an older cuDNN / CUDA.
-    current_path = os.environ.get("PATH", "")
-    new_path_parts = found_dirs + ([current_path] if current_path else [])
-    os.environ["PATH"] = os.pathsep.join(new_path_parts)
+    _CAPS["added_dirs"] = list(candidate_dirs)
 
-    # Prong 2: register with the Python DLL search list. Belt-and-
-    # suspenders — covers the case where ORT loads a DLL via the
-    # `LOAD_LIBRARY_SEARCH_USER_DIRS` flag set, which ignores PATH
-    # entirely and only consults `AddDllDirectory` registrations.
-    for d in found_dirs:
-        try:
-            os.add_dll_directory(d)
-        except (OSError, AttributeError):
-            # add_dll_directory missing on Python <3.8 (we require 3.10
-            # so this won't fire) or the directory already registered.
-            # Either way, the PATH prepend above is the load-bearing
-            # mechanism — the add_dll_directory call is just insurance.
-            pass
+    # ── Phase 3: probe each EP's required DLLs against the live loader ─
+    # We only mark an EP capable if EVERY DLL it needs at runtime is
+    # reachable. This is what stops the "looks fine, then crashes at
+    # InferenceSession" trap that bites cloud users without CUDA.
+    _CAPS["cudnn"] = _can_load_dll("cudnn64_9.dll")
+    _CAPS["cuda"] = (
+        _can_load_dll("cudart64_12.dll")
+        and _can_load_dll("cublas64_12.dll")
+        and _can_load_dll("cublasLt64_12.dll")
+        and _CAPS["cudnn"]
+    )
+    _CAPS["tensorrt"] = (
+        _can_load_dll("nvinfer_10.dll")
+        and _CAPS["cuda"]   # TRT EP delegates non-TRT ops to CUDA EP
+    )
+    _CAPS["msvc"] = _msvc_runtime_present()
 
     _NVIDIA_DLL_BOOTSTRAP_DONE = True
-    # One-line debug breadcrumb so users grepping for `[providers]` see
-    # what got bound. Kept to a single short line — the EP ladder log
-    # below is the primary signal anyway.
+
+    # Single-line capability summary. Quiet enough for production logs,
+    # informative enough that "TRT didn't kick in" is one grep away.
+    enabled = [k for k in ("tensorrt", "cuda", "cudnn", "msvc") if _CAPS[k]]
+    missing = [k for k in ("tensorrt", "cuda", "cudnn", "msvc") if not _CAPS[k]]
     print(
-        f"  [providers] bootstrapped NVIDIA DLL dirs: "
-        f"{', '.join(os.path.basename(d) or d for d in found_dirs)}"
+        f"  [providers] capabilities: "
+        f"enabled=[{', '.join(enabled) or 'none'}] "
+        f"missing=[{', '.join(missing) or 'none'}]"
     )
+
+
+# ---------------------------------------------------------------------------
+# Probe helpers used by the bootstrap. Kept module-private (underscore)
+# because they're implementation details — only `_bootstrap_nvidia_dlls()`
+# and `resolve_providers()` should call them.
+# ---------------------------------------------------------------------------
+
+def _try_import(mod_name: str) -> bool:
+    """True iff `import mod_name` succeeds. No side-effects on failure."""
+    try:
+        __import__(mod_name)
+        return True
+    except ImportError:
+        return False
+
+
+def _wheel_dir(mod_name: str, sub_path: str) -> str | None:
+    """Return the on-disk dir for a pip wheel's DLL bundle, or None.
+
+    Uses the package's `__file__` to locate site-packages, then joins
+    `sub_path` (commonly "bin"). Returns None if the wheel isn't
+    installed OR the expected sub_path doesn't exist on disk.
+    """
+    try:
+        mod = __import__(mod_name, fromlist=["__file__"])
+    except ImportError:
+        return None
+    mod_file = getattr(mod, "__file__", None)
+    if not mod_file:
+        return None
+    base_dir = os.path.dirname(mod_file)
+    target = os.path.join(base_dir, sub_path) if sub_path else base_dir
+    return target if os.path.isdir(target) else None
+
+
+def _system_cuda_roots() -> list[str]:
+    """All plausible system CUDA Toolkit roots, highest-version-first.
+
+    Probes:
+      * `CUDA_PATH`, `CUDA_HOME`, `CUDA_PATH_V12_*` env vars
+      * standard installer location
+        `C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v*`
+
+    Filters to versions whose `bin/cudart64_12.dll` actually exists —
+    older v10/v11 toolkits would mismatch our cu12 wheels and ORT.
+    Returns a deduplicated list, no order guarantees beyond
+    "best candidate first".
+    """
+    import glob
+
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    # Env-var probes first — user's explicit choice wins.
+    for env in (
+        "CUDA_PATH", "CUDA_HOME",
+        "CUDA_PATH_V12_0", "CUDA_PATH_V12_1", "CUDA_PATH_V12_2",
+        "CUDA_PATH_V12_3", "CUDA_PATH_V12_4", "CUDA_PATH_V12_5",
+        "CUDA_PATH_V12_6", "CUDA_PATH_V12_7", "CUDA_PATH_V12_8",
+        "CUDA_PATH_V12_9",
+    ):
+        v = os.environ.get(env, "").strip()
+        if v and os.path.isdir(v) and v not in seen:
+            seen.add(v)
+            roots.append(v)
+
+    # Then the installer's standard layout. We sort descending so the
+    # highest v12.* wins on ties (newer CUDA = more codegen kernels +
+    # better Blackwell support — relevant for the user's RTX 5090).
+    matches = glob.glob(
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*"
+    )
+    matches.sort(reverse=True)
+    for m in matches:
+        if m in seen:
+            continue
+        if not os.path.isdir(os.path.join(m, "bin")):
+            continue
+        seen.add(m)
+        roots.append(m)
+
+    # Filter to v12-compatible toolkits only. Older v10/v11 ship
+    # cudart64_10.dll / cudart64_11.dll and ORT-cu12 will reject them.
+    return [r for r in roots if os.path.isfile(
+        os.path.join(r, "bin", "cudart64_12.dll")
+    )]
+
+
+def _can_load_dll(name: str) -> bool:
+    """True iff Windows can resolve `name` via the current PATH/dll dirs.
+
+    Uses `ctypes.WinDLL` because that calls `LoadLibraryW` with the
+    same default search semantics ORT's provider bridge uses — so a
+    success here is the strongest available signal that ORT will
+    succeed too. We unload the test handle immediately by dropping
+    the reference (Windows refcounts module loads).
+
+    Non-Windows callers should not rely on this — returns False on
+    POSIX since the DLL extension wouldn't match libfoo.so anyway.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        ctypes.WinDLL(name)
+        return True
+    except (OSError, FileNotFoundError):
+        return False
+
+
+def _msvc_runtime_present() -> bool:
+    """True iff the MSVC C++ Redistributable runtime DLLs are installed.
+
+    ORT's CUDA/TRT EP DLLs link against `vcruntime140.dll` and
+    `msvcp140.dll`. On a fresh Windows Server / Datacenter image
+    (common in cloud) these are NOT pre-installed, and the EPs fail
+    to load with a misleading WinError 126 that names a CUDA DLL.
+    Probing System32 directly is the cheapest way to give the user
+    a clear "install VC++ Redistributable" hint instead.
+    """
+    sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    needed = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
+    return all(os.path.isfile(os.path.join(sys32, dll)) for dll in needed)
 
 
 # Run the bootstrap at module import time. Every code path into the
@@ -313,28 +479,60 @@ def _tensorrt_libs_importable() -> bool:
 
 
 def _trt_enabled() -> bool:
-    """True if the user opted into TensorRT EP.
+    """True if the TensorRT EP should sit at the top of the ladder.
 
-    Two gates: env var must be truthy AND tensorrt_libs must be
-    importable. Both must hold — opting in without the libs is a
-    config error we surface via a one-line warning rather than a
-    crash, because the lane still works fine on CUDA.
+    Decision matrix (env var wins over capability probe, capability
+    probe wins over wishful thinking):
+
+        ┌─────────────────────────┬──────────┬──────────────────────┐
+        │ VIDEO_USE_PARAKEET_TRT  │ _CAPS    │ result               │
+        ├─────────────────────────┼──────────┼──────────────────────┤
+        │ "1"/"true"/...          │ capable  │ True                 │
+        │ "1"/"true"/...          │ NOT cap. │ False + loud warning │
+        │ "0"/"false"/...         │ either   │ False (user override)│
+        │ unset / empty           │ capable  │ True  (NEW default)  │
+        │ unset / empty           │ NOT cap. │ False (silent skip)  │
+        └─────────────────────────┴──────────┴──────────────────────┘
+
+    Why TRT-by-default-when-capable:
+        On a machine with the TRT wheels + system CUDA installed, the
+        engine compile happens once and is cached on disk; subsequent
+        runs load the cached engine in <1s and we get the full ~320x
+        RTFx speedup instead of CUDA's ~70x. The user already paid
+        the disk + install cost for `tensorrt-cu12-libs`, so it would
+        be rude not to use it.
+
+    Why we still gate on _CAPS["tensorrt"] in cloud:
+        Cloud CPU-only / GPU-without-TRT machines can't compile an
+        engine at all. Auto-on without the capability check would
+        crash at first inference instead of the smooth fallback to
+        CUDA / CPU we want. The probe is cheap (a single ctypes
+        WinDLL) and runs once at module import.
     """
     raw = os.environ.get("VIDEO_USE_PARAKEET_TRT", "").strip().lower()
-    if raw not in _TRUTHY:
+    capable = bool(_CAPS.get("tensorrt"))
+
+    # Explicit user override — honor it and warn loudly if the env
+    # asks for something we can't actually deliver.
+    if raw in _TRUTHY:
+        if not capable:
+            print(
+                "  [providers] VIDEO_USE_PARAKEET_TRT=1 set but "
+                "TensorRT runtime not detected (missing nvinfer_10.dll "
+                "or upstream CUDA dependency). Falling back to CUDA EP. "
+                "Install: `pip install tensorrt-cu12-libs nvidia-cudnn-cu12` "
+                "and ensure CUDA Toolkit 12.x is on PATH.",
+                file=sys.stderr,
+            )
+            return False
+        return True
+    if raw in _FALSY:
         return False
-    if not _tensorrt_libs_importable():
-        # User asked for TRT but the runtime libs aren't installed.
-        # Single line to stderr so they know why we silently fell back
-        # to CUDA — never raise, because CUDA EP is still very fast.
-        print(
-            "  [providers] VIDEO_USE_PARAKEET_TRT=1 set but "
-            "`tensorrt_libs` is not importable. Falling back to "
-            "CUDA EP. Install with:  pip install tensorrt-cu12-libs",
-            file=sys.stderr,
-        )
-        return False
-    return True
+
+    # Unset → capability-driven default. No noise either way; the
+    # one-line "[providers] resolved EP ladder: ..." log already tells
+    # the user which tier we picked.
+    return capable
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +589,15 @@ def resolve_providers(prefer_tensorrt: bool = True) -> list:
         ladder.append(("TensorrtExecutionProvider", _trt_options()))
 
     # ── Tier 2: CUDA ──────────────────────────────────────────────────
-    if "CUDAExecutionProvider" in available:
+    # Gated on `_CAPS["cuda"]` on Windows — ORT happily lists CUDA as
+    # "available" purely because the EP DLL was compiled in, but it
+    # will silent-fall-back to CPU at session creation if cudart /
+    # cublas / cudnn aren't actually loadable. Probing first lets us
+    # skip the broken tier cleanly so the lane log shows
+    # `CPUExecutionProvider` (truth) instead of CUDA -> CPU (lie).
+    # On non-Windows we trust ORT's probe since rpath usually works.
+    cuda_capable = _CAPS.get("cuda", True) if sys.platform == "win32" else True
+    if "CUDAExecutionProvider" in available and cuda_capable:
         ladder.append(("CUDAExecutionProvider", _cuda_options()))
 
     # ── Tier 3: DirectML (Windows) ────────────────────────────────────
@@ -424,10 +630,19 @@ def resolve_providers(prefer_tensorrt: bool = True) -> list:
 
 def main() -> None:
     """Print the resolved ladder + raw ORT availability for diagnostics."""
-    print("ORT installed providers:", _ort_available_providers())
-    print("VIDEO_USE_PARAKEET_TRT  :", os.environ.get("VIDEO_USE_PARAKEET_TRT", ""))
+    print("ORT installed providers :", _ort_available_providers())
+    print("VIDEO_USE_PARAKEET_TRT  :", os.environ.get("VIDEO_USE_PARAKEET_TRT", "(unset)"))
     print("tensorrt_libs importable:", _tensorrt_libs_importable())
-    print("ladder (prefer_trt=True):", resolve_providers(prefer_tensorrt=True))
+    # Capability matrix lifted straight from `_CAPS` so users can see
+    # exactly which gate failed when TRT/CUDA didn't kick in.
+    print("capabilities            :", {
+        k: _CAPS[k] for k in ("tensorrt", "cuda", "cudnn", "msvc")
+    })
+    if _CAPS.get("added_dirs"):
+        print("DLL dirs added          :")
+        for d in _CAPS["added_dirs"]:
+            print(f"  - {d}")
+    print("ladder (prefer_trt=True ):", resolve_providers(prefer_tensorrt=True))
     print("ladder (prefer_trt=False):", resolve_providers(prefer_tensorrt=False))
 
 
