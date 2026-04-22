@@ -66,6 +66,10 @@ PANNS_LABELS_URL = (
     "https://raw.githubusercontent.com/qiuqiangkong/"
     "audioset_tagging_cnn/master/metadata/class_labels_indices.csv"
 )
+PANNS_CHECKPOINT_PATH = PANNS_DATA_DIR / "Cnn14_mAP=0.431.pth"
+PANNS_CHECKPOINT_URL = (
+    "https://zenodo.org/record/3987831/files/Cnn14_mAP%3D0.431.pth"
+)
 
 
 def _ensure_panns_data_csv() -> None:
@@ -102,6 +106,102 @@ def _ensure_panns_data_csv() -> None:
             f"to {PANNS_LABELS_CSV}: {type(exc).__name__}: {exc}. "
             f"If your network is restricted, place the file manually at "
             f"that path and re-run."
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# PANNs CNN14 checkpoint bootstrap
+#
+# Older `panns_inference` versions auto-fetched the CNN14 weights on first
+# `AudioTagging(checkpoint_path=None)` call; current releases dropped that
+# behavior and just crash with a FileNotFoundError pointing at
+# `~/panns_data/Cnn14_mAP=0.431.pth`. Same problem shape as the labels CSV
+# above — we mirror the same fix: fetch from the upstream Zenodo record
+# the first time the lane runs on a machine.
+#
+# The checkpoint is ~340 MB so we stream it in 1 MB chunks (don't .read()
+# the whole body — that would peak at 340 MB of resident RAM with zero
+# user feedback). A 10 MB progress tick keeps the console alive without
+# spamming the log.
+# ---------------------------------------------------------------------------
+
+def _ensure_panns_data_checkpoint() -> None:
+    """Guarantee `~/panns_data/Cnn14_mAP=0.431.pth` exists before we hand
+    `panns_inference.AudioTagging` a `checkpoint_path=None`. Idempotent:
+    returns instantly when the file is already present and non-empty.
+
+    Streams the ~340 MB body in 1 MB chunks with a coarse progress print
+    every ~10 MB so the user knows the process isn't hung. Atomic-write
+    pattern (`.pth.tmp` -> `Path.replace`) so a Ctrl-C mid-download never
+    leaves a half-written checkpoint that PANNs would later mis-load.
+
+    Raises RuntimeError with actionable advice when the network fetch
+    fails — better than the cryptic FileNotFoundError panns would emit.
+    """
+    if PANNS_CHECKPOINT_PATH.exists() and PANNS_CHECKPOINT_PATH.stat().st_size > 0:
+        return
+
+    PANNS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"  panns: bootstrapping CNN14 checkpoint -> {PANNS_CHECKPOINT_PATH}")
+    print(f"  panns: ~340 MB one-time download from {PANNS_CHECKPOINT_URL}")
+
+    # Atomic-write pattern matches the CSV helper above. Same reasoning:
+    # an interrupted half-file would silently break later inference runs.
+    tmp_path = PANNS_CHECKPOINT_PATH.with_suffix(".pth.tmp")
+    # 1 MB read chunks. Small enough to keep RAM flat, large enough that
+    # the per-chunk Python overhead vanishes next to the network read.
+    chunk_size = 1024 * 1024
+    # Print a progress line every ~10 MB. Coarse on purpose — the goal is
+    # "not hung", not a precise progress bar (we said no tqdm dep).
+    progress_step = 10 * 1024 * 1024
+    try:
+        with urllib.request.urlopen(PANNS_CHECKPOINT_URL, timeout=60) as resp:
+            # Content-Length lets us print "X / Y MB"; some mirrors omit
+            # it, in which case we just print the running total.
+            total_bytes = 0
+            try:
+                total_bytes = int(resp.headers.get("Content-Length", "0") or 0)
+            except (TypeError, ValueError):
+                total_bytes = 0
+            total_mb = total_bytes / (1024 * 1024) if total_bytes else 0.0
+
+            downloaded = 0
+            next_tick = progress_step
+            with open(tmp_path, "wb") as fh:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded >= next_tick:
+                        done_mb = downloaded / (1024 * 1024)
+                        if total_mb:
+                            print(f"  panns: downloaded {done_mb:.0f} / {total_mb:.0f} MB")
+                        else:
+                            print(f"  panns: downloaded {done_mb:.0f} MB")
+                        next_tick += progress_step
+
+            # Final summary line so the user sees a clean "done" rather
+            # than the loop just stopping mid-progress.
+            done_mb = downloaded / (1024 * 1024)
+            if total_mb:
+                print(f"  panns: downloaded {done_mb:.0f} / {total_mb:.0f} MB (complete)")
+            else:
+                print(f"  panns: downloaded {done_mb:.0f} MB (complete)")
+
+        tmp_path.replace(PANNS_CHECKPOINT_PATH)
+    except Exception as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"could not download PANNs CNN14 checkpoint from "
+            f"{PANNS_CHECKPOINT_URL} to {PANNS_CHECKPOINT_PATH}: "
+            f"{type(exc).__name__}: {exc}. If your network is restricted, "
+            f"place the file manually at that path and re-run."
         ) from exc
 
 
@@ -275,9 +375,13 @@ def _build_tagger(device: str):
     Bootstraps the AudioSet labels CSV first — otherwise the
     `from panns_inference import AudioTagging` line below crashes inside
     panns's own config.py with a FileNotFoundError that obscures the real
-    "no data file shipped with the package" cause.
+    "no data file shipped with the package" cause. Then bootstraps the
+    CNN14 checkpoint (current `panns_inference` releases no longer
+    auto-fetch it on first use, so `AudioTagging(checkpoint_path=None)`
+    would otherwise blow up with a FileNotFoundError for the .pth).
     """
     _ensure_panns_data_csv()
+    _ensure_panns_data_checkpoint()
     from panns_inference import AudioTagging
     try:
         return AudioTagging(checkpoint_path=None, device=device)

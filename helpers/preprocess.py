@@ -55,6 +55,37 @@ PYTHON = sys.executable
 
 
 # ---------------------------------------------------------------------------
+# Lane launch staggering
+# ---------------------------------------------------------------------------
+#
+# When PARALLEL_3 (or any multi-lane parallel schedule) fires, all child
+# subprocesses race to cuda.cudaMalloc their model weights in the same
+# ~100ms window. Each lane's STEADY-STATE footprint may fit comfortably,
+# but the TRANSIENT peak (weights materializing alongside intermediate
+# activations + the CUDA caching allocator's slab reservations) can push
+# the device past its VRAM ceiling and trigger an OOM — especially for
+# Whisper-large-v3, whose KV cache grows during long-form generation
+# right when Florence-2 is still committing its weights.
+#
+# The fix is cheap: stagger the thread starts so each child has time to
+# settle its initial weight allocation before the next one fires.
+#
+# Why 8 seconds:
+#   - Whisper-large-v3 weight load: ~3-5s on a fast NVMe + cu128 wheel
+#   - Florence-2-base   weight load: ~2-3s
+#   - PANNs CNN14       weight load: ~1-2s
+#   - 8s gives comfortable headroom for the slowest lane to commit its
+#     weights to VRAM before the next allocator hits the device
+#   - Cost on the wall clock: 2 gaps × 8s = 16s extra at the start of a
+#     3-15 minute preprocess run. Negligible vs. the OOM-and-retry path.
+#
+# Override at runtime with the env var VIDEO_USE_LANE_STAGGER_S (float,
+# seconds). Set to 0 to disable staggering entirely, or crank it higher
+# on slow NVMe / cold model caches where weight loads take longer.
+LANE_STAGGER_S = 8.0
+
+
+# ---------------------------------------------------------------------------
 # Lane spec
 # ---------------------------------------------------------------------------
 
@@ -240,17 +271,62 @@ def _spawn_parallel(jobs: list[LaneJob]) -> list[int]:
     in the same order. Each job uses its own subprocess for GPU isolation
     (CUDA contexts are per-process), so this is safe even with 3 GPU
     lanes simultaneously — they share the device but not the allocator.
+
+    Launch staggering
+    -----------------
+    To avoid a simultaneous cuda.cudaMalloc spike across all children
+    (which can OOM even when steady-state VRAM would fit), thread starts
+    are spaced by `LANE_STAGGER_S` seconds. The FIRST thread starts
+    immediately; only the 2nd / 3rd / Nth get delayed. The delay is read
+    once from the env var `VIDEO_USE_LANE_STAGGER_S` (float, seconds),
+    falling back to the module constant `LANE_STAGGER_S`. Set the env
+    var to 0 to disable staggering entirely (e.g. on multi-GPU rigs
+    where each lane gets its own device).
     """
+    # ---------------------------------------------------------------
+    # Resolve the per-launch delay once, up front. We parse defensively
+    # because env vars are user-supplied strings and a typo here would
+    # otherwise crash the orchestrator mid-dispatch.
+    # ---------------------------------------------------------------
+    raw = os.environ.get("VIDEO_USE_LANE_STAGGER_S")
+    if raw is None or raw == "":
+        stagger_s = LANE_STAGGER_S
+    else:
+        try:
+            stagger_s = float(raw)
+        except ValueError:
+            print(
+                f"[orchestrator] WARN: VIDEO_USE_LANE_STAGGER_S={raw!r} is "
+                f"not a float; falling back to {LANE_STAGGER_S}s"
+            )
+            stagger_s = LANE_STAGGER_S
+    # Negative values are nonsense — clamp to 0 (i.e. no stagger).
+    if stagger_s < 0:
+        stagger_s = 0.0
+
     results: dict[int, int] = {}
     threads: list[threading.Thread] = []
 
     def runner(idx: int, job: LaneJob) -> None:
         results[idx] = _run_lane(job)
 
+    # ---------------------------------------------------------------
+    # Launch loop. We sleep BETWEEN starts (not before the first, not
+    # after the last) so the wall-clock cost is exactly
+    # (N - 1) * stagger_s and the first lane can begin loading weights
+    # the instant we get here.
+    # ---------------------------------------------------------------
     for idx, job in enumerate(jobs):
+        if idx > 0 and stagger_s > 0:
+            print(
+                f"[orchestrator] staggering {stagger_s:.0f}s before "
+                f"launching {job.name}"
+            )
+            time.sleep(stagger_s)
         t = threading.Thread(target=runner, args=(idx, job), daemon=False)
         t.start()
         threads.append(t)
+
     for t in threads:
         t.join()
     return [results.get(i, -1) for i in range(len(jobs))]

@@ -197,6 +197,76 @@ def _install_legacy_pretrained_config_compat() -> None:
 
 
 # ---------------------------------------------------------------------------
+# transformers 5.x compatibility shim — second layer, model side.
+#
+# In transformers 5.x the attention dispatcher in `modeling_utils.py`
+# unconditionally reads support flags off `self` to decide which kernel
+# to wire up (eager vs sdpa vs flash-attn-2). Bona-fide HF models declare
+# these as class attributes on their subclass of `PreTrainedModel`. But
+# Florence-2 ships its modeling file via trust_remote_code, and that file
+# predates the new dispatcher contract — it never declares `_supports_sdpa`
+# at all. Result, on first forward pass:
+#
+#     AttributeError: 'Florence2ForConditionalGeneration' object has no
+#                     attribute '_supports_sdpa'
+#         at transformers/modeling_utils.py:1709
+#
+# Why setting these to False is the correct floor (not True):
+#   - False → dispatcher falls back to the eager attention path, which
+#     is universally correct, just slower. Worst case: a perf hit.
+#   - True without the model actually implementing the SDPA / flash-attn
+#     contract → the dispatcher hands the kernel tensors it can't handle,
+#     producing silently-wrong outputs (or a crash inside the kernel,
+#     which is the lucky case). Correctness > throughput.
+#
+# Why this is safe for models that DO declare the attrs:
+#   - We only `setattr` when `hasattr(...)` is False on the class. Real
+#     HF models that declare `_supports_sdpa = True` on their subclass
+#     are untouched — subclass attribute lookup hits their declaration
+#     long before walking up to `PreTrainedModel`.
+#   - Instance-level writes (`self._supports_sdpa = True` from inside a
+#     custom __init__) also win over the class default, because Python
+#     attribute lookup checks the instance __dict__ first. We're setting
+#     the FLOOR, not overriding declared values.
+#
+# Scope: this matters only for trust_remote_code modules whose authors
+# never updated to the 5.x dispatcher contract. First-party HF models
+# always declare these flags — the patch is a no-op for them.
+#
+# Idempotent, cheap, no model load required.
+# ---------------------------------------------------------------------------
+
+_MISSING_MODEL_FLAGS_IN_TRANSFORMERS_5 = (
+    "_supports_sdpa",
+    "_supports_flash_attn_2",
+    "_supports_flash_attn",          # legacy 4.x name, harmless to add
+    "_supports_cache_class",
+    "_supports_static_cache",
+    "_supports_quantized_cache",
+)
+
+
+def _install_legacy_pretrained_model_compat() -> None:
+    """Provide False defaults for attention-dispatch support flags that
+    transformers 5.x's `PreTrainedModel` no longer declares but its
+    dispatcher unconditionally reads.
+
+    Safe no-op when transformers isn't installed (the visual lane is
+    optional via `[preprocess]`) and when the attributes already exist
+    (transformers 4.x, or trust_remote_code modules that *do* declare
+    them). False is the correctness-preserving floor: it forces the
+    eager attention path instead of risking a silently-wrong fast path.
+    """
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+    except ImportError:
+        return
+    for attr in _MISSING_MODEL_FLAGS_IN_TRANSFORMERS_5:
+        if not hasattr(PreTrainedModel, attr):
+            setattr(PreTrainedModel, attr, False)
+
+
+# ---------------------------------------------------------------------------
 # Florence-2 model construction. trust_remote_code=True is REQUIRED — the
 # model uses a custom modeling file that ships in the HF repo.
 # ---------------------------------------------------------------------------
@@ -206,6 +276,11 @@ def _build_florence(model_id: str, device: str, dtype_name: str):
     # the removed attrs during __init__, which is invoked synchronously
     # by AutoConfig (and therefore AutoModelForCausalLM) below.
     _install_legacy_pretrained_config_compat()
+    # Order matters: config patch must precede the model patch, because
+    # AutoConfig resolution happens before any PreTrainedModel subclass
+    # is touched. This second patch covers the attention dispatcher's
+    # support-flag reads on the model side.
+    _install_legacy_pretrained_model_compat()
 
     import torch
     from transformers import AutoModelForCausalLM, AutoProcessor
