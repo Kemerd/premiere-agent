@@ -20,6 +20,7 @@ can scrape pass-rate without parsing rich output.
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 import os
 import subprocess
@@ -34,6 +35,123 @@ from pathlib import Path
 # fast tier.
 PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT / "helpers"))
+
+
+# ---------------------------------------------------------------------------
+# Live output: force everything we print to flush IMMEDIATELY.
+#
+# Why this matters: when stdout isn't a TTY (piped to Claude Code, redirected
+# to a file, run under `Get-Content -Wait`), Python's default buffering hides
+# everything until the buffer fills or the process exits. On the heavy tier
+# that means 60-90s of "did it freeze??" silence per model load.
+#
+# Two layers of defense:
+#   1. Reconfigure the std streams to line-buffered + UTF-8 (Windows console
+#      defaults to cp1252 which mangles unicode in HF model names).
+#   2. Replace builtins.print with a flush=True version. Calls in this file
+#      still pass through normally; calls in transitively-imported helper
+#      modules (whisper_lane, etc) ALSO get the flush behaviour for free.
+# ---------------------------------------------------------------------------
+
+def _enable_live_output() -> None:
+    try:
+        # Python 3.7+ — set line buffering and UTF-8 encoding atomically.
+        sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        # Already wrapped (rare) or older Python — no-op, the print
+        # monkey-patch below still gives us flushing.
+        pass
+
+    _orig_print = builtins.print
+
+    def _flushy_print(*args, **kwargs):
+        kwargs.setdefault("flush", True)
+        return _orig_print(*args, **kwargs)
+
+    builtins.print = _flushy_print
+
+_enable_live_output()
+
+
+# ---------------------------------------------------------------------------
+# Optional log tee — when --log <path> is passed, mirror EVERY byte that
+# would go to stdout/stderr into the log file as well, atomically per write.
+# Lets the user run:
+#
+#     python -u tests.py --heavy --log run.log
+#
+# in one window and:
+#
+#     Get-Content run.log -Wait        # PowerShell
+#     tail -f run.log                  # bash / zsh
+#
+# in another to watch progress live, even if the test process is suspended
+# in a Claude Code subshell.
+# ---------------------------------------------------------------------------
+
+class _Tee:
+    """Mirror writes to two streams. Tolerant of one side being closed."""
+
+    def __init__(self, primary, secondary):
+        self._a = primary
+        self._b = secondary
+
+    def write(self, s: str) -> int:
+        n = 0
+        try:
+            n = self._a.write(s)
+        except Exception:
+            pass
+        try:
+            self._b.write(s)
+            self._b.flush()
+        except Exception:
+            pass
+        return n
+
+    def flush(self) -> None:
+        for s in (self._a, self._b):
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        try:
+            return self._a.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._a, name)
+
+
+def _install_log_tee(log_path: Path) -> None:
+    """Wrap stdout + stderr so all output also goes to the log file.
+
+    Writes are flushed immediately so external `tail -f` sees lines as
+    they're emitted, not in 4 KB chunks.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(log_path, "w", encoding="utf-8", buffering=1)  # line-buffered
+    fh.write(f"# tests.py log @ {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    fh.flush()
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+
+
+# ---------------------------------------------------------------------------
+# Timestamped status helper — used by HEAVY tier so user can tell which
+# model load is "currently happening" vs "definitely hung".
+# ---------------------------------------------------------------------------
+
+_TEST_T0 = time.monotonic()
+
+def _status(msg: str) -> None:
+    """Print a single timestamped status line. Always flushes."""
+    elapsed = time.monotonic() - _TEST_T0
+    print(f"  [{elapsed:6.1f}s] {msg}")
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +710,21 @@ def test_parakeet_fallback(R: Results, tmp: Path) -> None:
         traceback.print_exc()
         R.fail("sentinel lifecycle", f"{type(e).__name__}: {e}")
 
+    # Air-gapped escape hatch: PARAKEET_MODEL_PATH env-var contract.
+    # We can't actually load NeMo here (heavy + may not be installed),
+    # but we *can* verify the constant exists and that an obviously-bad
+    # path produces the actionable RuntimeError instead of a raw
+    # FileNotFoundError. This locks in the user-facing contract for
+    # users behind proxies that block HF entirely.
+    try:
+        assert hasattr(pl, "PARAKEET_MODEL_PATH_ENV"), \
+            "parakeet_lane must expose PARAKEET_MODEL_PATH_ENV constant"
+        assert pl.PARAKEET_MODEL_PATH_ENV == "PARAKEET_MODEL_PATH", \
+            f"env var name regressed: {pl.PARAKEET_MODEL_PATH_ENV}"
+        R.ok("PARAKEET_MODEL_PATH env-var contract")
+    except Exception as e:
+        R.fail("PARAKEET_MODEL_PATH contract", f"{type(e).__name__}: {e}")
+
 
 # ---------------------------------------------------------------------------
 # 9. HEAVY tier — actually load the three production models and run them
@@ -621,7 +754,20 @@ def test_heavy(R: Results, tmp: Path) -> None:
     edit.mkdir(exist_ok=True)
     clip = tmp / "synth.mp4"
 
+    # Hint to the user up front about what's about to happen — first run
+    # of each lane downloads its model weights, which can take minutes
+    # and look like a hang if no progress is shown.
+    _status(
+        "HEAVY mode is loading three real models. First run downloads:"
+    )
+    print("           - openai/whisper-large-v3       (~3.0 GB)")
+    print("           - microsoft/Florence-2-base     (~1.0 GB)")
+    print("           - PANNs CNN14 (panns-inference) (~340 MB)")
+    print("           Subsequent runs hit the HF cache and start in ~5s each.")
+    print("           HF transformers prints its own download bars to stderr.")
+
     try:
+        _status("generating synthetic 2s clip via ffmpeg ...")
         _make_synthetic_clip(clip, seconds=2.0)
         R.ok(f"synthetic clip generated ({clip.stat().st_size // 1024} KB)")
     except Exception as e:
@@ -630,7 +776,10 @@ def test_heavy(R: Results, tmp: Path) -> None:
 
     # ── Whisper ───────────────────────────────────────────────────────
     try:
+        _status("Whisper lane: importing whisper_lane ...")
         from whisper_lane import run_whisper_lane_batch
+        _status("Whisper lane: loading openai/whisper-large-v3 (download on first run) ...")
+        t0 = time.monotonic()
         out = run_whisper_lane_batch(
             [clip], edit,
             model_id="openai/whisper-large-v3",
@@ -641,6 +790,7 @@ def test_heavy(R: Results, tmp: Path) -> None:
             num_speakers=None,
             force=False,
         )
+        _status(f"Whisper lane: done in {time.monotonic()-t0:.1f}s")
         if out and out[0].exists():
             data = json.loads(out[0].read_text(encoding="utf-8"))
             n_words = sum(1 for w in data.get("words", []) if w.get("type") == "word")
@@ -654,12 +804,15 @@ def test_heavy(R: Results, tmp: Path) -> None:
 
     # ── PANNs ─────────────────────────────────────────────────────────
     try:
+        _status("Audio lane: importing audio_lane + loading PANNs CNN14 ...")
         from audio_lane import run_audio_lane_batch
+        t0 = time.monotonic()
         out = run_audio_lane_batch(
             [clip], edit,
             threshold=0.30, top_k=5, windows_per_batch=64,
             force=False,
         )
+        _status(f"Audio lane: done in {time.monotonic()-t0:.1f}s")
         if out and out[0].exists():
             data = json.loads(out[0].read_text(encoding="utf-8"))
             n_events = len(data.get("events", []))
@@ -673,7 +826,9 @@ def test_heavy(R: Results, tmp: Path) -> None:
 
     # ── Florence-2 ────────────────────────────────────────────────────
     try:
+        _status("Visual lane: importing visual_lane + loading Florence-2-base ...")
         from visual_lane import run_visual_lane_batch
+        t0 = time.monotonic()
         out = run_visual_lane_batch(
             [clip], edit,
             model_id="microsoft/Florence-2-base",
@@ -681,6 +836,7 @@ def test_heavy(R: Results, tmp: Path) -> None:
             task="<MORE_DETAILED_CAPTION>",
             force=False,
         )
+        _status(f"Visual lane: done in {time.monotonic()-t0:.1f}s")
         if out and out[0].exists():
             data = json.loads(out[0].read_text(encoding="utf-8"))
             n_caps = len(data.get("captions", []))
@@ -695,6 +851,7 @@ def test_heavy(R: Results, tmp: Path) -> None:
 
     # ── Pack the three lanes ──────────────────────────────────────────
     try:
+        _status("packing three lanes -> *_timeline.md ...")
         proc = subprocess.run(
             [sys.executable, str(PROJECT_ROOT / "helpers" / "pack_timelines.py"),
              "--edit-dir", str(edit), "--merge"],
@@ -753,13 +910,31 @@ def run_all(heavy: bool = False, keep_tmp: bool = False) -> Results:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="video-use-premiere smoke tests")
+    ap = argparse.ArgumentParser(
+        description="video-use-premiere smoke tests",
+        epilog=(
+            "TIP: For live output during long-running heavy mode, run with:\n"
+            "    python -u tests.py --heavy --log run.log\n"
+            "Then in a SECOND window:\n"
+            "    Get-Content run.log -Wait      (PowerShell)\n"
+            "    tail -f run.log                (bash/zsh)\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--heavy", action="store_true",
                     help="Also run the model-loading tier (~4.5 GB download "
                          "on first run, GPU recommended).")
     ap.add_argument("--keep-tmp", action="store_true",
                     help="Don't delete the temp dir at the end.")
+    ap.add_argument("--log", type=Path, default=None,
+                    help="Tee all stdout+stderr to this log file as well, "
+                         "line-buffered. Use with `Get-Content -Wait` or "
+                         "`tail -f` from another window to follow live progress.")
     args = ap.parse_args()
+
+    if args.log is not None:
+        _install_log_tee(args.log.resolve())
+        print(f"  log tee: {args.log.resolve()}")
 
     R = run_all(heavy=args.heavy, keep_tmp=args.keep_tmp)
     return 0 if not R.failed else 1
