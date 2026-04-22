@@ -109,39 +109,62 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
         raise RuntimeError(f"could not probe dimensions of {video_path}")
 
     # ------------------------------------------------------------------
-    # Square center-crop, baked into the ffmpeg filter chain.
+    # Square center-crop + downscale to Florence's native input size,
+    # baked into the ffmpeg filter chain.
     #
-    # Why: Florence-2's vision tower has a hard assertion that the
-    # encoded feature map is square (`assert h * w == num_tokens, 'only
-    # support square feature maps for now'` — `modeling_florence2.py`
-    # line ~2610). With non-square pixel_values (e.g. 16:9 4K DJI
-    # footage) the embedding produces a non-square map and the
-    # assertion explodes mid-generate.
+    # Why crop:
+    #   Florence-2's vision tower has a hard assertion that the encoded
+    #   feature map is square (`assert h * w == num_tokens, 'only
+    #   support square feature maps for now'` — `modeling_florence2.py`
+    #   line ~2610). With non-square pixel_values (e.g. 16:9 4K DJI
+    #   footage) the embedding produces a non-square map and the
+    #   assertion explodes mid-generate.
     #
-    # Why ffmpeg-side crop instead of PIL post-decode:
-    #   1. ffmpeg crops BEFORE rgb24 conversion, so the pipe carries
-    #      `square^2 * 3` bytes per frame instead of `width * height * 3`.
-    #      For 4K 16:9 input that's a ~33% reduction in pipe bandwidth
-    #      and Python-side memory churn — meaningful at 1 fps over a
+    # Why scale to 768:
+    #   Florence-2-base ships with a fixed-size learned positional
+    #   embedding table sized for 768x768 / patch_size=32 → 24x24=576
+    #   tokens. Hand it any other resolution and `image_pos_embed(x)`
+    #   indexes out-of-bounds → device-side assert (which surfaces as a
+    #   misleading async CUDA error on the next op). transformers 5.x's
+    #   CLIPImageProcessor *should* resize for us via its `do_resize`
+    #   path, but the size-dict-vs-shortest-edge interpretation got
+    #   reshuffled in the 5.x rewrite and the resize is silently a
+    #   no-op on already-square inputs at non-default resolutions. We
+    #   short-circuit the ambiguity by handing the processor exactly
+    #   what its embedding table expects.
+    #
+    # Why ffmpeg-side crop+scale instead of PIL post-decode:
+    #   1. ffmpeg does both ops BEFORE rgb24 conversion, so the pipe
+    #      carries `768*768*3 = 1.7 MB` per frame instead of
+    #      `width * height * 3` (4K = ~25 MB). ~14x reduction in pipe
+    #      bandwidth + Python-side allocator churn at 1 fps over a
     #      multi-hour shoot.
-    #   2. PIL.Image.crop() would force a temporary copy in user-space
-    #      Python; ffmpeg's `crop` filter does it inside the decoder
-    #      with zero extra allocation.
+    #   2. PIL.Image.{crop,resize} would force temporary copies in
+    #      user-space Python; ffmpeg's filter graph does both inside
+    #      the decoder with zero extra allocation.
+    #   3. ffmpeg's `lanczos` resampler is higher quality than PIL's
+    #      default (bilinear) for big downscales — meaningful for
+    #      detail-rich captioning targets.
     #
     # We center-crop to `min(width, height)` so portrait, landscape,
     # and already-square footage all become square. ffmpeg's `crop`
     # filter defaults to centered when x/y are omitted.
     # ------------------------------------------------------------------
     square_dim = min(width, height)
+    target_dim = 768  # Florence-2-base native input size; see preprocessor_config.json
 
     ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_bin, "-loglevel", "error",
         "-i", str(video_path),
         # Filter chain order matters: fps decimation FIRST (cheap, drops
-        # ~95% of frames before we pay the crop cost), THEN crop. Output
-        # of crop is `square_dim x square_dim` regardless of source AR.
-        "-vf", f"fps={fps},crop={square_dim}:{square_dim}",
+        # ~95% of frames before we pay the crop+scale cost), THEN crop
+        # to square, THEN scale to Florence's native size with lanczos
+        # for sharp downscaling. Order of crop->scale (rather than the
+        # reverse) saves ffmpeg a needless aspect-preserving resize.
+        "-vf",
+        f"fps={fps},crop={square_dim}:{square_dim},"
+        f"scale={target_dim}:{target_dim}:flags=lanczos",
         "-pix_fmt", "rgb24",
         "-f", "rawvideo", "-",
     ]
@@ -149,10 +172,10 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
     # Subprocess.Popen so we can stream stdout in frame-sized chunks.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    # Per-frame size now reflects the post-crop dimensions, not the
-    # source. Misreading this would mis-frame every chunk and yield
-    # garbage / a hang on the final partial chunk.
-    frame_size = square_dim * square_dim * 3
+    # Per-frame size reflects the FINAL output of the filter chain —
+    # post-crop, post-scale. Misreading this would mis-frame every
+    # chunk and yield garbage / a hang on the final partial chunk.
+    frame_size = target_dim * target_dim * 3
     t = 0
     try:
         while True:
@@ -160,7 +183,7 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
             if not buf or len(buf) < frame_size:
                 break
             arr = np.frombuffer(buf, dtype=np.uint8).reshape(
-                square_dim, square_dim, 3
+                target_dim, target_dim, 3
             )
             # Florence-2 takes PIL images. Conversion is cheap (no copy).
             yield t, Image.fromarray(arr, mode="RGB")

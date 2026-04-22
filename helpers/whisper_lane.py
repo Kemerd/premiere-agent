@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import warnings
@@ -169,20 +170,84 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     )) and ("memory" in msg or "alloc" in msg)
 
 
+def _vram_snapshot_via_nvidia_smi() -> str:
+    """Out-of-process VRAM probe via the `nvidia-smi` CLI.
+
+    Critical fallback: when an async CUDA error has poisoned our own
+    process's CUDA context, *every* in-process query (mem_get_info,
+    memory_stats, even cudaDeviceSynchronize) raises the same broken
+    error and gives us nothing to log. nvidia-smi runs in a separate
+    process with a fresh CUDA context, so it sees the actual driver
+    state regardless of what our process did to its own context.
+
+    Returns "" only if nvidia-smi isn't on PATH or fails — both of
+    which are themselves diagnostic ("nvidia-smi missing" tells the
+    user the driver itself isn't installed).
+    """
+    import shutil
+    nvsmi = shutil.which("nvidia-smi")
+    if nvsmi is None:
+        return ""
+    try:
+        # --query-gpu gives us the same numbers as torch.cuda.mem_get_info
+        # but from outside our (potentially broken) CUDA context. units MB.
+        proc = subprocess.run(
+            [
+                nvsmi,
+                "--query-gpu=memory.free,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return ""
+        # First line = device 0 (we don't currently support multi-GPU).
+        line = proc.stdout.strip().splitlines()[0]
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            return ""
+        free_mb, used_mb, total_mb = (float(parts[0]), float(parts[1]), float(parts[2]))
+        return (
+            f"VRAM (via nvidia-smi): "
+            f"free={free_mb / 1024:.2f} GB, "
+            f"used_by_all_procs={used_mb / 1024:.2f} GB, "
+            f"total={total_mb / 1024:.2f} GB"
+        )
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return ""
+
+
 def _vram_snapshot() -> str:
-    """Return a one-line summary of current GPU memory state, or '' if
-    CUDA isn't available. Used to give OOM logs context — without this
-    every OOM looks identical, so a user can't tell whether they hit
-    fragmentation, model-too-big, or co-tenant pressure.
+    """Return a one-line summary of current GPU memory state, or a
+    diagnostic-flavored fallback when in-process queries are unavailable.
+
+    Two-tier strategy:
+        1. Preferred: torch.cuda APIs — gives us our own allocator's
+           view (reserved / allocated / fragmentation deltas).
+        2. Fallback: shell out to nvidia-smi — works even when our
+           CUDA context is in an unrecoverable error state from a
+           prior async kernel failure (the exact case where snapshot
+           value is most needed for diagnostics).
+
+    Why we don't *just* use nvidia-smi: it can't see allocator
+    fragmentation (torch_reserved minus torch_allocated). On a healthy
+    context, the in-process numbers reveal that "free" memory might
+    actually be reserved-but-unused by torch's caching allocator —
+    super important for diagnosing real OOMs vs. pressure.
     """
     try:
         import torch
         if not torch.cuda.is_available():
-            return ""
+            return _vram_snapshot_via_nvidia_smi() or "(no CUDA, no nvidia-smi)"
         device = torch.cuda.current_device()
+        # mem_get_info hits the driver — first thing to fail if our
+        # context was corrupted by a prior async error.
         free_b, total_b = torch.cuda.mem_get_info(device)
-        # Caching allocator's view: how much torch *thinks* it owns vs.
-        # how much it's actively using right now. Big delta => fragmentation.
+        # Caching allocator view: torch_reserved - torch_allocated tells
+        # us how much memory torch *holds* but isn't currently using
+        # (fragmentation / cache for fast re-alloc).
         reserved_b = torch.cuda.memory_reserved(device)
         allocated_b = torch.cuda.memory_allocated(device)
         gb = lambda b: b / (1024 ** 3)
@@ -192,8 +257,13 @@ def _vram_snapshot() -> str:
             f"torch_reserved={gb(reserved_b):.2f} GB, "
             f"torch_allocated={gb(allocated_b):.2f} GB"
         )
-    except Exception:
-        return ""
+    except Exception as exc:
+        # In-process query failed — almost always means CUDA context
+        # is poisoned by an async kernel error. Note that fact and
+        # ALSO try nvidia-smi as a sanity check on actual driver state.
+        fallback = _vram_snapshot_via_nvidia_smi()
+        ctx_note = f"(torch CUDA context unusable: {type(exc).__name__})"
+        return f"{ctx_note} {fallback}".strip() if fallback else ctx_note
 
 
 def _release_cuda_cache() -> None:
