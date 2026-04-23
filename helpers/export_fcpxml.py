@@ -177,6 +177,42 @@ def _classify_colorspace(transfer: str, primaries: str) -> str:
     return _FCPXML_COLORSPACE_TABLE.get((t, p), _DEFAULT_FCPXML_COLORSPACE)
 
 
+# Canonical FPS values that OTIO's fcpx-xml adapter knows how to encode
+# (FRAMERATE_FRAMEDURATION dict keys in otio_fcpx_xml_adapter/fcpx_xml.py).
+# The adapter does an exact-equality lookup against these keys; any rate
+# that doesn't match exactly gets an empty <format frameDuration=""/>,
+# which the same adapter then crashes on while reading back during write
+# (`split("/")` on an empty string -> "expected 2, got 1" ValueError).
+#
+# ffprobe returns NTSC rates as their EXACT rational fractions:
+#     60000/1001  = 59.94005994005994...    (NOT 59.94)
+#     30000/1001  = 29.97002997002997...    (NOT 29.97)
+#     24000/1001  = 23.976023976023976...   (NOT 23.98)
+# We snap any rate within a tight tolerance of a canonical key onto that
+# key, so the adapter's lookup hits and the .fcpxml writes cleanly.
+# Integer rates pass through unchanged.
+_FCPXML_CANONICAL_FPS: tuple[float, ...] = (
+    23.98, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0,
+)
+
+
+def _snap_fps_for_fcpxml(fps: float, tolerance: float = 0.05) -> float:
+    """Snap a probed fps onto the nearest OTIO-known FCPXML rate.
+
+    Returns the original value unchanged when no canonical rate is
+    within `tolerance` (i.e. for genuinely unusual rates like 48 or
+    120 — the adapter will still produce an empty frameDuration but
+    that's an OTIO-side limitation we can't paper over here, and the
+    Premiere xmeml writer doesn't have this issue at all).
+    """
+    if fps <= 0:
+        return fps
+    best_key = min(_FCPXML_CANONICAL_FPS, key=lambda k: abs(k - fps))
+    if abs(best_key - fps) <= tolerance:
+        return best_key
+    return fps
+
+
 def _parse_fps(rate_str: str) -> float | None:
     """Parse ffprobe rational rate strings like '30000/1001' or '24/1'.
 
@@ -512,11 +548,22 @@ def _resolve_sequence_settings(edl: dict, frame_rate_arg) -> dict:
     # Sources without a usable fps probe (live recordings, image
     # sequences, etc.) are skipped; we never let a missing probe drag
     # the sequence rate DOWN to the default.
+    #
+    # We snap each probed rate onto OTIO's canonical FCPXML key set
+    # BEFORE taking the max — ffprobe returns NTSC rates as exact
+    # rationals (60000/1001 = 59.94005994...) but OTIO's lookup uses
+    # exact-equality against {59.94, 60, 29.97, ...} and silently
+    # writes an empty frameDuration on any miss, which crashes the
+    # adapter on read-back. Snapping at probe time keeps the rest of
+    # the pipeline (timeline rate, frame snapping) on the canonical
+    # value too, so all downstream math stays internally consistent.
     max_fps = 0.0
     for meta in probed.values():
         fps = meta.get("video_fps") or 0.0
-        if fps and fps > max_fps:
-            max_fps = float(fps)
+        if fps:
+            fps = _snap_fps_for_fcpxml(float(fps))
+            if fps > max_fps:
+                max_fps = fps
     if max_fps > 0:
         seq["video_fps"] = max_fps
 
@@ -530,6 +577,11 @@ def _resolve_sequence_settings(edl: dict, frame_rate_arg) -> dict:
         try:
             user_fps = float(frame_rate_arg)
             if user_fps > 0:
+                # Snap the override too — same reasoning as the auto
+                # path above. A user typing "--frame-rate=59.94" should
+                # get the canonical key, not float(59.94)=59.93999...
+                # which still misses OTIO's exact-equality lookup.
+                user_fps = _snap_fps_for_fcpxml(user_fps)
                 if max_fps and user_fps + 1e-3 < max_fps:
                     print(f"  warn: --frame-rate={user_fps} is BELOW the "
                           f"highest source fps ({max_fps:g}); time-remapped "
