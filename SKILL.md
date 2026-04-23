@@ -332,6 +332,7 @@ If the stretch fails the two criteria above (no continuous activity, or no story
 - **Cut FIRST, squeeze SECOND.** Apply the pacing preset's silence-removal pass first (drop dead air ≥ `min_silence_to_remove`); then identify the surviving long stretches that fit the "coherent activity + story-of-progress" criteria; then squeeze those ranges. Squeezing dead air is just slower nothing.
 - **Word-boundary discipline still applies on adjacent 1× ranges** (Hard Rule 6 / 7). The squeezed range itself doesn't need word-boundary alignment when `audio_strategy="drop"` (the audio's gone anyway), but pad it generously (~1–2s on each side of the activity) so the viewer's eye registers the speed change cleanly.
 - **`speed` field is OPTIONAL and defaults to 1.0.** Untouched EDLs behave exactly as before. Only emit a `speed` value when you're actively squeezing.
+- **The retime key is `speed` — NOT `timelapse_speed`, NOT `clip_speed`, NOT `retime`.** Recurring agent footgun: beats named `*_TIMELAPSE` invite an autocomplete-style `"timelapse_speed": 8` that the exporter cannot recognise. The export pipeline does a defensive textual rename of `timelapse_speed` → `speed` before parsing, but do NOT rely on it — write the canonical key the first time and don't invent synonyms. The `notes_for_editor` block at the end of the EDL is an especially common offender; if you mention the field by name there, call it `speed`.
 
 **EDL example with a timelapse:**
 
@@ -536,6 +537,13 @@ RULES:
     Pure dead-air (camera abandoned, nothing moving) is a CUT, not a
     squeeze. The `speed` field is OPTIONAL and defaults to 1.0; omit
     it on every normal range.
+
+    THE KEY IS LITERALLY `"speed"`. Not `"timelapse_speed"`, not
+    `"clip_speed"`, not `"retime"`. If you name your beats with a
+    `_TIMELAPSE` suffix the autocomplete tug toward `timelapse_speed`
+    is real — resist it. The exporter does a textual rename of
+    `timelapse_speed` → `speed` as a safety net, but every other
+    invented synonym is silently dropped and the range plays at 1×.
   - Unavoidable slips are kept if no better take exists. Note them in "reason".
   - If over budget, revise: drop a beat or trim tails, OR squeeze a
     qualifying long no-speech stretch (per "Time-squeezing" above)

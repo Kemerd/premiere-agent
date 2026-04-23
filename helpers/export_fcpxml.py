@@ -1755,7 +1755,19 @@ def main() -> None:
     if not edl_path.exists():
         sys.exit(f"edl not found: {edl_path}")
 
-    edl = json.loads(edl_path.read_text(encoding="utf-8"))
+    # Read the EDL as raw text so we can normalize a single recurring
+    # editor-agent typo before json.loads sees it: the canonical retime
+    # key is `speed` (see SKILL.md "Time-squeezing"), but agents who
+    # named their beats `..._TIMELAPSE` routinely write `timelapse_speed`
+    # instead. The exporter would otherwise read `r.get("speed")` as
+    # None and silently drop every retime, leaving the operator with a
+    # 1x cut and no obvious indication of why. A textual rename here
+    # is bulletproof — it can't accidentally hit JSON values because
+    # both alternates are bare keys without quote characters of their
+    # own, and the surrounding `"..."` makes the match unambiguous.
+    edl_text = edl_path.read_text(encoding="utf-8")
+    edl_text = edl_text.replace('"timelapse_speed"', '"speed"')
+    edl = json.loads(edl_text)
 
     # ── Resolve the sequence shape from the EDL's primary source ──────
     # Picks the source with the most runtime in the cut, ffprobes it for
