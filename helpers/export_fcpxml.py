@@ -859,7 +859,14 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
         # subsequent clips correctly. The patcher injects the actual
         # retime element so the NLE plays the FULL source range
         # (v_src_dur) inside that compressed window.
-        v_clip_name = f"{src_name}_v_{i:02d}"
+        #
+        # Clip name uses the SOURCE FILE BASENAME (e.g. "DJI_2025…_0137_D")
+        # rather than the EDL's shorthand source key (e.g. "C0137"), so
+        # Premiere's project-bin / timeline labels match what the editor
+        # sees on disk. Suffix `_v_NN` keeps each cut individually
+        # addressable for the side-channel speed_map lookup.
+        src_file_stem = Path(src_path).stem
+        v_clip_name = f"{src_file_stem}_v_{i:02d}"
         v_clip = otio.schema.Clip(
             name=v_clip_name,
             media_reference=_new_media_ref(),
@@ -887,6 +894,15 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
                 "src_start_s": v_start,
                 "src_dur_s": v_src_dur,
                 "out_dur_s": v_out_dur,
+                # Full source-FILE duration (NOT the played sub-range).
+                # The xmeml patcher writes this into <duration> per
+                # Apple's spec: "duration encodes the total number of
+                # frames in the clip. This value does not change even
+                # if you set In and Out points." When this matches the
+                # asset's <duration>, Premiere stops drawing the
+                # diagonal "out of bounds" stripe pattern over retimed
+                # clips and renders the full speed-mapped range.
+                "media_dur_s": float(media_dur_s),
                 "frame_rate": float(frame_rate),
             }
 
@@ -903,7 +919,7 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
         #      "Maintain Audio Pitch" (Premiere) / "Preserve Pitch"
         #      (FCP X), which is a one-click property on the clip.
         a_clip = None
-        a_clip_name = f"{src_name}_a_{i:02d}"
+        a_clip_name = f"{src_file_stem}_a_{i:02d}"
         if speed == 1.0:
             a_clip = otio.schema.Clip(
                 name=a_clip_name,
@@ -928,6 +944,9 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
                 "src_start_s": v_start,
                 "src_dur_s": v_src_dur,
                 "out_dur_s": v_out_dur,
+                # See video branch above — full source-FILE duration so
+                # the xmeml <duration> patch can match Premiere's spec.
+                "media_dur_s": float(media_dur_s),
                 "frame_rate": float(frame_rate),
             }
         # else: drop branch — fall through and append a Gap below.
@@ -1492,10 +1511,32 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
           </effect>
         </filter>
 
-    We also extend the clipitem's <out> tag from src_start + out_dur to
-    src_start + src_dur so Premiere knows to consume the FULL source
-    range under the (already correct) timeline duration. <duration>,
-    <start>, <end>, <in> stay as-is.
+    We also rewrite the clipitem's source-side fields so Premiere knows
+    to consume the FULL source range inside the (already compressed)
+    timeline window. Specifically:
+      * <out>      goes from src_start + out_dur   →  src_start + src_dur
+      * <duration> goes from out_dur_frames        →  media_dur_frames
+        (i.e. the FULL source-file frame count, not the sub-range we
+        play, not the compressed timeline span)
+
+    Apple's xmeml spec is explicit on this point:
+        "the duration element encodes the total number of frames in
+        the clip. This value does not change even if you set In and
+        Out points for the clip using the in and out elements."
+
+    For ordinary 1× clips Premiere is lenient and tolerates OTIO's
+    default <duration> = (end - start). For Time-Remapped clips it is
+    NOT lenient: if <duration> < <out>, Premiere treats every source
+    frame past <duration> as "out of bounds" and paints the diagonal
+    stripe pattern + black program monitor over that portion of the
+    clip on the timeline (visually: the clip looks like part of it is
+    "missing" past a certain point). Setting <duration> to the full
+    source-file frame count makes the asset's source-side bookkeeping
+    internally consistent (in ≤ out ≤ duration), and the Time Remap
+    filter cleanly maps the (out - in) source span onto the
+    (end - start) timeline span at the requested speed %.
+
+    <start>, <end>, <in> stay as-is — they're already correct.
 
     Returns the count of clipitems patched. Non-fatal on any error.
     """
@@ -1543,20 +1584,56 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
         if already_patched:
             continue
 
-        # Extend <out> so the source range Premiere reads under the
-        # (already compressed) timeline duration is the FULL src_dur.
-        # OTIO wrote out = in + out_dur_frames; we want in + src_dur_frames.
+        # Extend <out> AND <duration> so Premiere's source-side bookkeeping
+        # stays internally consistent with the Time Remap filter we're
+        # about to add.
+        #
+        #   <in>       — unchanged. The source IN-point we play from.
+        #   <out>      — bumped from (in + out_dur_frames) to
+        #                (in + src_dur_frames) so it covers the FULL
+        #                source range the speed filter will consume.
+        #   <duration> — bumped from out_dur_frames (the compressed
+        #                timeline span OTIO writes by default) to the
+        #                FULL SOURCE-FILE frame count. This is what
+        #                Apple's xmeml spec actually requires
+        #                ("duration encodes the total number of frames
+        #                in the clip … does not change even if you set
+        #                In/Out points"), and Premiere enforces it
+        #                strictly for time-remapped clips.
+        #
+        # If <duration> stays at out_dur_frames (or even at
+        # src_dur_frames < media_dur_frames), Premiere reads <out> as
+        # exceeding <duration> and treats those frames as out-of-bounds
+        # — which it draws as the diagonal "media offline" stripe
+        # pattern over the back portion of the clip, with black in the
+        # program monitor. Setting <duration> to media_dur_frames
+        # restores the (in ≤ out ≤ duration) invariant and Premiere
+        # renders the full retimed range cleanly.
         in_e = ci.find("in")
         out_e = ci.find("out")
+        dur_e = ci.find("duration")
         if in_e is not None and out_e is not None:
             try:
                 in_frames = int(float((in_e.text or "0").strip()))
                 src_dur_frames = int(round(float(info["src_dur_s"]) * fr))
                 out_e.text = str(in_frames + src_dur_frames)
+                # Full source-FILE duration. Falls back to
+                # (in + src_dur) only if media_dur_s is missing — older
+                # speed_map entries from cached EDL pre-fix won't carry
+                # it, and a slightly-too-small duration is still better
+                # than the default's wildly-too-small one.
+                if dur_e is not None:
+                    media_dur_s = info.get("media_dur_s")
+                    if media_dur_s is not None:
+                        media_dur_frames = int(round(
+                            float(media_dur_s) * fr))
+                    else:
+                        media_dur_frames = in_frames + src_dur_frames
+                    dur_e.text = str(media_dur_frames)
             except (TypeError, ValueError):
-                # Leave the existing <out> alone if it's unparseable —
-                # Premiere will still apply the speed % to whatever
-                # source range it finds, just less precisely.
+                # Leave the existing values alone if anything is
+                # unparseable — Premiere will still apply the speed %
+                # to whatever source range it finds, just less precisely.
                 pass
 
         # Build the timeremap filter. We hand-build the element tree so
