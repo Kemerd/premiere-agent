@@ -2072,13 +2072,39 @@ def _patch_xmeml_bin_layout(
 
         # Hoist the FULL <file> definition out of its current
         # (sequence-clipitem) parent and re-attach it to the master
-        # clip. Sequence clipitems will then link via the
-        # `<file id=...>` reference shape, which is what Premiere
-        # expects when a bin master is present.
+        # clip. Sequence clipitems then link via the `<file id=...>`
+        # reference shape, which is what Premiere expects when a bin
+        # master is present.
+        #
+        # CRITICAL: When the full def was sitting inside a sequence
+        # clipitem (the FIRST clipitem per file id — that's where OTIO
+        # writes the populated form, with subsequent clipitems carrying
+        # bare references), we MUST leave a `<file id="…"/>` reference
+        # behind in the same position. Otherwise Premiere's xmeml
+        # importer hits a clipitem with no <file> element at all,
+        # can't resolve which asset to play, and aborts the entire
+        # import with the unhelpful "The importer reported a generic
+        # error." dialog. We track the original parent's children
+        # list to preserve the insertion ORDER too (Premiere is
+        # picky about element order inside <clipitem>).
+        original_parent = None
+        original_index = -1
         for parent in root.iter():
-            if f_full in list(parent):
-                parent.remove(f_full)
+            kids = list(parent)
+            if f_full in kids:
+                original_parent = parent
+                original_index = kids.index(f_full)
                 break
+        if original_parent is not None:
+            original_parent.remove(f_full)
+            # Only replace with a reference when the original parent
+            # was a SEQUENCE clipitem (parent.tag == "clipitem") —
+            # the full def could in theory have lived inside a
+            # <resources>-style block on some adapter version, in
+            # which case there's nothing to replace.
+            if original_parent.tag == "clipitem":
+                ref = ET.Element("file", {"id": fid})
+                original_parent.insert(original_index, ref)
         clip_e.append(f_full)
 
         masters_written += 1
