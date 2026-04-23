@@ -165,6 +165,21 @@ _FCPXML_COLORSPACE_TABLE: dict[tuple[str, str], str] = {
 _DEFAULT_FCPXML_COLORSPACE = "1-1-1 (Rec. 709)"
 
 
+# ---------------------------------------------------------------------------
+# Timestretch diagnostics — former per-export `.timestretch.log` file was
+# removed; call sites stay as no-ops so build/patch code stays readable.
+# ---------------------------------------------------------------------------
+
+def _ts_log(_msg: str) -> None:
+    """No-op; timestretch file logging was removed."""
+    pass
+
+
+def _ts_log_section(_title: str) -> None:
+    """No-op; timestretch file logging was removed."""
+    pass
+
+
 def _classify_colorspace(transfer: str, primaries: str) -> str:
     """Map ffprobe color tags to an FCPXML 1.10+ colorSpace string.
 
@@ -382,8 +397,10 @@ def _probe_source_meta(path: Path) -> dict:
 # counts (which are always written at the SEQUENCE rate by xmeml
 # convention) against the source file's NATIVE rate — the math
 # silently expands the source range past the file's actual end and
-# Premiere paints diagonal "out of bounds" stripes over time-remapped
-# clips (because the speed filter compounds the discrepancy).
+# Premiere paints diagonal "out of bounds" stripes over the back
+# portion of any retimed clip (the (out - in) clip-rate ratio we
+# encode for "[N%] Speed/Duration" requires the source range to
+# resolve in the source's own frame count to stay in bounds).
 #
 # To avoid all of the above we take the OVERHEAD across every source
 # used in the EDL:
@@ -881,6 +898,26 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
     # Keyed by the unique clip name we mint below.
     speed_map: dict[str, dict] = {}
 
+    # ── Optional timestretch trace points (no-op unless _ts_log is wired) ─
+    _ts_log_section("build_timeline")
+    _ts_log(f"  sequence_fps        : {frame_rate}")
+    if sequence_settings:
+        _ts_log(
+            f"  sequence_resolution : "
+            f"{sequence_settings.get('video_width')}x"
+            f"{sequence_settings.get('video_height')}"
+        )
+        _ts_log(
+            f"  sequence_audio      : "
+            f"{sequence_settings.get('audio_channels')}ch @ "
+            f"{sequence_settings.get('audio_rate')}Hz"
+        )
+        _ts_log(
+            f"  primary_source      : "
+            f"{sequence_settings.get('primary_source')}"
+        )
+    _ts_log(f"  total_ranges        : {len(ranges)}")
+
     for i, r in enumerate(ranges):
         src_name = r["source"]
         if src_name not in sources:
@@ -919,10 +956,162 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
                   "Hard-cut + retime only.", file=sys.stderr)
             a_lead = v_tail = trans_in = 0.0
 
+        # ── Source-bounds clamp (BEFORE frame snapping & OTIO build) ─
+        # We probe the source media here (before snapping start/end to
+        # frame boundaries) so we can clamp the EDL range against the
+        # file's physical end. EDL agents routinely write ranges where
+        # `end` lands past the source's last decodable frame — they
+        # work from rough timestamps, not precise media bookkeeping —
+        # and Premiere's renderer paints the diagonal "media offline"
+        # stripe over any timeline portion that decodes to a missing
+        # frame. The post-write patcher has its own clamp as belt-and-
+        # braces, but clamping HERE means OTIO sees in-bounds numbers
+        # too, the asset's <file><duration> declaration matches what
+        # the clipitem actually consumes, and the (in + src_dur) math
+        # downstream stays internally consistent across both writers.
+        #
+        # SAFETY MARGIN — we trim 6 frames (~100ms at 60fps) from the
+        # file's reported duration before clamping. This absorbs:
+        #   • ffprobe vs decoder duration disagreements (container
+        #     duration is sometimes rounded up past the last decodable
+        #     frame, especially on DJI / GoPro action-cam MP4s)
+        #   • Premiere's internal probe rounding (it sometimes sees
+        #     fewer frames than ffprobe reports)
+        #   • B-frame reordering tail latency on long-GOP codecs
+        # The cost of a too-conservative trim is ~100ms of unused
+        # source tail; the cost of a too-aggressive trim is the
+        # diagonal stripe pattern. Easy trade-off.
+        #
+        # _probe_source_meta is LRU-cached by absolute path so this is
+        # a free lookup if the source has been seen before this loop
+        # iteration (which it almost always has, courtesy of
+        # _resolve_sequence_settings probing every used source up
+        # front to pick the sequence shape).
+        src_path_resolved = Path(src_path).resolve()
+        src_meta = _probe_source_meta(src_path_resolved)
+        media_dur_s = src_meta["duration_s"]
+        src_fps = src_meta.get("video_fps") or 0.0
+        # Snapshot the EDL's intent BEFORE we mutate start/end so the
+        # log can show the delta between "what the editor agent asked
+        # for" and "what we actually wrote". Only emit the per-range
+        # block at all when the range carries a non-trivial speed
+        # (1.0× ranges are the boring path and would 100x the log).
+        edl_start = start
+        edl_end = end
+        if speed != 1.0:
+            _ts_log_section(
+                f"range[{i}] {src_name}  (speed={speed:g})"
+            )
+            _ts_log(
+                f"  edl              : start={edl_start:.6f}s "
+                f"end={edl_end:.6f}s dur={edl_end - edl_start:.6f}s"
+            )
+            _ts_log(
+                f"  edl_split_edit   : a_lead={a_lead:.6f}s "
+                f"v_tail={v_tail:.6f}s trans_in={trans_in:.6f}s"
+            )
+            _ts_log(
+                f"  source           : path={src_path_resolved}"
+            )
+            # media_dur_s can be None on probe failure — print as
+            # "None" rather than letting the format spec crash. Same
+            # for src_fps which defaults to 0.0 above when missing.
+            _md_str = (
+                f"{float(media_dur_s):.6f}"
+                if media_dur_s is not None else "None"
+            )
+            _ts_log(
+                f"  source_probe     : media_dur_s={_md_str}s "
+                f"src_fps={float(src_fps):g} "
+                f"video={src_meta.get('video_width')}x"
+                f"{src_meta.get('video_height')} "
+                f"audio={src_meta.get('audio_channels')}ch@"
+                f"{src_meta.get('audio_rate')}Hz"
+            )
+        if media_dur_s and media_dur_s > 0:
+            safety_s = 6.0 / float(frame_rate)
+            max_end = max(0.0, media_dur_s - safety_s)
+            # The widest source-side window we ever need is the union
+            # of the video range AND the audio split-edit extension
+            # (start - a_lead, end + v_tail). Clamp that union, then
+            # back out start/end so all downstream math stays within
+            # the file. We DON'T proportionally scale a_lead/v_tail —
+            # those got zeroed out above for retimed clips, and on
+            # 1.0× clips the EDL agent is responsible for keeping
+            # them inside the source.
+            need_end = end + v_tail
+            need_start = start - a_lead
+            clamp_fired = (need_end > max_end or need_start < 0.0)
+            if clamp_fired:
+                print(
+                    f"  warn: range[{i}] {src_name} source window "
+                    f"[{need_start:.3f}s, {need_end:.3f}s] exceeds "
+                    f"media bounds [0, {max_end:.3f}s] "
+                    f"(file is {media_dur_s:.3f}s, 6-frame safety "
+                    f"margin applied) — clamping. Tighten the EDL "
+                    f"range to silence this warning.",
+                    file=sys.stderr,
+                )
+            if need_end > max_end:
+                end = max(start + (1.0 / float(frame_rate)),
+                          max_end - max(0.0, v_tail))
+            if need_start < 0.0:
+                start = max(0.0, a_lead)
+            if speed != 1.0:
+                _ts_log(
+                    f"  bounds_clamp     : safety_s={safety_s:.6f}s "
+                    f"max_end={max_end:.6f}s "
+                    f"need_window=[{need_start:.6f}, {need_end:.6f}]s "
+                    f"fired={clamp_fired} "
+                    f"post_clamp_start={start:.6f}s "
+                    f"post_clamp_end={end:.6f}s "
+                    f"post_clamp_dur={end - start:.6f}s"
+                )
+            # If clamping collapsed the range to ≤0, drop it entirely.
+            # Better than emitting a sub-frame stub the NLE will
+            # complain about on import.
+            if end - start <= 0:
+                print(
+                    f"  skip range[{i}] {src_name}: clamp collapsed "
+                    f"the range to zero duration — likely the entire "
+                    f"requested range falls past the source's end.",
+                    file=sys.stderr,
+                )
+                continue
+
         # Snap everything to whole frames so NLE imports are clean.
         v_start = _snap_to_frame(start, frame_rate)
-        v_end = _snap_to_frame(end, frame_rate)
+        v_end_pre_floor = _snap_to_frame(end, frame_rate)
+        v_end = v_end_pre_floor
+        # Belt-and-braces: _snap_to_frame() rounds to the NEAREST frame,
+        # which can push v_end past the safety boundary even after the
+        # clamp above. Floor it to the largest whole-frame timestamp
+        # ≤ (media_dur_s - safety_s) so the snap can never round us
+        # back over the cliff.
+        snap_floor_fired = False
+        if media_dur_s and media_dur_s > 0:
+            safety_s = 6.0 / float(frame_rate)
+            max_end_floor = (
+                int((media_dur_s - safety_s) * frame_rate)
+                / float(frame_rate)
+            )
+            if v_end > max_end_floor:
+                snap_floor_fired = True
+                v_end = max(v_start + 1.0 / float(frame_rate),
+                            max_end_floor)
         v_src_dur = max(0.0, v_end - v_start)
+        if speed != 1.0:
+            _ts_log(
+                f"  snap_to_frame    : v_start={v_start:.6f}s "
+                f"v_end_pre_floor={v_end_pre_floor:.6f}s "
+                f"v_end={v_end:.6f}s "
+                f"snap_floor_fired={snap_floor_fired} "
+                f"v_src_dur={v_src_dur:.6f}s "
+                f"(at seq fps {frame_rate}: "
+                f"v_start_f={int(round(v_start * frame_rate))}f "
+                f"v_end_f={int(round(v_end * frame_rate))}f "
+                f"v_src_dur_f={int(round(v_src_dur * frame_rate))}f)"
+            )
 
         # Output-timeline duration of this clip after retime. At
         # speed=1.0 this is identical to the source duration; at
@@ -937,13 +1126,59 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
             print(f"  skip range[{i}] {src_name}: speed={speed:g} would "
                   f"produce {v_out_dur*1000:.1f}ms output; below frame.",
                   file=sys.stderr)
+            if speed != 1.0:
+                _ts_log(
+                    f"  SKIP             : v_out_dur collapsed to "
+                    f"{v_out_dur:.6f}s — below 1 frame at "
+                    f"speed={speed:g}"
+                )
             continue
         v_dur = v_out_dur  # what the timeline / OTIO layout sees
+        if speed != 1.0:
+            # Effective speed = v_src_dur / v_out_dur. After snapping
+            # both to whole frames this is usually a hair off the
+            # requested speed (e.g. requested 8.0× landing as 7.97×).
+            # The drift is intentional — frame-quantization is
+            # mandatory for clean NLE imports — but it's worth logging
+            # so a future "why does my 8x clip play at 7.97x" question
+            # has an immediate answer.
+            eff_speed = (v_src_dur / v_out_dur) if v_out_dur > 0 else 0.0
+            _ts_log(
+                f"  output_dur       : v_out_dur={v_out_dur:.6f}s "
+                f"(v_src_dur/{speed:g} snapped) "
+                f"effective_speed={eff_speed:g}× "
+                f"(requested {speed:g}×, drift "
+                f"{(eff_speed - speed):+.4f}×) "
+                f"v_out_dur_f={int(round(v_out_dur * frame_rate))}f"
+            )
 
         # Audio source range is independently snapped — could be different
-        # from the video range by ±half a frame after rounding.
-        a_src_start = _snap_to_frame(start - a_lead, frame_rate)
-        a_src_end = _snap_to_frame(end + v_tail, frame_rate)
+        # from the video range by ±half a frame after rounding. Same
+        # max_end_floor logic as v_end above so a J-cut tail can't
+        # sneak past the safety boundary either. (For retimed clips
+        # a_lead / v_tail were already zeroed; this matters for 1.0×
+        # clips with split edits.)
+        a_src_start = max(0.0, _snap_to_frame(start - a_lead, frame_rate))
+        a_src_end_pre_floor = _snap_to_frame(end + v_tail, frame_rate)
+        a_src_end = a_src_end_pre_floor
+        a_snap_floor_fired = False
+        if media_dur_s and media_dur_s > 0:
+            safety_s = 6.0 / float(frame_rate)
+            max_end_floor = (
+                int((media_dur_s - safety_s) * frame_rate)
+                / float(frame_rate)
+            )
+            if a_src_end > max_end_floor:
+                a_snap_floor_fired = True
+                a_src_end = max(a_src_start + 1.0 / float(frame_rate),
+                                max_end_floor)
+        if speed != 1.0:
+            _ts_log(
+                f"  audio_range      : a_src_start={a_src_start:.6f}s "
+                f"a_src_end_pre_floor={a_src_end_pre_floor:.6f}s "
+                f"a_src_end={a_src_end:.6f}s "
+                f"a_snap_floor_fired={a_snap_floor_fired}"
+            )
         # When retime is on, the audio's TIMELINE duration is the
         # video's output duration regardless of audio_strategy; the
         # patcher injects the matching audio retime when "keep" is
@@ -960,17 +1195,15 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
         # for any imported XML.
         #
         # available_range is REQUIRED by both adapters — it writes into
-        # the asset declaration. We probe the source ONCE for duration +
-        # audio/video shape and cache it; see _probe_source_meta().
+        # the asset declaration. `src_path_resolved` / `src_meta` /
+        # `media_dur_s` were already populated by the bounds-clamp
+        # block above (and _probe_source_meta is LRU-cached anyway).
         #
         # The audio shape (channel count + sample rate) matters: Premiere
         # validates "the clip was created with N audio channel(s)" against
         # the actual file on link, and refuses if they disagree. We pre-
         # populate the fcp_xml metadata so the FCP7 xmeml writer emits
         # <channelcount>/<samplerate> matching the real source.
-        src_path_resolved = Path(src_path).resolve()
-        src_meta = _probe_source_meta(src_path_resolved)
-        media_dur_s = src_meta["duration_s"]
         media_avail_range = otio.opentime.TimeRange(
             start_time=otio.opentime.RationalTime(0, frame_rate),
             duration=_rt(media_dur_s, frame_rate),
@@ -1071,17 +1304,41 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
                 "src_start_s": v_start,
                 "src_dur_s": v_src_dur,
                 "out_dur_s": v_out_dur,
-                # Full source-FILE duration (NOT the played sub-range).
-                # The xmeml patcher writes this into <duration> per
-                # Apple's spec: "duration encodes the total number of
-                # frames in the clip. This value does not change even
-                # if you set In and Out points." When this matches the
-                # asset's <duration>, Premiere stops drawing the
-                # diagonal "out of bounds" stripe pattern over retimed
-                # clips and renders the full speed-mapped range.
+                # Full source-FILE duration. NOT written into the
+                # clipitem's <duration> (that field is per the xmeml
+                # spec the source-range frame count, == out - in,
+                # not the file-wide count — bin masters own the
+                # file-wide value). We carry it here purely so the
+                # patcher's bounds clamp can verify (in + src_dur)
+                # never reads past the file's last decodable frame.
                 "media_dur_s": float(media_dur_s),
                 "frame_rate": float(frame_rate),
             }
+            # Pre-compute the patcher's intended XML values right here
+            # (at sequence rate) so the log captures the math BOTH
+            # writers will perform downstream. Anything weird shows up
+            # as a delta between this line and the patcher's later
+            # "patch_xmeml" / "patch_fcpxml" lines for the same clip.
+            in_f = int(round(v_start * frame_rate))
+            src_dur_f = int(round(v_src_dur * frame_rate))
+            media_dur_f = int(round(media_dur_s * frame_rate))
+            max_src_dur_f = max(1, media_dur_f - in_f - 6)
+            patch_clamp_will_fire = src_dur_f > max_src_dur_f
+            final_src_dur_f = min(src_dur_f, max_src_dur_f)
+            _ts_log(
+                f"  speed_map[v]     : name={v_clip_name} "
+                f"clip_id_v={i:02d}"
+            )
+            _ts_log(
+                f"  patcher_preview  : in_f={in_f} src_dur_f={src_dur_f} "
+                f"media_dur_f={media_dur_f} "
+                f"max_src_dur_f={max_src_dur_f} "
+                f"will_clamp={patch_clamp_will_fire} "
+                f"target_out_f={in_f + final_src_dur_f} "
+                f"target_dur_f={final_src_dur_f}  "
+                f"(invariant: out - in == duration == "
+                f"{final_src_dur_f}f)"
+            )
 
         # Audio handling — three paths:
         #   1. speed == 1.0  → standard A1 clip (existing behaviour).
@@ -1176,8 +1433,21 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
                 source_range=_range(0.0, v_out_dur, frame_rate),
             ))
 
+        prev_cur_v = cur_v
+        prev_cur_a = cur_a
         cur_v += v_dur
         cur_a = target_a_start + a_dur  # inherits both lead AND tail
+        if speed != 1.0:
+            _ts_log(
+                f"  timeline_place   : "
+                f"v_track_in={prev_cur_v:.6f}s "
+                f"v_track_out={cur_v:.6f}s "
+                f"v_track_span={cur_v - prev_cur_v:.6f}s "
+                f"a_track_in={prev_cur_a:.6f}s "
+                f"a_track_target_in={target_a_start:.6f}s "
+                f"a_track_out={cur_a:.6f}s "
+                f"a_gap_inserted={a_gap if a_gap > 1e-6 else 0.0:.6f}s"
+            )
 
     # Stash the speed map on the timeline so the post-write patchers can
     # find it. Existing 'video-use-premiere' bucket is preserved (it
@@ -1603,6 +1873,7 @@ def _patch_fcpxml_speed(out_path: Path, speed_map: dict | None) -> int:
               file=sys.stderr)
         return 0
 
+    _ts_log_section(f"_patch_fcpxml_speed → {out_path.name}")
     patched = 0
     # Walk every <clip> element in the file (typically one per timeline
     # entry). The OTIO FCPXML adapter places retime-eligible clips
@@ -1619,6 +1890,7 @@ def _patch_fcpxml_speed(out_path: Path, speed_map: dict | None) -> int:
 
         # Idempotence — if a <timeMap> is already there, leave it.
         if clip_e.find("timeMap") is not None:
+            _ts_log(f"  skip {name}: already has <timeMap>")
             continue
 
         # Build the retime element. FCPXML wants children in a specific
@@ -1631,15 +1903,23 @@ def _patch_fcpxml_speed(out_path: Path, speed_map: dict | None) -> int:
             "value":  "0s",
             "interp": "linear",
         })
+        time_str = _fmt_seconds_for_fcpxml(out_dur, fr)
+        value_str = _fmt_seconds_for_fcpxml(src_dur, fr)
         ET.SubElement(tm, "timept", {
-            "time":   _fmt_seconds_for_fcpxml(out_dur, fr),
-            "value":  _fmt_seconds_for_fcpxml(src_dur, fr),
+            "time":   time_str,
+            "value":  value_str,
             "interp": "linear",
         })
         # Prepend so the importer reads the retime before the inner
         # <video>/<audio> element it modifies.
         clip_e.insert(0, tm)
         patched += 1
+        _ts_log(
+            f"  patch {name}: <timeMap> "
+            f"timept(0s→0s, {time_str}→{value_str}) "
+            f"out_dur_s={out_dur:.6f} src_dur_s={src_dur:.6f} "
+            f"effective_speed={(src_dur / out_dur if out_dur > 0 else 0):g}×"
+        )
 
     if patched == 0:
         return 0
@@ -1659,8 +1939,12 @@ def _patch_fcpxml_speed(out_path: Path, speed_map: dict | None) -> int:
 def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
     """Inject Premiere "Time Remap" filters for every retimed clipitem.
 
-    The FCP7 xmeml encoding for constant speed is a <filter> block on
-    the clipitem carrying the standard timeremap effect:
+    Apple's xmeml spec — the FCPXML / FinalCutPro_XML "Elements
+    Catalog" entry for the Time Remap Effect — is the source of
+    truth here. Constant-speed remapping is encoded as a <filter>
+    block on the clipitem carrying the standard timeremap effect
+    PLUS an explicit <graphdict> parameter with two virtual
+    keyframes spanning the clipitem:
 
         <filter>
           <effect>
@@ -1669,6 +1953,9 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
             <effectcategory>motion</effectcategory>
             <effecttype>motion</effecttype>
             <mediatype>video</mediatype>     (or "audio" on A1 clips)
+
+            <!-- Scalar params: drive the timeline name annotation
+                 ("[N%]") and pick constant-vs-spline mode. -->
             <parameter>
               <parameterid>variablespeed</parameterid>
               <value>0</value>               (0=constant, 1=keyframed)
@@ -1685,37 +1972,92 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
               <parameterid>frameblending</parameterid>
               <value>FALSE</value>
             </parameter>
+
+            <!-- The canonical Apple-spec encoding: explicit map
+                 from sequence-absolute timeline frame (`when`)
+                 to absolute source-media frame (`value`). -->
+            <parameter>
+              <parameterid>graphdict</parameterid>
+              <name>graphdict</name>
+              <interpolation><name>Linear</name></interpolation>
+              <keyframe>
+                <when>START_FRAME</when>     (== <start>)
+                <value>IN_FRAME</value>      (== <in>)
+                <speedvirtualkf>TRUE</speedvirtualkf>
+                <speedkfin>TRUE</speedkfin>
+                <speedkfstart>TRUE</speedkfstart>
+              </keyframe>
+              <keyframe>
+                <when>END_FRAME</when>       (== <end>)
+                <value>OUT_FRAME</value>     (== <out> = <in> + SRC_DUR)
+                <speedvirtualkf>TRUE</speedvirtualkf>
+                <speedkfout>TRUE</speedkfout>
+                <speedkfend>TRUE</speedkfend>
+              </keyframe>
+            </parameter>
           </effect>
         </filter>
 
-    We also rewrite the clipitem's source-side fields so Premiere knows
-    to consume the FULL source range inside the (already compressed)
-    timeline window. Specifically:
+    The filter (specifically the scalar <speed> parameter) is what
+    produces the "[N%]" indicator beside the clip name on
+    Premiere's timeline. Without it, the clip plays at 1.0× no
+    matter what (out - in) vs (end - start) say — Premiere does
+    NOT infer "Speed/Duration" from a clipitem-span ratio in
+    xmeml. The filter is mandatory for the squish to render.
+
+    Why graphdict matters for the diagonal-stripe bug: Premiere's
+    timeremap engine has TWO ways to compute the source frame at a
+    given timeline position — (a) the implicit clip-rate ratio
+    (out - in) / (end - start) combined with the scalar speed%,
+    and (b) the explicit graphdict virtual keyframes. Without (b),
+    Premiere falls back to (a), and any rounding mismatch between
+    the integer (out - in) frame count and the integer
+    (end - start) timeline span at the requested speed gets
+    painted as the diagonal "out of bounds" stripe over the
+    fractional-frame discrepancy zone. The graphdict explicitly
+    pins the mapping at both endpoints so there's no ambiguity:
+    timeline frame <start> → source frame <in>, timeline frame
+    <end> → source frame <out> (= <in> + SRC_DUR), linearly
+    interpolated. Premiere uses the explicit map and never falls
+    back to the implicit-ratio code path.
+
+    The `when` field on graphdict virtual keyframes uses the SAME
+    coordinate space as <start>/<end> (sequence-absolute timeline
+    frames at the parent rate), NOT clipitem-local 0..span. The
+    speedkfstart/speedkfend flags on the virtual keyframes
+    explicitly say they sit "at the setting for `start`/`end`" —
+    so kf0.when must equal <start> and kf1.when must equal <end>,
+    or Premiere can't locate the keyframes within the clipitem's
+    timeline range and falls back to drawing the entire clip with
+    the diagonal "out of bounds" stripe pattern.
+
+    Companion source-side rewrite — for the filter+graphdict to
+    consume the correct source range we extend the clipitem's
+    playhead bookkeeping:
       * <out>      goes from src_start + out_dur   →  src_start + src_dur
-      * <duration> goes from out_dur_frames        →  media_dur_frames
-        (i.e. the FULL source-file frame count, not the sub-range we
-        play, not the compressed timeline span)
+        so the source range matches what the graphdict's keyframe
+        endpoints declare.
+      * <duration> goes from out_dur_frames        →  src_dur_frames
+        so the canonical xmeml invariant
+            <out> - <in> == <duration>
+        is preserved. This is the SAME invariant every other
+        clipitem in the file (and every bin master) obeys:
+        <duration> is the frame count THIS clipitem consumes from
+        its source media, NOT the file-wide frame count. The
+        file-wide value lives on the bin master
+        (`<clip><name>foo.mp4</name><duration>FILE</duration>…`);
+        the per-use clipitem only ever owns its own slice.
 
-    Apple's xmeml spec is explicit on this point:
-        "the duration element encodes the total number of frames in
-        the clip. This value does not change even if you set In and
-        Out points for the clip using the in and out elements."
-
-    For ordinary 1× clips Premiere is lenient and tolerates OTIO's
-    default <duration> = (end - start). For Time-Remapped clips it is
-    NOT lenient: if <duration> < <out>, Premiere treats every source
-    frame past <duration> as "out of bounds" and paints the diagonal
-    stripe pattern + black program monitor over that portion of the
-    clip on the timeline (visually: the clip looks like part of it is
-    "missing" past a certain point). Setting <duration> to the full
-    source-file frame count makes the asset's source-side bookkeeping
-    internally consistent (in ≤ out ≤ duration), and the Time Remap
-    filter cleanly maps the (out - in) source span onto the
-    (end - start) timeline span at the requested speed %.
+    The bounds clamp below (src_dur_frames vs max_src_dur_frames)
+    is an additional safety net — it keeps (in + src_dur_frames)
+    inside the file's physical frame count even when the EDL
+    range itself landed past the end (e.g. an editor agent
+    rounding up).
 
     <start>, <end>, <in> stay as-is — they're already correct.
 
-    Returns the count of clipitems patched. Non-fatal on any error.
+    Returns the count of clipitems patched. Non-fatal on any
+    error.
     """
     if not speed_map:
         return 0
@@ -1730,6 +2072,7 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
               file=sys.stderr)
         return 0
 
+    _ts_log_section(f"_patch_xmeml_speed → {out_path.name}")
     patched = 0
     for ci in root.iter("clipitem"):
         # In xmeml the OTIO clip name lives in the clipitem's <name>
@@ -1743,8 +2086,83 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
             continue
         info = speed_map[name]
         kind = info.get("kind", "video")
-        speed_pct = float(info["speed"]) * 100.0  # 4.0 → 400 (Premiere %)
+        requested_speed = float(info["speed"])
+        
+        # The scalar <speed> parameter is Premiere's timeline-name
+        # annotation value ("[N%]"). It MUST match the slope encoded
+        # in the graphdict virtual keyframes or Premiere will show
+        # the wrong speed indicator. The graphdict slope is
+        # (value_delta / when_delta) = (src_dur / out_dur) = speed,
+        # so the scalar parameter needs the same: speed × 100.
+        speed_pct = requested_speed * 100.0
+        
         fr = float(info.get("frame_rate") or 24.0)
+
+        # Snapshot the timeline-side bookkeeping FIRST so the log can
+        # show what OTIO actually wrote vs what we're about to rewrite.
+        # Any disagreement with the speed_map's intent (e.g. <start> /
+        # <end> not landing where the cur_v cursor said) shows up here
+        # before we mutate anything.
+        start_e = ci.find("start")
+        end_e = ci.find("end")
+        rate_e = ci.find("rate")
+        clip_rate_str = "?"
+        if rate_e is not None:
+            tb = rate_e.find("timebase")
+            ntsc = rate_e.find("ntsc")
+            if tb is not None:
+                tb_t = (tb.text or "?").strip()
+                ntsc_t = (ntsc.text or "?").strip() if ntsc is not None else "?"
+                clip_rate_str = f"timebase={tb_t} ntsc={ntsc_t}"
+        # Resolve the linked <file> (asset) and capture its declared
+        # duration / pathurl. If the clipitem references a master via
+        # `id` we have to walk the file list to find the body — but the
+        # OTIO writer always emits an inline <file> on first occurrence
+        # and refs after that. We grab whichever is present.
+        file_e = ci.find("file")
+        file_dur_str = "<no-inline-file>"
+        file_url_str = "<no-inline-file>"
+        file_id_str = "?"
+        if file_e is not None:
+            file_id_str = file_e.get("id") or "?"
+            fdur = file_e.find("duration")
+            if fdur is not None:
+                file_dur_str = (fdur.text or "?").strip()
+            furl = file_e.find("pathurl")
+            if furl is not None:
+                file_url_str = (furl.text or "?").strip()
+        _ts_log("")
+        _ts_log(
+            f"  ── {name} (kind={kind}, speed={info['speed']:g}× / "
+            f"{speed_pct:g}%) ──"
+        )
+        _ts_log(
+            f"    pre-patch xml    : "
+            f"<rate>{clip_rate_str}</rate> "
+            f"<start>{(start_e.text if start_e is not None else '?')}</start> "
+            f"<end>{(end_e.text if end_e is not None else '?')}</end> "
+            f"<in>{ci.findtext('in', '?')}</in> "
+            f"<out>{ci.findtext('out', '?')}</out> "
+            f"<duration>{ci.findtext('duration', '?')}</duration>"
+        )
+        _ts_log(
+            f"    asset file       : id={file_id_str} "
+            f"<duration>{file_dur_str}</duration> url={file_url_str}"
+        )
+        # Pull the floats with explicit defaults so a malformed
+        # speed_map entry (future caller bug) logs gracefully instead
+        # of crashing the patcher with a TypeError on the format spec.
+        _ss = float(info.get("src_start_s") or 0.0)
+        _sd = float(info.get("src_dur_s") or 0.0)
+        _od = float(info.get("out_dur_s") or 0.0)
+        _md = float(info.get("media_dur_s") or 0.0)
+        _ts_log(
+            f"    speed_map info   : src_start_s={_ss:.6f} "
+            f"src_dur_s={_sd:.6f} "
+            f"out_dur_s={_od:.6f} "
+            f"media_dur_s={_md:.6f} "
+            f"frame_rate={fr}"
+        )
 
         # Idempotence — skip if a timeremap filter is already present.
         # We check effectid because Premiere ships several motion-y
@@ -1759,62 +2177,157 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
                 already_patched = True
                 break
         if already_patched:
+            _ts_log(
+                f"    SKIP             : <filter><effectid>timeremap"
+                f"</effectid> already present (idempotent re-run)"
+            )
             continue
 
-        # Extend <out> AND <duration> so Premiere's source-side bookkeeping
-        # stays internally consistent with the Time Remap filter we're
-        # about to add.
+        # ── Compute the frame numbers we need, from speed_map info ────
         #
-        #   <in>       — unchanged. The source IN-point we play from.
-        #   <out>      — bumped from (in + out_dur_frames) to
-        #                (in + src_dur_frames) so it covers the FULL
-        #                source range the speed filter will consume.
-        #   <duration> — bumped from out_dur_frames (the compressed
-        #                timeline span OTIO writes by default) to the
-        #                FULL SOURCE-FILE frame count. This is what
-        #                Apple's xmeml spec actually requires
-        #                ("duration encodes the total number of frames
-        #                in the clip … does not change even if you set
-        #                In/Out points"), and Premiere enforces it
-        #                strictly for time-remapped clips.
+        # Premiere's NATIVE time-remap xmeml structure (verified by
+        # importing our cut.xml, fixing the time-remaps in Premiere,
+        # and re-exporting as fixed_seq.xml) is fundamentally
+        # different from non-remapped clipitems:
         #
-        # If <duration> stays at out_dur_frames (or even at
-        # src_dur_frames < media_dur_frames), Premiere reads <out> as
-        # exceeding <duration> and treats those frames as out-of-bounds
-        # — which it draws as the diagonal "media offline" stripe
-        # pattern over the back portion of the clip, with black in the
-        # program monitor. Setting <duration> to media_dur_frames
-        # restores the (in ≤ out ≤ duration) invariant and Premiere
-        # renders the full retimed range cleanly.
+        #   <duration>   = clipitem extent in clipitem-local frames
+        #                  (typically == timeline span <end>-<start>,
+        #                  but can be larger to provide trim handles)
+        #   <in>         = CLIPITEM-LOCAL timeline frame where the
+        #                  visible section begins (NOT a source frame!)
+        #   <out>        = CLIPITEM-LOCAL timeline frame where the
+        #                  visible section ends   (NOT a source frame!)
+        #
+        # The graphdict carries the actual source-frame mapping:
+        #
+        #   when         = clipitem-local timeline frame (0..duration)
+        #   value        = ABSOLUTE source-media frame number
+        #                  (0..media_duration_in_frames)
+        #
+        # OTIO writes the clipitem with <in> = src_start_frame and
+        # <out> = src_start_frame + out_dur_frames (treating in/out as
+        # source frames, which is correct for non-remapped clips).
+        # For time-remapped clips we MUST rewrite these to be
+        # clipitem-local instead, and emit the source-frame mapping
+        # in the graphdict.
+        src_in_frame = int(round(
+            float(info.get("src_start_s", 0.0)) * fr
+        ))
+        src_dur_frames_intended = int(round(
+            float(info["src_dur_s"]) * fr
+        ))
+        src_dur_frames = src_dur_frames_intended
+
+        # Used by older log lines that still reference in_frames as
+        # "the source-IN frame number". Keeping the alias avoids
+        # touching every log statement below.
+        in_frames = src_in_frame
+
         in_e = ci.find("in")
         out_e = ci.find("out")
         dur_e = ci.find("duration")
-        if in_e is not None and out_e is not None:
-            try:
-                in_frames = int(float((in_e.text or "0").strip()))
-                src_dur_frames = int(round(float(info["src_dur_s"]) * fr))
-                out_e.text = str(in_frames + src_dur_frames)
-                # Full source-FILE duration. Falls back to
-                # (in + src_dur) only if media_dur_s is missing — older
-                # speed_map entries from cached EDL pre-fix won't carry
-                # it, and a slightly-too-small duration is still better
-                # than the default's wildly-too-small one.
-                if dur_e is not None:
-                    media_dur_s = info.get("media_dur_s")
-                    if media_dur_s is not None:
-                        media_dur_frames = int(round(
-                            float(media_dur_s) * fr))
-                    else:
-                        media_dur_frames = in_frames + src_dur_frames
-                    dur_e.text = str(media_dur_frames)
-            except (TypeError, ValueError):
-                # Leave the existing values alone if anything is
-                # unparseable — Premiere will still apply the speed %
-                # to whatever source range it finds, just less precisely.
-                pass
+        # Snapshot the pre-patch in/out/duration so the log can show
+        # what OTIO wrote vs. what we rewrote.
+        pre_in_str = (in_e.text or "?").strip() if in_e is not None else "?"
+        pre_out_str = (out_e.text or "?").strip() if out_e is not None else "?"
+        pre_dur_str = (dur_e.text or "?").strip() if dur_e is not None else "?"
 
-        # Build the timeremap filter. We hand-build the element tree so
-        # nothing depends on the OTIO adapter's filter serialization.
+        # Compute the timeline span of this clipitem from <start>/<end>
+        # (which OTIO wrote in sequence-absolute frames at the
+        # sequence rate). This is the visible portion of the clip
+        # on the timeline, and equals the clipitem-local end coord.
+        try:
+            start_frame = int(float((start_e.text or "0").strip())) \
+                if start_e is not None else 0
+            end_frame = int(float((end_e.text or "0").strip())) \
+                if end_e is not None else (
+                    start_frame +
+                    int(round(float(info["out_dur_s"]) * fr))
+                )
+        except (TypeError, ValueError):
+            start_frame = 0
+            end_frame = int(round(float(info["out_dur_s"]) * fr))
+        timeline_dur_frames = max(1, end_frame - start_frame)
+
+        # Bounds-clamp source consumption to the file's actual frame
+        # count, with a 6-frame safety margin to absorb ffprobe-vs-
+        # decoder duration disagreements on DJI / GoPro footage.
+        media_dur_s = info.get("media_dur_s")
+        if media_dur_s is not None:
+            media_dur_frames = int(round(float(media_dur_s) * fr))
+            media_src_str = f"{media_dur_s:.6f}s × {fr}fps"
+        else:
+            media_dur_frames = src_in_frame + src_dur_frames
+            media_src_str = f"FALLBACK in+src_dur ({media_dur_frames}f)"
+        max_src_dur_frames = max(
+            1, media_dur_frames - src_in_frame - 6
+        )
+        clamp_fired_here = src_dur_frames > max_src_dur_frames
+        if clamp_fired_here:
+            print(
+                f"  warn: clip '{name}' source range exceeds "
+                f"media bounds — clamping src_dur from "
+                f"{src_dur_frames} to {max_src_dur_frames} "
+                f"frames (in={src_in_frame}, "
+                f"media_dur={media_dur_frames}). "
+                f"Edit the EDL range to fit within the source "
+                f"file to avoid this clamp.",
+                file=sys.stderr,
+            )
+            src_dur_frames = max_src_dur_frames
+
+        # Source-frame absolute coords for the visible section's
+        # endpoints — these are what Premiere stores in the
+        # graphdict's `value` field at the in/out keyframes.
+        src_out_frame = src_in_frame + src_dur_frames
+
+        # ── Rewrite clipitem in/out/duration to clipitem-local ────────
+        # For our minimal "no head/tail trim" case the visible section
+        # spans the full clipitem extent: <in>=0, <out>=duration.
+        if in_e is not None:
+            in_e.text = "0"
+        if out_e is not None:
+            out_e.text = str(timeline_dur_frames)
+        if dur_e is not None:
+            dur_e.text = str(timeline_dur_frames)
+
+        _ts_log(
+            f"    frame_math       : src_in_f={src_in_frame} "
+            f"src_dur_f_intended={src_dur_frames_intended} "
+            f"media_dur_f={media_dur_frames} "
+            f"(from {media_src_str}) "
+            f"max_src_dur_f={max_src_dur_frames} "
+            f"clamp_fired={clamp_fired_here} "
+            f"src_dur_f_final={src_dur_frames} "
+            f"src_out_f={src_out_frame} "
+            f"timeline_span_f={timeline_dur_frames}"
+        )
+        _ts_log(
+            f"    written xml      : <in>0</in> "
+            f"<out>{timeline_dur_frames}</out> "
+            f"<duration>{timeline_dur_frames}</duration> "
+            f"(was in={pre_in_str} out={pre_out_str} dur={pre_dur_str}) "
+            f"— now CLIPITEM-LOCAL, source mapping is in graphdict"
+        )
+
+        # The display speed_pct is now derived from the ACTUAL graphdict
+        # slope (src_dur / timeline_dur), not from the requested
+        # speed multiplier — this guarantees the [N%] timeline label
+        # matches what Premiere computes from the graphdict, even when
+        # frame-snap rounding makes the actual ratio drift slightly
+        # from the requested multiplier (e.g. 800.21% instead of 800%).
+        actual_slope = src_dur_frames / timeline_dur_frames
+        speed_pct = actual_slope * 100.0
+        _ts_log(
+            f"    speed_consistency: actual_slope={actual_slope:.4f}× "
+            f"display_speed_pct={speed_pct:g}% "
+            f"requested={info['speed']:g}× "
+            f"snap_drift={(actual_slope - float(info['speed'])):+.4f}×"
+        )
+
+        # Build the timeremap filter. We hand-build the element tree
+        # so nothing depends on the OTIO adapter's filter
+        # serialization.
         filt = ET.SubElement(ci, "filter")
         eff = ET.SubElement(filt, "effect")
         ET.SubElement(eff, "name").text = "Time Remap"
@@ -1826,7 +2339,15 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
         )
 
         def _add_param(eff_e, pid, value, vmin=None, vmax=None):
-            """Helper: append a <parameter> with id/name/value/(min/max)."""
+            """Append a simple <parameter> with id/name/value/(min/max).
+
+            Used for the scalar Time Remap parameters
+            (variablespeed, speed, reverse, frameblending). The
+            graphdict parameter has its own builder below because it
+            additionally needs <interpolation> + a pair of
+            <keyframe> children with the speed-virtual-keyframe
+            metadata Apple's spec mandates.
+            """
             p = ET.SubElement(eff_e, "parameter")
             p.set("authoringApp", "PremierePro")
             ET.SubElement(p, "parameterid").text = pid
@@ -1837,14 +2358,144 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
                 ET.SubElement(p, "valuemax").text = str(vmax)
             ET.SubElement(p, "value").text = str(value)
 
-        # Constant speed: variablespeed=0, speed=<pct>, no keyframe spline.
+        # ── Scalar parameters (display indicator + sanity defaults) ──
+        # variablespeed=0 says "this is a constant-speed remap". Even
+        # with explicit graphdict keyframes Premiere still reads this
+        # to decide whether to draw the speed band straight or as a
+        # spline in the Effect Controls panel.
         _add_param(eff, "variablespeed", 0, vmin=0, vmax=1)
-        # Premiere's hard limits on speed are -100000..100000 (%) — the
-        # MAX_SPEED clamp upstream keeps us inside the sane window.
+        # Premiere's hard limits on speed are -100000..100000 (%) —
+        # the MAX_SPEED clamp upstream keeps us inside the sane
+        # window. The <speed> scalar is what produces the "[N%]"
+        # indicator on the timeline name strip; without it Premiere
+        # shows the clip name with no speed annotation.
         _add_param(eff, "speed", f"{speed_pct:g}",
                    vmin=-100000, vmax=100000)
         _add_param(eff, "reverse", "FALSE")
         _add_param(eff, "frameblending", "FALSE")
+
+        # ── graphdict: Premiere's canonical Time Remap encoding ───────
+        # Verified by reverse-engineering Premiere's own export of a
+        # time-remapped clipitem (see fixed_seq.xml in the test
+        # corpus). Apple's spec told us about graphdict but was
+        # ambiguous about coordinate spaces — Premiere's actual
+        # implementation is:
+        #
+        #   <parameter authoringApp="PremierePro">
+        #     <parameterid>graphdict</parameterid>
+        #     <name>graphdict</name>
+        #     <valuemin>0</valuemin>
+        #     <valuemax>MEDIA_DURATION_FRAMES</valuemax>  ← whole file
+        #     <value>0</value>
+        #     <keyframe>                       ← speedkfstart (extent IN)
+        #       <when>0</when>
+        #       <value>SRC_IN_FRAME</value>
+        #       <speedvirtualkf>TRUE</speedvirtualkf>
+        #       <speedkfstart>TRUE</speedkfstart>
+        #     </keyframe>
+        #     <keyframe>                       ← speedkfin (visible IN)
+        #       <when>0</when>                 (== <in>)
+        #       <value>SRC_IN_FRAME</value>
+        #       <speedvirtualkf>TRUE</speedvirtualkf>
+        #       <speedkfin>TRUE</speedkfin>
+        #     </keyframe>
+        #     <keyframe>                       ← speedkfout (visible OUT)
+        #       <when>TIMELINE_DUR</when>      (== <out>)
+        #       <value>SRC_OUT_FRAME</value>
+        #       <speedvirtualkf>TRUE</speedvirtualkf>
+        #       <speedkfout>TRUE</speedkfout>
+        #     </keyframe>
+        #     <keyframe>                       ← speedkfend (extent END)
+        #       <when>TIMELINE_DUR</when>
+        #       <value>SRC_OUT_FRAME</value>
+        #       <speedvirtualkf>TRUE</speedvirtualkf>
+        #       <speedkfend>TRUE</speedkfend>
+        #     </keyframe>
+        #     <interpolation>
+        #       <name>FCPCurve</name>          ← NOT "Linear"!
+        #     </interpolation>
+        #   </parameter>
+        #
+        # Coordinate spaces:
+        #   when  → CLIPITEM-LOCAL TIMELINE FRAMES at the clip's rate
+        #           (range: 0..duration). The visible section is
+        #           the [<in>..<out>] sub-range of [0..duration].
+        #   value → ABSOLUTE SOURCE-MEDIA FRAMES
+        #           (range: 0..media_duration_in_frames). Tells
+        #           Premiere which source frame to play at the
+        #           corresponding timeline-local moment.
+        #
+        # The slope (Δvalue / Δwhen) is the speed multiplier.
+        # For our constant-speed remap with no head/tail trim, the
+        # start+in keyframes coincide at when=0/value=src_in, and
+        # the out+end keyframes coincide at when=timeline_dur/
+        # value=src_out. Premiere requires all four virtual-keyframe
+        # markers to be present even when their positions coincide.
+        #
+        # Verified slope example from fixed_seq.xml v_42 (10× speed):
+        #   kf(in):  when=554,  value=5541
+        #   kf(out): when=1973, value=19736
+        #   slope = (19736-5541) / (1973-554) = 14195/1419 = 10.003× ✓
+        graphdict = ET.SubElement(eff, "parameter")
+        graphdict.set("authoringApp", "PremierePro")
+        ET.SubElement(graphdict, "parameterid").text = "graphdict"
+        ET.SubElement(graphdict, "name").text = "graphdict"
+        # The valuemin/valuemax bounds on the parent <parameter> are
+        # what Premiere uses to know the FULL source-media frame range
+        # available for trim-handle dragging. Without these, dragging
+        # the trim handles in Premiere can't reveal more source
+        # frames beyond what's already exposed by the keyframes.
+        ET.SubElement(graphdict, "valuemin").text = "0"
+        ET.SubElement(graphdict, "valuemax").text = str(media_dur_frames)
+        ET.SubElement(graphdict, "value").text = "0"
+        # ── Four virtual keyframes (start, in, out, end) ──
+        # In our minimal case start coincides with in, and out
+        # coincides with end (no head/tail trim handles), so kf0/kf1
+        # share coordinates and kf2/kf3 share coordinates. Premiere
+        # still wants all four flag markers present and distinct.
+        kf_start = ET.SubElement(graphdict, "keyframe")
+        ET.SubElement(kf_start, "when").text = "0"
+        ET.SubElement(kf_start, "value").text = str(src_in_frame)
+        ET.SubElement(kf_start, "speedvirtualkf").text = "TRUE"
+        ET.SubElement(kf_start, "speedkfstart").text = "TRUE"
+
+        kf_in = ET.SubElement(graphdict, "keyframe")
+        ET.SubElement(kf_in, "when").text = "0"
+        ET.SubElement(kf_in, "value").text = str(src_in_frame)
+        ET.SubElement(kf_in, "speedvirtualkf").text = "TRUE"
+        ET.SubElement(kf_in, "speedkfin").text = "TRUE"
+
+        kf_out = ET.SubElement(graphdict, "keyframe")
+        ET.SubElement(kf_out, "when").text = str(timeline_dur_frames)
+        ET.SubElement(kf_out, "value").text = str(src_out_frame)
+        ET.SubElement(kf_out, "speedvirtualkf").text = "TRUE"
+        ET.SubElement(kf_out, "speedkfout").text = "TRUE"
+
+        kf_end = ET.SubElement(graphdict, "keyframe")
+        ET.SubElement(kf_end, "when").text = str(timeline_dur_frames)
+        ET.SubElement(kf_end, "value").text = str(src_out_frame)
+        ET.SubElement(kf_end, "speedvirtualkf").text = "TRUE"
+        ET.SubElement(kf_end, "speedkfend").text = "TRUE"
+
+        # FCPCurve is Apple's standard piecewise interpolation —
+        # this is what Premiere's own export uses for time remap.
+        # "Linear" produces a DIFFERENT (broken) playback path that
+        # Premiere mis-renders as the diagonal "out of bounds" stripe.
+        gd_interp = ET.SubElement(graphdict, "interpolation")
+        ET.SubElement(gd_interp, "name").text = "FCPCurve"
+
+        _ts_log(
+            f"    graphdict        : "
+            f"4 keyframes (start/in/out/end), "
+            f"interp=FCPCurve, "
+            f"valuemax={media_dur_frames}  "
+            f"kf_start+kf_in (when=0, value={src_in_frame})  "
+            f"kf_out+kf_end (when={timeline_dur_frames}, "
+            f"value={src_out_frame})  "
+            f"slope = {(src_out_frame - src_in_frame) / max(1, timeline_dur_frames):.4f}×  "
+            f"(timeline-local 0..{timeline_dur_frames} → "
+            f"source-absolute {src_in_frame}..{src_out_frame})"
+        )
 
         patched += 1
 
@@ -1856,8 +2507,9 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
     except Exception as e:
         print(f"  warn: xmeml speed patch built {patched} timeremap "
               f"filter(s) but failed to write back to {out_path.name} "
-              f"({type(e).__name__}: {e}); the file is still valid xmeml, "
-              "just without the retime filters.", file=sys.stderr)
+              f"({type(e).__name__}: {e}); the file is still valid "
+              "xmeml, just without the retime filters.",
+              file=sys.stderr)
         return 0
 
     return patched
@@ -2232,8 +2884,13 @@ def write_premiere_xml(timeline, out_path: Path) -> None:
         )
     seq_meta = _sequence_meta_from_timeline(timeline)
     _patch_xmeml_sequence_format(out_path, sequence_meta=seq_meta)
-    # Inject Premiere's "Time Remap" filter for every retimed clipitem.
-    # Idempotent; no-op when speed_map is empty.
+    # Inject Premiere's "Time Remap" filter for every retimed
+    # clipitem. The filter is what makes Premiere display the "[N%]"
+    # indicator and actually compress the source range; without it
+    # the clip plays at 1.0× regardless of in/out vs start/end ratio.
+    # The patcher also bounds-clamps the source range against the
+    # file's actual frame count so timelapses can't run past the
+    # media end and trip the diagonal "out of bounds" stripe.
     speed_map = _speed_map_from_timeline(timeline)
     n_speed = _patch_xmeml_speed(out_path, speed_map)
     if n_speed:
