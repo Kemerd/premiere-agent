@@ -132,22 +132,35 @@ _DEFAULT_VIDEO_FPS = 24.0  # only used when no source has a probe-able fps
 # for these well-known spaces, and ffprobe occasionally omits one but
 # rarely both. Anything unrecognised falls through to Rec. 709, which is
 # the safe assumption for SDR camera footage.
+# Format is "<primaries>-<transfer>-<matrix> (Pretty Name)" using the
+# ISO/IEC 23091-2 numeric code points Apple expects:
+#   primaries: 1=Rec.709, 9=Rec.2020, 12=DCI-P3, 6=NTSC, 5=PAL
+#   transfer:  1=Rec.709 SDR, 13=sRGB, 16=HLG, 17=ST.428, 18=PQ
+#   matrix:    1=Rec.709, 9=Rec.2020 NCL, 6=Rec.601 525, 5=Rec.601 625
+# Anything missing falls through to Rec. 709 — safe SDR default.
 _FCPXML_COLORSPACE_TABLE: dict[tuple[str, str], str] = {
-    # SDR Rec. 709 (the 99% case for HD camera footage)
+    # SDR Rec. 709 (99% of HD camera footage)
     ("bt709", "bt709"):           "1-1-1 (Rec. 709)",
     ("bt709", "unknown"):         "1-1-1 (Rec. 709)",
+    ("iec61966-2-1", "bt709"):    "1-13-1 (Rec. 709 sRGB)",
     ("smpte170m", "smpte170m"):   "1-1-1 (Rec. 709)",
     # SD NTSC / PAL — mapped to Rec. 709 by FCP X for SD masters too
     ("smpte170m", "bt470bg"):     "1-1-1 (Rec. 709)",
     ("bt470bg", "bt470bg"):       "1-1-1 (Rec. 709)",
-    # Rec. 2020 SDR / HDR variants
-    ("bt2020-10", "bt2020"):      "9-1-1 (Rec. 2020)",
-    ("bt2020-10", "bt2020nc"):    "9-1-1 (Rec. 2020)",
-    ("bt2020-12", "bt2020"):      "9-1-1 (Rec. 2020)",
+    # Rec. 2020 SDR — matrix is 9 (BT.2020 NCL), NOT 1 (was a bug)
+    ("bt2020-10", "bt2020"):      "9-1-9 (Rec. 2020)",
+    ("bt2020-10", "bt2020nc"):    "9-1-9 (Rec. 2020)",
+    ("bt2020-12", "bt2020"):      "9-1-9 (Rec. 2020)",
+    ("bt2020-12", "bt2020nc"):    "9-1-9 (Rec. 2020)",
+    # Rec. 2020 HDR — HLG (DJI / GoPro / iPhone HLG output)
     ("arib-std-b67", "bt2020"):   "9-16-9 (Rec. 2020 HLG)",
     ("arib-std-b67", "bt2020nc"): "9-16-9 (Rec. 2020 HLG)",
+    # Rec. 2020 HDR — PQ / HDR10 / Dolby Vision Profile 5/8
     ("smpte2084", "bt2020"):      "9-18-9 (Rec. 2020 PQ)",
     ("smpte2084", "bt2020nc"):    "9-18-9 (Rec. 2020 PQ)",
+    # DCI-P3 (Apple ProRes XQ + iPhone "Wide Color" HEVC)
+    ("bt709", "smpte432"):        "12-1-1 (Display P3)",
+    ("iec61966-2-1", "smpte432"): "12-13-1 (Display P3 sRGB)",
 }
 _DEFAULT_FCPXML_COLORSPACE = "1-1-1 (Rec. 709)"
 
@@ -2274,7 +2287,7 @@ def main() -> None:
     # Resolution + fps come from MAX-across-sources (so the sequence
     # never under-fits any clip, see _resolve_sequence_settings); color
     # / audio shape inherit from the runtime-dominant primary source.
-    print(f"  fps + res:   max-across-sources (sequence ≥ every clip)")
+    print(f"  fps + res:   max-across-sources (sequence >= every clip)")
     print(f"  color/audio: inherited from primary source: {primary_label}")
 
     # Emit each requested dialect. Failures in one writer don't prevent
@@ -2290,8 +2303,15 @@ def main() -> None:
             # Re-raise install-hint exits unchanged so the user sees the fix.
             raise
         except Exception as e:
+            # Full traceback to stderr — generic ValueErrors etc. coming
+            # out of the OTIO fcpxml adapter are useless without the
+            # frame that fired them. The Premiere writer still runs
+            # below either way, so the user gets ONE working export
+            # plus enough info to file a bug on the dud one.
+            import traceback as _tb
             print(f"  [fcpxml]   FAILED: {type(e).__name__}: {e}",
                   file=sys.stderr)
+            _tb.print_exc(file=sys.stderr)
 
     if prxml_out is not None:
         try:
@@ -2302,8 +2322,10 @@ def main() -> None:
         except SystemExit:
             raise
         except Exception as e:
+            import traceback as _tb
             print(f"  [premiere] FAILED: {type(e).__name__}: {e}",
                   file=sys.stderr)
+            _tb.print_exc(file=sys.stderr)
 
 
 if __name__ == "__main__":
