@@ -327,12 +327,26 @@ def _probe_source_meta(path: Path) -> dict:
 # A timeline that doesn't match its source footage trips Premiere's
 # "this clip does not match the sequence's settings — change to match?"
 # dialog on every clip and (worse) silently downscales high-res sources
-# to whatever default the user's NLE happens to have. We avoid both by
-# picking the source that contributes the MOST runtime to the EDL and
-# inheriting its resolution / fps / color space onto the sequence.
+# to whatever default the user's NLE happens to have. Worse still, a
+# sequence frame rate LOWER than any source's native rate causes
+# Premiere to reinterpret the clipitem's <in>/<out>/<duration> frame
+# counts (which are always written at the SEQUENCE rate by xmeml
+# convention) against the source file's NATIVE rate — the math
+# silently expands the source range past the file's actual end and
+# Premiere paints diagonal "out of bounds" stripes over time-remapped
+# clips (because the speed filter compounds the discrepancy).
+#
+# To avoid all of the above we take the OVERHEAD across every source
+# used in the EDL:
+#   • frame rate  -> MAX native fps    (sequence ≥ every source)
+#   • resolution  -> MAX pixel area    (sequence ≥ every source)
+# Color space / audio rate still inherit from the runtime-dominant
+# "primary" source — those are aesthetic picks where "max" makes no
+# physical sense, and the dominant clip's settings are the right
+# baseline for round-tripped color metadata.
 #
 # The frame_rate argument from the CLI is honored as an override when
-# explicit; "auto" / None means "match the dominant source".
+# explicit; "auto" / None means "match the highest source rate".
 # ---------------------------------------------------------------------------
 
 def _pick_primary_source(edl: dict) -> str | None:
@@ -365,6 +379,24 @@ def _pick_primary_source(edl: dict) -> str | None:
                   key=lambda kv: (-kv[1], order[kv[0]]))[0][0]
 
 
+def _collect_used_sources(edl: dict) -> list[str]:
+    """Return the unique source keys that any range in the EDL references.
+
+    Order is "first appearance in the EDL" so probe ordering is stable
+    across runs (and so warning lines come out in a predictable order).
+    Sources declared in `edl["sources"]` but never referenced by a range
+    are deliberately ignored — we don't want unused B-roll bloating the
+    sequence-shape decision (and slowing the export with extra ffprobes).
+    """
+    seen: dict[str, None] = {}
+    ranges = edl.get("ranges") or edl.get("edl") or []
+    for r in ranges:
+        src = r.get("source")
+        if src and src not in seen:
+            seen[src] = None
+    return list(seen.keys())
+
+
 def _resolve_sequence_settings(edl: dict, frame_rate_arg) -> dict:
     """Collapse the EDL's source set into one sequence-shape dict.
 
@@ -373,12 +405,32 @@ def _resolve_sequence_settings(edl: dict, frame_rate_arg) -> dict:
     The caller hands this dict to build_timeline / the writers / the
     post-write patchers, all of which need the same numbers to agree.
 
+    Selection rules:
+      * video_fps        — MAX native fps across every source the EDL
+                           actually uses. A higher-fps sequence cleanly
+                           contains lower-fps clips (Premiere conforms
+                           them on import); the reverse causes
+                           reinterpretation bugs documented in the
+                           file-header comment for this section.
+      * video_width/height — pulled together from whichever source has
+                           the LARGEST pixel area. Using one source's
+                           width with another's height would risk a
+                           non-physical aspect ratio.
+      * color / pixel_aspect / audio_channels / audio_rate
+                         — inherited from the runtime-dominant
+                           ("primary") source. These are aesthetic /
+                           compatibility picks, not strict bounds.
+
     `frame_rate_arg` semantics:
-      - None or "auto"      -> inherit from primary source (then default)
-      - numeric (float/int) -> hard override; primary's fps is ignored
+      - None or "auto"      -> use the MAX-fps result above
+      - numeric (float/int) -> hard override; auto-resolved fps ignored
+        (warns to stderr if the override is BELOW any source's native
+         fps, since that's the exact configuration that breaks time
+         remap on import — see file-header comment)
     """
     primary_key = _pick_primary_source(edl)
     sources = edl.get("sources") or {}
+    used_keys = _collect_used_sources(edl)
 
     # Default sequence-shape — matches the _probe defaults so the caller
     # can rely on every key being present even with no sources at all.
@@ -395,28 +447,83 @@ def _resolve_sequence_settings(edl: dict, frame_rate_arg) -> dict:
         "pixel_aspect_ratio": "1:1",
         "fcpxml_color_space": _DEFAULT_FCPXML_COLORSPACE,
     }
-    primary_meta = None
-    if primary_key and primary_key in sources:
+
+    # Probe every used source ONCE, cache the metadata so build_timeline
+    # doesn't pay for a second probe pass when it laces clips later
+    # (_probe_source_meta has its own LRU cache by absolute-path key).
+    probed: dict[str, dict] = {}
+    for key in used_keys:
+        if key not in sources:
+            continue
         try:
-            primary_meta = _probe_source_meta(Path(sources[primary_key]).resolve())
-            for k in ("video_width", "video_height", "audio_channels",
-                      "audio_rate", "color_primaries", "color_transfer",
-                      "color_space", "pixel_aspect_ratio"):
-                if primary_meta.get(k) is not None:
-                    seq[k] = primary_meta[k]
-            if primary_meta.get("video_fps"):
-                seq["video_fps"] = primary_meta["video_fps"]
+            probed[key] = _probe_source_meta(Path(sources[key]).resolve())
         except Exception as e:
-            print(f"  warn: primary source probe failed for "
-                  f"{primary_key} ({type(e).__name__}: {e}); using defaults.",
+            print(f"  warn: source probe failed for {key} "
+                  f"({type(e).__name__}: {e}); excluding from sequence-shape.",
                   file=sys.stderr)
 
-    # CLI override — "auto" / None means "use what we just resolved".
-    # Any positive numeric value wins over the source's native fps.
+    # ── Color / audio / pixel-aspect — inherit from the primary source ──
+    # These keys are about *interpretation* not bounds, so taking the
+    # max across sources makes no semantic sense (max color primaries?).
+    # The runtime-dominant clip is the right baseline.
+    primary_meta = probed.get(primary_key) if primary_key else None
+    if primary_meta:
+        for k in ("audio_channels", "audio_rate", "color_primaries",
+                  "color_transfer", "color_space", "pixel_aspect_ratio"):
+            if primary_meta.get(k) is not None:
+                seq[k] = primary_meta[k]
+
+    # ── Resolution — MAX pixel area across all used sources ──
+    # We pick width AND height from the same winning source to preserve
+    # its aspect ratio rather than mix-and-match (which could end up
+    # 3840x1080 or other Frankenstein shapes). Ties resolve to the
+    # earliest-appearing source, matching primary-source tie semantics.
+    best_area = -1
+    best_key = None
+    for key in used_keys:
+        meta = probed.get(key)
+        if not meta:
+            continue
+        w, h = meta.get("video_width"), meta.get("video_height")
+        if not w or not h:
+            continue
+        area = int(w) * int(h)
+        if area > best_area:
+            best_area = area
+            best_key = key
+    if best_key is not None:
+        seq["video_width"] = probed[best_key]["video_width"]
+        seq["video_height"] = probed[best_key]["video_height"]
+
+    # ── Frame rate — MAX native fps across all used sources ──
+    # Sources without a usable fps probe (live recordings, image
+    # sequences, etc.) are skipped; we never let a missing probe drag
+    # the sequence rate DOWN to the default.
+    max_fps = 0.0
+    for meta in probed.values():
+        fps = meta.get("video_fps") or 0.0
+        if fps and fps > max_fps:
+            max_fps = float(fps)
+    if max_fps > 0:
+        seq["video_fps"] = max_fps
+
+    # ── CLI override ──
+    # "auto" / None means "use what we just resolved" (the MAX above).
+    # Any positive numeric value wins, but we LOUDLY warn if it's lower
+    # than a source's native rate — that's the exact configuration that
+    # breaks time-remapped clipitems on import to Premiere (the bug
+    # users hit before this auto-pick logic was tightened).
     if frame_rate_arg is not None and frame_rate_arg != "auto":
         try:
             user_fps = float(frame_rate_arg)
             if user_fps > 0:
+                if max_fps and user_fps + 1e-3 < max_fps:
+                    print(f"  warn: --frame-rate={user_fps} is BELOW the "
+                          f"highest source fps ({max_fps:g}); time-remapped "
+                          f"clips may render with diagonal 'out of bounds' "
+                          f"stripes in Premiere. Pass --frame-rate=auto "
+                          f"(or omit) to inherit the source rate.",
+                          file=sys.stderr)
                 seq["video_fps"] = user_fps
         except (TypeError, ValueError):
             pass
@@ -665,7 +772,12 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
     if not ranges:
         raise ValueError("EDL has no ranges")
 
-    timeline = otio.schema.Timeline(name=edl.get("name") or "video-use-premiere cut")
+    # Sequence name defaults to "VU_Sequence" — keeps Premiere's
+    # project window tidy ("VU_Sequence" beside a "Footage" bin
+    # courtesy of the post-write _patch_xmeml_bin_layout pass) and
+    # matches the layout convention documented in SKILL.md. The EDL
+    # may override with its own `name` if the editor has a preference.
+    timeline = otio.schema.Timeline(name=edl.get("name") or "VU_Sequence")
     # Timeline rate sets the granularity of TimeRanges in the file. NLEs
     # auto-convert on import but giving them the same rate the user
     # eventually delivers at avoids any subtle re-quantization.
@@ -1686,6 +1798,276 @@ def _patch_xmeml_speed(out_path: Path, speed_map: dict | None) -> int:
     return patched
 
 
+def _patch_xmeml_bin_layout(
+    out_path: Path,
+    bin_name: str = "Footage",
+) -> int:
+    """Reorganize the xmeml so source clips live in a project-bin folder.
+
+    The OTIO `fcp_xml` adapter emits a flat layout — `<project>/<children>`
+    contains a single `<sequence>` element and Premiere derives the
+    project-bin clips implicitly from the sequence's `<clipitem>`s.
+    Implicit derivation means:
+
+      1. Every source clip lands at the bin's ROOT (no folder), which
+         is messy when an EDL pulls from many files.
+      2. None of the sequence clipitems carry a `<masterclipid>`, which
+         is the official xmeml linkage between a timeline clipitem and
+         its bin "master clip" entry. Without it, Premiere treats every
+         clipitem as a one-off phantom asset — and for time-remapped
+         clipitems that's exactly the configuration that triggers the
+         "Replace with clip > From Bin" workaround (which restores the
+         masterclipid linkage Premiere wanted in the first place).
+
+    This pass fixes both:
+
+      * Builds one `<clip>` master per unique `<file id>` and wraps
+        them all in a single `<bin name="{bin_name}">` (default
+        "Footage"). Master clips carry the file's full duration / rate
+        / pathurl so Premiere has the canonical asset metadata.
+      * Inserts a `<masterclipid>` reference into every sequence
+        `<clipitem>` so it links back to its bin master.
+      * Inserts the bin as the FIRST child of `<project>/<children>`
+        so it sorts above the sequence in the project window.
+
+    Idempotent — skips re-running if a `<bin>` is already present at
+    the project root. Non-fatal on any error: the file is left as-is
+    and a warning is printed.
+
+    Returns the number of master clips written into the bin.
+    """
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(str(out_path))
+        root = tree.getroot()
+    except Exception as e:
+        print(f"  warn: could not parse {out_path.name} for bin "
+              f"layout patch ({type(e).__name__}: {e}); leaving as-is.",
+              file=sys.stderr)
+        return 0
+
+    # ── Locate the project's <children> container ─────────────────────
+    # OTIO's xmeml output is <xmeml><project><children><sequence/>…
+    # We look for that exact shape; if the user hand-edited the file
+    # into something else we bail rather than guess.
+    project = root.find("project")
+    children = project.find("children") if project is not None else None
+    sequence = children.find("sequence") if children is not None else None
+    if project is None or children is None or sequence is None:
+        return 0
+
+    # ── Idempotence — skip if a bin is already at the root ────────────
+    if children.find("bin") is not None:
+        return 0
+
+    # ── Collect every UNIQUE <file id="…"> across the whole document ──
+    # The OTIO adapter writes the FULL file definition (name, pathurl,
+    # duration, rate, media descriptor) inside the FIRST clipitem that
+    # references each file id; subsequent clipitems carry a bare
+    # `<file id="file-N" />` reference. We snapshot the full def for
+    # each id so we can hoist it into the master clip below.
+    full_files: dict[str, ET.Element] = {}
+    for f in root.iter("file"):
+        fid = f.get("id")
+        if not fid or fid in full_files:
+            continue
+        # Only the "full" definition has child elements (name, pathurl,
+        # duration, rate, …). Reference-only forms are empty.
+        if len(list(f)) == 0:
+            continue
+        full_files[fid] = f
+    if not full_files:
+        return 0
+
+    # ── Build a deterministic file_id -> masterclip_id mapping ────────
+    # Sort by the numeric suffix when present ("file-7" -> 7) so the
+    # masterclip ids come out in source-declaration order. Falls back
+    # to lexicographic for non-conforming ids.
+    def _id_sort_key(fid: str):
+        try:
+            return (0, int(fid.rsplit("-", 1)[-1]))
+        except (ValueError, IndexError):
+            return (1, fid)
+    file_ids_sorted = sorted(full_files.keys(), key=_id_sort_key)
+    file_to_master: dict[str, str] = {
+        fid: f"masterclip-{i + 1}" for i, fid in enumerate(file_ids_sorted)
+    }
+
+    # ── Build the bin <children> with one master clip per source file ──
+    # Master-clip structure follows Premiere's own xmeml export shape
+    # (the minimum subset Premiere requires to recognise the bin entry
+    # AND treat sequence clipitems as instances of that master):
+    #
+    #   <clip id="masterclip-N" frameBlend="FALSE" explodedTracks="true">
+    #     <uuid>...</uuid>
+    #     <masterclipid>masterclip-N</masterclipid>
+    #     <ismasterclip>TRUE</ismasterclip>
+    #     <duration>...</duration>            (file duration in frames)
+    #     <rate>...</rate>                    (file rate)
+    #     <name>...</name>                    (file basename)
+    #     <media>
+    #       <video><track><clipitem .../></track></video>
+    #       <audio><track><clipitem .../></track></audio>
+    #     </media>
+    #     <file id="file-N">...full def...</file>
+    #   </clip>
+    import uuid as _uuid
+
+    bin_e = ET.Element("bin")
+    ET.SubElement(bin_e, "name").text = bin_name
+    bin_children = ET.SubElement(bin_e, "children")
+
+    masters_written = 0
+    for fid in file_ids_sorted:
+        f_full = full_files[fid]
+        master_id = file_to_master[fid]
+
+        # Pull canonical fields off the file def so the master mirrors
+        # the underlying asset's intrinsic shape. .find() may return
+        # None for sparsely populated files; we fall back to safe
+        # defaults rather than skip (a missing duration master is
+        # still a valid bin entry, just with 0-length scrubber).
+        file_name_e = f_full.find("name")
+        file_dur_e = f_full.find("duration")
+        file_rate_e = f_full.find("rate")
+        file_media_e = f_full.find("media")
+        # `<file>` declares whether each media stream exists via
+        # `<media><video>` and `<media><audio>` children — we only
+        # build a master-side <video>/<audio> branch when the source
+        # actually has that stream, so we don't fabricate a phantom
+        # audio track on a video-only file (or vice versa).
+        has_video = (file_media_e is not None and
+                     file_media_e.find("video") is not None)
+        has_audio = (file_media_e is not None and
+                     file_media_e.find("audio") is not None)
+
+        clip_e = ET.SubElement(bin_children, "clip", {
+            "id": master_id,
+            "frameBlend": "FALSE",
+            "explodedTracks": "true",
+        })
+        # Stable UUID per file id so reimports don't churn Premiere's
+        # internal asset registry — UUIDv5 over the file id keeps it
+        # deterministic across runs.
+        ET.SubElement(clip_e, "uuid").text = str(
+            _uuid.uuid5(_uuid.NAMESPACE_URL, f"video-use-premiere/{fid}")
+        )
+        ET.SubElement(clip_e, "masterclipid").text = master_id
+        ET.SubElement(clip_e, "ismasterclip").text = "TRUE"
+        if file_dur_e is not None and file_dur_e.text:
+            ET.SubElement(clip_e, "duration").text = file_dur_e.text
+        if file_rate_e is not None:
+            # Deep-copy rate so subsequent edits to the file's rate
+            # element don't mutate the master's rate by reference.
+            from copy import deepcopy as _deepcopy
+            clip_e.append(_deepcopy(file_rate_e))
+        if file_name_e is not None and file_name_e.text:
+            ET.SubElement(clip_e, "name").text = file_name_e.text
+
+        # Master-side media branch — one clipitem per stream, each
+        # spanning the FULL file (in=0, out=duration). Premiere uses
+        # this to populate the bin clip's source view scrubber.
+        media_e = ET.SubElement(clip_e, "media")
+        try:
+            file_dur_frames = int(float((file_dur_e.text or "0").strip())) \
+                if file_dur_e is not None else 0
+        except (TypeError, ValueError):
+            file_dur_frames = 0
+
+        def _add_master_track(parent_tag: str, track_idx_text: str) -> None:
+            """Build <{parent_tag}><track><clipitem/></track></{parent_tag}>
+            with the master's full-range clipitem inside."""
+            stream_e = ET.SubElement(media_e, parent_tag)
+            track_e = ET.SubElement(stream_e, "track")
+            ci = ET.SubElement(track_e, "clipitem", {
+                "id": f"{master_id}-{parent_tag[0]}",
+            })
+            ET.SubElement(ci, "masterclipid").text = master_id
+            if file_name_e is not None and file_name_e.text:
+                ET.SubElement(ci, "name").text = file_name_e.text
+            if file_dur_e is not None and file_dur_e.text:
+                ET.SubElement(ci, "duration").text = file_dur_e.text
+            if file_rate_e is not None:
+                from copy import deepcopy as _deepcopy
+                ci.append(_deepcopy(file_rate_e))
+            ET.SubElement(ci, "in").text = "0"
+            ET.SubElement(ci, "out").text = str(file_dur_frames)
+            ET.SubElement(ci, "file", {"id": fid})
+            if parent_tag == "audio":
+                # Required for Premiere to wire the master's audio
+                # scrubber to the file's first audio stream.
+                st = ET.SubElement(ci, "sourcetrack")
+                ET.SubElement(st, "mediatype").text = "audio"
+                ET.SubElement(st, "trackindex").text = track_idx_text
+
+        if has_video:
+            _add_master_track("video", "1")
+        if has_audio:
+            _add_master_track("audio", "1")
+
+        # Hoist the FULL <file> definition out of its current
+        # (sequence-clipitem) parent and re-attach it to the master
+        # clip. Sequence clipitems will then link via the
+        # `<file id=...>` reference shape, which is what Premiere
+        # expects when a bin master is present.
+        for parent in root.iter():
+            if f_full in list(parent):
+                parent.remove(f_full)
+                break
+        clip_e.append(f_full)
+
+        masters_written += 1
+
+    if masters_written == 0:
+        return 0
+
+    # ── Wire every sequence <clipitem> back to its bin master ─────────
+    # We add a <masterclipid> child (Premiere's official linkage) and
+    # ensure the clipitem's <file> is a bare reference (`<file id="…"/>`)
+    # rather than a duplicate of the full def we just hoisted. OTIO
+    # already writes refs after the first clipitem; this is just
+    # defensive in case a future adapter version regresses.
+    for ci in sequence.iter("clipitem"):
+        f_e = ci.find("file")
+        if f_e is None:
+            continue
+        fid = f_e.get("id")
+        if not fid or fid not in file_to_master:
+            continue
+        master_id = file_to_master[fid]
+        # Only add a masterclipid if one isn't already present —
+        # Premiere errors on duplicates.
+        if ci.find("masterclipid") is None:
+            mid_e = ET.Element("masterclipid")
+            mid_e.text = master_id
+            # Insert near the top so the ordering matches Premiere's
+            # own xmeml exports (masterclipid before <name>).
+            ci.insert(0, mid_e)
+        # Strip any stray children from the file ref so it's a clean
+        # `<file id="…"/>` self-closing reference. The full def now
+        # lives on the bin master.
+        for child in list(f_e):
+            f_e.remove(child)
+        f_e.text = None
+
+    # ── Insert the bin BEFORE the sequence in <project>/<children> ────
+    # ElementTree's Element supports `insert(index, element)`; we use
+    # 0 so the bin sorts to the top of the project window.
+    children.insert(0, bin_e)
+
+    try:
+        tree.write(str(out_path), encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        print(f"  warn: xmeml bin layout patch built {masters_written} "
+              f"master clip(s) but failed to write back to "
+              f"{out_path.name} ({type(e).__name__}: {e}); the file is "
+              "still valid xmeml, just without the bin reorganisation.",
+              file=sys.stderr)
+        return 0
+
+    return masters_written
+
+
 def write_fcpxml(timeline, out_path: Path) -> None:
     """Write the timeline as FCPXML 1.10+ (.fcpxml) — Resolve / FCP X path.
 
@@ -1766,6 +2148,17 @@ def write_premiere_xml(timeline, out_path: Path) -> None:
     if n_speed:
         print(f"  retime: patched {n_speed} timeremap filter(s) "
               f"in {out_path.name}")
+    # Reorganise the project layout — hoist source files into a
+    # "Footage" bin and link sequence clipitems to bin master clips
+    # via <masterclipid>. Beyond the obvious organisational win, the
+    # masterclipid linkage is what Premiere's "Replace with clip >
+    # From Bin" workaround restores when users hit it manually to
+    # repair time-remapped clipitems; running it at export time means
+    # the user never needs to.
+    n_masters = _patch_xmeml_bin_layout(out_path, bin_name="Footage")
+    if n_masters:
+        print(f"  layout: hoisted {n_masters} source file(s) into a "
+              f"'Footage' bin in {out_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -1878,7 +2271,11 @@ def main() -> None:
           f"@ {timeline_fps:.3f} fps, {seq_meta['fcpxml_color_space']}")
     print(f"  audio:       {seq_meta['audio_channels']}ch @ "
           f"{seq_meta['audio_rate']} Hz")
-    print(f"  inherited from primary source: {primary_label}")
+    # Resolution + fps come from MAX-across-sources (so the sequence
+    # never under-fits any clip, see _resolve_sequence_settings); color
+    # / audio shape inherit from the runtime-dominant primary source.
+    print(f"  fps + res:   max-across-sources (sequence ≥ every clip)")
+    print(f"  color/audio: inherited from primary source: {primary_label}")
 
     # Emit each requested dialect. Failures in one writer don't prevent
     # the other from running — the user shouldn't lose the Premiere file
