@@ -1,0 +1,120 @@
+# =============================================================================
+#  Codex CLI — project-level config for video-use-premiere
+# -----------------------------------------------------------------------------
+#  Lives at <repo-root>/.codex/config.toml. Codex loads this file ONLY when the
+#  project has been marked trusted in the user's ~/.codex/config.toml — see the
+#  one-time setup note at the bottom of this file.
+#
+#  Precedence (highest first):
+#    1. CLI flags (`codex -a never`, `--config k=v`)
+#    2. Profile values (`--profile <name>`)
+#    3. THIS FILE  (project-scoped, trusted projects only)
+#    4. ~/.codex/config.toml  (user defaults)
+#    5. /etc/codex/config.toml  (system, Unix only)
+#    6. Built-in defaults
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Approval policy — when does Codex pause to ask before running commands?
+# -----------------------------------------------------------------------------
+#  Options:
+#    "on-request"  pauses for every file edit and shell command (safest, most
+#                  friction).
+#    "on-failure"  auto-approves anything the sandbox allows and only pauses
+#                  when a command fails or needs to escalate out of the
+#                  sandbox. Recommended balance for this skill — pip / uv /
+#                  ffmpeg / helper scripts all run silently, but if something
+#                  trips the sandbox you still get a prompt.
+#    "never"       full autonomy ("yolo mode"). Same as `--full-auto`.
+# -----------------------------------------------------------------------------
+approval_policy = "on-failure"
+
+# -----------------------------------------------------------------------------
+#  Sandbox mode — how much filesystem / network access does Codex have?
+# -----------------------------------------------------------------------------
+#  Options:
+#    "read-only"           No writes, no shell mutations. Useless for editing.
+#    "workspace-write"     Writes scoped to the project root + $TMPDIR + /tmp.
+#                          .git/ and .codex/ stay protected (commands like
+#                          `git commit` may still need approval — that's a
+#                          feature, not a bug).
+#    "danger-full-access"  No sandbox. Don't use unless you already isolate
+#                          the process some other way (container, VM, etc).
+# -----------------------------------------------------------------------------
+sandbox_mode = "workspace-write"
+
+# -----------------------------------------------------------------------------
+#  Workspace-write sandbox details
+# -----------------------------------------------------------------------------
+#  network_access = true is REQUIRED for pip / uv / pipx / conda / npm to
+#  fetch packages. Without it, every install command stalls waiting for
+#  approval to escalate out of the sandbox.
+#
+#  exclude_tmpdir_env_var / exclude_slash_tmp default to false (i.e. tmp dirs
+#  ARE writable). Left at defaults.
+#
+#  writable_roots lets you whitelist additional paths outside the workspace
+#  that helper scripts touch. The HuggingFace cache and uv tool dir live
+#  under the user profile and are read/written during model downloads.
+# -----------------------------------------------------------------------------
+[sandbox_workspace_write]
+network_access = true
+
+writable_roots = [
+    # HuggingFace model cache (Parakeet ONNX, Florence-2, CLAP weights all
+    # download here on first run via _hf_env.py).
+    "~/.cache/huggingface",
+    "~/AppData/Local/huggingface",
+
+    # uv tool / venv shims live outside the project.
+    "~/.local/share/uv",
+    "~/AppData/Roaming/uv",
+    "~/AppData/Local/uv",
+
+    # PyTorch / ONNX runtime cache.
+    "~/.cache/torch",
+    "~/AppData/Local/torch",
+]
+
+# -----------------------------------------------------------------------------
+#  Windows native sandbox
+# -----------------------------------------------------------------------------
+#  When running Codex natively on Windows (which is the case here — the repo
+#  lives at L:\Dev\video-use-premiere), set the sandbox mode to "elevated"
+#  unless you don't have admin rights, in which case fall back to
+#  "unelevated".
+# -----------------------------------------------------------------------------
+[windows]
+native_sandbox_mode = "elevated"
+
+# -----------------------------------------------------------------------------
+#  Shell environment policy — keep the sub-shells lean and predictable
+# -----------------------------------------------------------------------------
+#  By default Codex inherits the full parent environment, which on Windows
+#  is enormous (PATH alone is ~100 entries) and can leak secrets into shell
+#  command output. Restricting to the variables the helpers actually need
+#  speeds up spawns and reduces the secret-leak surface.
+# -----------------------------------------------------------------------------
+[shell_environment_policy]
+inherit = "core"
+exclude = ["AWS_*", "AZURE_*", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "*_TOKEN", "*_SECRET"]
+
+# =============================================================================
+#  ONE-TIME SETUP — required for this file to take effect
+# -----------------------------------------------------------------------------
+#  Codex IGNORES every .codex/config.toml unless the project is explicitly
+#  trusted in your user config. Two ways to do it:
+#
+#    A) The first time you `cd` into this repo and run `codex`, the CLI will
+#       prompt: "Trust this project?". Say yes — Codex appends the trust
+#       entry to ~/.codex/config.toml automatically.
+#
+#    B) Manually add this block to ~/.codex/config.toml (Windows path is
+#       %USERPROFILE%\.codex\config.toml):
+#
+#         [projects."L:\\Dev\\video-use-premiere"]
+#         trust_level = "trusted"
+#
+#  After trust is granted, every `codex` invocation inside this repo merges
+#  the settings above on top of your user defaults.
+# =============================================================================
