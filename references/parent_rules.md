@@ -1079,6 +1079,99 @@ in the NLE.
 
 ---
 
+## Editor return rationale — extra blocks to echo to the user
+
+Two editor sub-agent features detect **user intent baked into the
+source recording itself** and produce dedicated blocks in the
+editor's return rationale that you must surface to the user when
+describing the cut. Detection happens autonomously inside the
+editor's merged-timeline read; you don't gate them with flags,
+you don't read the timeline yourself. Your job is echo +
+clarification.
+
+### `In-clip editor notes` block
+
+The editor detects verbal directives the user recorded into the
+source clips themselves — *"hey to the AI editing this, skip the
+first take"*, *"editor's note: this clip is a throwaway"*,
+countdown markers (*"three two one"*) excluded from the cut, etc.
+Full detection / application rules live in
+`subagent_editor_rules.md` "In-clip editor notes."
+
+The editor returns a list shaped like:
+
+```
+In-clip editor notes detected:
+  - C0312 t=0.4s "skip the first take, the second is the keeper"
+    — APPLIED. ...
+  - C0418 t=0.8s "this whole clip is a throwaway" — APPLIED. ...
+  - C0507 t=12.3s "hey editor I think we should..." — IGNORED.
+    No clear directive followed.
+```
+
+What you do with it:
+
+1. **Echo every APPLIED note back to the user**, quoting the
+   editor's transcribed phrasing verbatim. *"In your C0312 you
+   said 'skip the first take, the second is the keeper' — went
+   with the second, like you asked."*
+2. **Surface ambiguous notes the editor flagged** (*"cut around
+   the embarrassing bit"*, *"the audio is bad here"*). Ask a
+   single clarifying question, capture the user's answer as a
+   verbatim conversation quote, re-spawn the editor with the
+   quote in the bundle.
+3. **Persist applied notes in `project.md`** — one-liner per
+   session is enough.
+
+If the user wants to disable the feature for a session (e.g. *"my
+brother yells 'hey AI' as a joke, ignore those"*), capture the
+exact quote in the bundle. The editor honors the override.
+
+### `Retake decisions` block
+
+The editor detects when the user re-recorded a line — frustration
+marker (*"fuck, again"*), restart phrase (*"let me try that
+again"*), long-pause-then-restart, slate / clap between takes, or
+a fresh clip starting with the same content as the last — and
+picks the cleaner take, dropping the rest. Full rules live in
+`subagent_editor_rules.md` "Retake detection."
+
+The editor returns a list shaped like:
+
+```
+Retake decisions:
+  - INTRO beat: kept C0312 14.2-22.5 (later take); dropped
+    C0312 4.1-12.0 — speaker said "fuck, again" at 11.4s.
+  - DEMO beat: kept C0312 first delivery 32.0-41.5; later
+    delivery at 45.0-54.2 had three "uh" fillers vs zero on
+    the first, so the earlier take won.
+  - PUNCHLINE: kept BOTH "we'll never ship" instances —
+    rhetorical emphasis, not a retake.
+```
+
+What you do with it:
+
+1. **Echo retake calls when they're load-bearing** — the user
+   wants to know their second take landed. Doesn't have to be
+   exhaustive on every micro-retake; surface the meaningful ones.
+2. **Surface override calls** explicitly — when the editor used
+   the EARLIER take instead of the later (because the later was
+   worse), tell the user that judgement was made and why.
+3. **Surface "kept both" calls on emphatic repetition** so the
+   user knows nothing was dropped by mistake.
+
+This block is informational; the editor already made the call.
+You're translating to the user, not re-deciding.
+
+### When the user overrides a retake decision
+
+If the user replies *"actually use the first take of the intro,
+the second is too rushed"*, capture verbatim and re-spawn the
+editor with that quote in the bundle. The editor's "explicit
+user quote" priority overrides its retake heuristic.
+
+---
+
 ## Parent-specific anti-patterns
 
 - **Reading any timeline file.** See shared_rules.md "Agent roles"

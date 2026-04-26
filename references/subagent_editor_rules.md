@@ -347,6 +347,375 @@ timeline shows:
 
 ---
 
+## In-clip editor notes — talkback baked into the source
+
+Users sometimes record verbal directives **into the clip itself**,
+addressed to a downstream editor before, between, or after takes.
+Common shapes:
+
+- **Preamble note before a take.** *"hey to the AI editing this,
+  skip the first attempt — the second one's the keeper. Three,
+  two, one…"* then the actual take begins.
+- **Mid-clip note between takes.** *"…ugh, that was awful. Editor,
+  just use the next one. Okay, take two — three, two, one…"*
+- **End-of-clip note.** *"…and that's that. Note for the editor:
+  if my hands shake on the close-up, cut to the wide."*
+- **Pickup directive.** *"editor's note: skip ahead until I clap"*
+  followed by the user clapping, the visual lane registering a
+  hand motion at t=N, and the take starting after.
+
+These are first-class user instructions — the user spoke them into
+the recording precisely so a downstream editor would find them.
+**Detect them, honour them, exclude the preamble from the EDL, and
+surface every one in your return rationale** so the parent echoes
+them back to the user in plain English.
+
+### Trigger-phrase detection
+
+Walk the speech lane in `merged_timeline.md` (and `speech_timeline.md`
+when you need word-level timing) for any phrase the speaker uses to
+**address an editor or AI**. Match liberally — case-insensitive,
+tolerant of mis-transcription — but require **imperative or
+instructional content following the address** before treating as a
+note.
+
+Common opening phrasings (non-exhaustive — match the *intent*, not
+a fixed list):
+
+- *"hey, [to the] editor[s]"*, *"hey editor"*, *"yo editor"*
+- *"hey, AI"*, *"hey, Claude"*, *"hey, the AI editing this"*
+- *"note to [the] editor"*, *"note to AI"*, *"note to self"*
+- *"editor's note"*, *"memo to editor"*, *"dear editor"*
+- *"for the editor"*, *"for whoever's editing"*,
+  *"to whoever's cutting this"*
+- *"AI listen up"*, *"AI take note"*
+
+Parakeet may mis-hear these (`"note the editor"` vs
+`"note to the editor"`, `"hey AI editing"` vs `"hey AI editor"`).
+Read for *intent*: if the speaker is clearly addressing a downstream
+editor / AI rather than the on-camera audience, the following
+content is a note candidate.
+
+### Boundary detection — where does the directive end?
+
+The directive runs from the trigger to **the first of**:
+
+1. **A take-start countdown.** *"three two one"*, *"3 2 1"*,
+   *"in three two one"*, *"and three… two… one… action"*,
+   *"and… action"*, *"okay rolling"*, *"okay take one"*,
+   *"take two"*, etc. The countdown / call itself is also EXCLUDED
+   from the EDL — nobody wants *"three two one"* in the cut.
+2. **A clap or slate.** Look for an `(audio: clap …)` /
+   `(audio: slate …)` event within ~3s of the trigger. Visual
+   confirmation (`visual: …hands clapping…` on the same window)
+   strengthens the signal but is not required.
+3. **A long silence gap** (≥ 1.5s) that clearly separates the
+   address from the rest of the clip.
+4. **An obvious topic / register shift** — speaker stops addressing
+   the editor and starts addressing the audience (*"Hey everyone,
+   today we're going to…"*).
+
+If none of those land within ~10s of the trigger, the trigger was
+probably a false positive (*"hey editor"* said rhetorically). Do
+not treat as a note; let the words ride as content (still subject to
+filler-cut rules).
+
+### Exclusion from the EDL
+
+Everything from the trigger through the take-start marker
+(inclusive of countdown / *"action"* / clap window) is excluded.
+Concretely: do not start an EDL range inside the preamble; place
+the in-point at or after the take-start marker, snapped to a word
+boundary per Hard Rule 6. The pacing preset's `lead_margin` still
+applies on the chosen in-point — but never let it pull the in-point
+back INTO the preamble. If `lead_margin` would re-include
+*"…three two one…"*, clamp the in-point so the preamble stays out.
+
+### Application — directive ranks alongside conversation quotes
+
+Treat each detected directive as a first-class instruction:
+
+1. **Things the user explicitly asked to keep / reject** in the
+   parent's Conversation Context bundle (always wins — these are
+   post-hoc, deliberate, may explicitly reverse an in-clip note).
+2. **In-clip editor notes** detected in this read.
+3. Default editorial rules (pacing, filler removal, etc.).
+
+If an in-clip note conflicts with a conversation-bundle quote, the
+conversation quote wins; note the override in the return rationale
+(*"In-clip note from C0312 said 'use the first take' but the user's
+later quote 'use the cleanest delivery' wins"*).
+
+Common directive shapes and how to apply them:
+
+- *"skip the first take, use the second"* → exclude first-take
+  ranges, prefer second-take words.
+- *"this take is bad"* / *"don't use this one"* → exclude that
+  take's words entirely from candidates.
+- *"cut after I say <X>"* / *"end on <X>"* → out-point on that word.
+- *"start when I clap"* → in-point at the clap audio event /
+  visual hand-clap frame.
+- *"the wide shot is better than the close-up here"* → bias toward
+  the wide-shot source for that beat.
+- *"cut around me coughing at minute four"* → split the EDL range
+  to drop the cough span.
+- *"speed this up"* — only honour when `timelapse_mode = true`
+  (otherwise note the deferral; gating wins).
+
+### Citation in the EDL `reason` field
+
+When an in-clip note shaped a range, cite it in `reason` with the
+source stem and timestamp, quoting verbatim:
+
+```json
+{"source": "C0312", "start": 8.20, "end": 22.45,
+ "beat": "DEMO",
+ "audio_lead": 0.0, "video_tail": 0.0, "transition_in": 0.0,
+ "quote": "...",
+ "reason": "Second take per in-clip note (C0312 t=0.4s): 'skip the first take, the second one is the keeper.' In-point at first word after countdown."}
+```
+
+Mandatory at `user_profile = professional`, recommended at
+`creator`, optional at `personal` — but the return-rationale report
+below is mandatory regardless of profile.
+
+### Return rationale — surface every detected note
+
+Include a dedicated `In-clip editor notes` block listing every
+detected directive, what you did about it, and any deviation:
+
+```
+In-clip editor notes detected:
+  - C0312 t=0.4s "skip the first take, the second one is the
+    keeper" — APPLIED. First-take range (C0312 0.0-7.8s) excluded;
+    used 8.2-22.5s instead.
+  - C0312 t=24.1s "if my hands shake on the close-up, cut to the
+    wide" — APPLIED conditionally. Hands appeared steady on the
+    close-up frames (visual: t=30s hands holding object steady),
+    no cut to wide needed.
+  - C0418 t=0.8s "for the editor, this whole clip is a throwaway"
+    — APPLIED. C0418 excluded from all ranges.
+  - C0507 t=12.3s "hey editor I think we should…" — IGNORED.
+    Trigger fired but no clear directive followed; speaker
+    transitioned into normal narration. Treated as content.
+```
+
+The parent will translate this into plain English for the user.
+
+### Conservative handling — when in doubt, surface, don't act
+
+If a directive is **ambiguous, contradictory, or impossible to
+verify** against the timeline, **do not silently act on it.**
+
+- *"editor cut around the embarrassing bit"* — what counts as
+  embarrassing? Don't guess. Flag in rationale; preserve the take.
+- *"the audio is bad on this one"* — you can't measure SNR from
+  the timeline (CLAP / Florence-2 don't surface it). Flag; preserve.
+- Two in-clip notes that contradict each other across takes
+  (*"use the first"* in C0312 vs *"use the second"* in C0312
+  pickup) — pick the **later** note (the user updated their
+  preference) and flag the conflict.
+
+Surfacing > silent guessing. The parent will ask one clarifying
+question and re-spawn you with the clarification in the bundle.
+
+### When the user wants to disable the feature
+
+If a verbatim conversation-bundle quote says *"ignore any 'hey
+editor' notes in the source"* / *"my brother yells 'hey AI' as a
+joke, don't act on those"*, **respect the override** — treat all
+in-clip notes as normal content for that session and note the
+override at the top of your return rationale.
+
+---
+
+## Retake detection — pick the cleanest take of repeated content
+
+Real recordings contain **multiple takes of the same line**. The
+speaker flubs, swears, restarts; or just naturally re-says
+something a beat later because they didn't like how it landed.
+Sometimes retakes happen across clip boundaries — one source ends
+right before another picks up the same line. Your job: detect the
+repetition, pick the cleanest take, drop the rest. The user
+recorded the better take precisely so you'd use it.
+
+This is distinct from filler removal (per-word *"uh"* / *"um"*) and
+distinct from in-clip editor notes (explicit verbal directives).
+Retakes are an **implicit pattern**: the same words, twice, the
+later one usually better.
+
+### Signals that a retake just happened
+
+Walk the speech lane looking for these patterns:
+
+1. **Frustration marker followed by similar content.** A curse word
+   (*"fuck"*, *"shit"*, *"damn"*, *"crap"*, *"bollocks"*), a
+   self-disgust noise (*"ugh"*, *"argh"*, *"god"*, *"jesus"*), or a
+   self-correction phrase (*"no no no"*, *"nope"*, *"hold on"*,
+   *"wait"*, *"sorry"*, *"let me try that again"*, *"one more
+   time"*, *"start over"*, *"take two"*, *"again"*) **followed
+   within ~10s by speech that paraphrases or repeats the
+   immediately preceding utterance.** The frustration marker is the
+   strongest single retake signal — when you see one, look both
+   ways for the matching pair.
+
+2. **Semantic repetition without an explicit marker.** Two
+   utterances within ~30s that say substantially the same thing in
+   different words (or the same words). Compute rough similarity by
+   hand: shared content nouns / verbs / named entities, similar
+   sentence shape, similar information density. Bag-of-content-
+   words overlap ≥ 50% with no intervening topic shift is a strong
+   cue.
+
+3. **Cross-clip retakes.** Two adjacent sources that start with
+   similar content. Source ordering in `merged_timeline.md` is the
+   parent's argv order; if filenames suggest sequence (`C0312` then
+   `C0313` recorded back-to-back, or `intro_take1.MP4` then
+   `intro_take2.MP4`), the second is almost always the keeper for
+   any overlap.
+
+4. **An explicit slate / clap separating the takes.**
+   `(audio: clap …)` or `(audio: slate …)` between two utterances
+   of the same content — that's a deliberate retake marker.
+
+5. **Long pause followed by restart.** A silence gap ≥ 2s followed
+   by speech that restates what came before the pause (*"…welcome
+   to the show. [3.4s silence] Welcome to the show, today we're…"*).
+
+### How to pick the keeper
+
+Default heuristic: **prefer the LATER take.** The later take exists
+because the speaker decided the earlier one wasn't good enough —
+respect that decision. Concretely, when you have two semantically
+matched ranges, exclude the earlier from the EDL and use the later.
+
+Override the default when:
+
+- An in-clip editor note explicitly says *"use the first take"* —
+  in-clip notes win (per the application priority above).
+- The later take is *worse* on objective signals: more fillers
+  than the earlier, more silences, more false starts, OR the
+  speaker visibly / audibly dropped energy. Compare on:
+    - filler-word count after silence-pass
+    - shortest false-start span
+    - total speech duration vs target word count (longer ≠ better;
+      tighter delivery wins)
+  If the EARLIER take wins decisively on these signals, use it
+  instead and note the override in `reason`.
+- The takes diverge in *meaning*: one ends with a punchline the
+  other lacks; one introduces a named subject the script needs;
+  one is the *"with the joke"* version the user explicitly asked
+  to keep. Trust the conversation bundle on this — verbatim quotes
+  that say *"keep the punchline take"* override the default.
+- The keeper take fails the structural test (cuts off mid-thought;
+  the speaker walks out of frame; visual continuity breaks). Drop
+  to the alternate, note in `reason`.
+
+### When repetition is INTENTIONAL — keep both
+
+Not every repetition is a retake. Watch for:
+
+- **Rhetorical / emphatic repetition.** *"Buy now. Buy now. Buy
+  NOW."* — the rhythm IS the beat. Keep all three.
+- **Comedic repetition / callback.** *"…and then he says 'no'.
+  No. Just no."* — beat structure depends on it.
+- **List repetition.** *"It's fast, it's faster, it's the
+  fastest."* — kept for the ladder.
+- **Speaker quoting another speaker.** *"He said: 'we'll never
+  ship.' We'll never ship."* — voice / tone change distinguishes.
+
+Disambiguation cues:
+
+| Cue                              | Retake | Intentional |
+|----------------------------------|:------:|:-----------:|
+| Frustration marker between       |   X    |             |
+| Long pause (≥ 2s) between        |   X    |             |
+| Slate / clap between             |   X    |             |
+| Visible camera reset / re-frame  |   X    |             |
+| Identical wording, no pause      |        |     X       |
+| Escalating pitch / energy        |        |     X       |
+| Speaker tone shift (joke beat)   |        |     X       |
+| Explicit *"again"* / *"take two"*|   X    |             |
+
+When ambiguous, **lean toward keeping both** — losing intentional
+emphasis is a more visible bug than keeping a single redundant
+sentence. Note the call in `reason`.
+
+### Cutting mechanics for retakes
+
+When you've identified an earlier-take range to drop and a later-
+take range to keep, the mechanics are the same as any other inline
+cut (see "Cut craft" above):
+
+- Both surviving / dropped boundaries snap to word boundaries
+  (Hard Rule 6).
+- The frustration marker, the curse word, the *"let me try that
+  again"* — **all excluded** from the EDL. They were the connective
+  tissue between takes; nobody wants them in the cut.
+- The combined-pad clamp from the silence-removal pass applies on
+  the gap between the kept earlier audio (before the dropped
+  retake) and the kept later audio (the keeper take), so margins
+  don't bleed back into the dropped span.
+- If the retake straddles a clip boundary (one source ended, next
+  picked up), emit two adjacent EDL ranges from different sources;
+  the FCPXML exporter handles same-track concatenation natively.
+
+### Citation in the EDL `reason` field
+
+When a retake decision shaped a range, cite the rejection reason:
+
+```json
+{"source": "C0312", "start": 14.20, "end": 22.45,
+ "beat": "INTRO",
+ "audio_lead": 0.0, "video_tail": 0.0, "transition_in": 0.0,
+ "quote": "Welcome back to PAX East today we're at...",
+ "reason": "Second take of intro (C0312 14.2-22.5s); first take at C0312 4.1-12.0s rejected — speaker said 'fuck, again' at 11.4s and restarted with cleaner delivery."}
+```
+
+### Return rationale — surface every retake call
+
+Include a dedicated `Retake decisions` block in your return:
+
+```
+Retake decisions:
+  - INTRO beat: kept C0312 14.2-22.5 (later take); dropped
+    C0312 4.1-12.0 (first take) — speaker said "fuck, again"
+    at 11.4s indicating a deliberate restart.
+  - DEMO beat: kept C0312 first delivery 32.0-41.5; later
+    delivery at 45.0-54.2 had three "uh" fillers vs zero on
+    the first, so the EARLIER take won (override on default).
+  - PUNCHLINE: kept BOTH instances of "we'll never ship"
+    (C0418 8.0-9.5 and 9.5-10.8); rhetorical emphasis,
+    no frustration marker between, escalating pitch.
+  - Cross-clip: C0420 begins with the same line that ends
+    C0419 — kept C0420's version (later, cleaner).
+```
+
+The parent surfaces these to the user.
+
+### Conservative handling for retakes
+
+- **If you cannot decide which take is cleaner**, default to the
+  later one and flag the call in the rationale so the parent knows
+  you guessed.
+- **If both takes contain unique content** (one has a sentence
+  the other lacks), keep BOTH and let the speech ride — better to
+  over-include than to silently drop a beat the speaker meant to
+  land.
+- **Never cut around a frustration marker without confirming a
+  matching restart within 10s.** A standalone *"fuck"* with no
+  retake might just be the speaker's natural reaction to something
+  on camera — that's content, not retake noise. Filler-word rules
+  do not list curse words as default-cut for that reason.
+- **Cross-clip retake detection requires temporal evidence.** Two
+  clips containing similar speech aren't necessarily takes of each
+  other — they might be different days, different scenes. Use clip
+  stem ordering (numeric or `_take1` / `_take2` suffixes), an
+  explicit user quote about retakes, or a slate / clap audio event
+  before excluding an entire clip as a "rejected take."
+
+---
+
 ## Pacing preset application algorithm
 
 The parent's brief gives you four numbers from a preset name. Apply
@@ -805,3 +1174,31 @@ factual, be terse on the report, but be thorough on the EDL itself.
   explicitly authorized it. The user organized for a reason.
 - **Spawning scouts on tiny libraries or single-source projects.**
   Spawn overhead exceeds savings. Do the work in-context.
+- **Including a *"hey editor"* preamble in the EDL.** Trigger
+  phrases + countdown / clap markers are exclusion zones; the
+  in-point belongs at or after the take-start marker.
+- **Acting silently on an in-clip note.** Every note you applied
+  (or chose to skip) goes in the `In-clip editor notes` block of
+  your return rationale. The user spoke it into the recording so
+  they'd hear it land back in the cut.
+- **Acting on an ambiguous in-clip directive.** *"Cut around the
+  embarrassing bit"* / *"the audio is bad here"* — flag, don't
+  guess. The parent can ask one question and re-spawn you with
+  the clarification.
+- **Cutting the LATER take when the speaker swore at the
+  earlier one.** Frustration markers are restart signals; the
+  later take is the keeper unless objective signals say otherwise.
+- **Treating rhetorical / emphatic repetition as a retake.**
+  *"Buy now. Buy now. Buy NOW."* is a beat, not three takes of
+  one line. When in doubt, keep both.
+- **Cutting around a curse word without confirming a matching
+  restart.** A standalone *"fuck"* may be content, not retake
+  noise. Look both ways before cutting.
+- **Cross-clip retake decisions without temporal evidence.** Two
+  clips containing similar speech might be different scenes
+  entirely. Confirm via stem ordering / recording metadata /
+  explicit user quote before excluding a whole clip as rejected.
+- **Failing to surface retake decisions in the return rationale.**
+  The user wants to know which take landed and why; the
+  `Retake decisions` block is mandatory whenever a retake call
+  influenced the cut.
