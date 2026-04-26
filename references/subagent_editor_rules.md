@@ -18,6 +18,41 @@ This rule overrides every other consideration in this file. There is
 no token budget concern, no time concern, no efficiency concern, no
 "diminishing returns" argument that justifies stopping early.
 
+### Mode-gated cold-path reads (conditional, before the merged-view read)
+
+The parent's brief carries three feature-mode flags
+(`script_mode`, `b_roll_mode`, `user_profile`). For the two boolean
+flags, **if the flag is true, read the matching cold-path file IN
+FULL before reading the merged timeline.** If the flag is false,
+skip the file silently — those rules don't apply this session.
+
+| Flag                | If `true`, read this file in full          |
+|---------------------|--------------------------------------------|
+| `script_mode`       | `references/scripted.md`                   |
+| `b_roll_mode`       | `references/b_roll_selection.md`           |
+
+`user_profile` is `personal | creator | professional` and is NOT a
+file flag — it sets your verification bar (see below). It comes
+into play when you're applying the rules from
+`b_roll_selection.md` (top-candidate review on every named-subject
+beat at `professional`, default bar otherwise) and when you're
+writing QA notes in EDL `reason` fields (terse for personal /
+creator; detailed list-the-rejected-candidates for professional).
+
+These cold-path files are **additive** to your default rules — they
+do not replace the merged-view spine read below, the pacing-preset
+algorithm, the word-boundary discipline, or any Hard Rule. When
+both `script_mode` and `b_roll_mode` are true (the common combo for
+voiceover-driven assembly), read both files; the assembly procedure
+in `scripted.md` references the selection rules in
+`b_roll_selection.md` step-by-step.
+
+If a flag the brief did not mention seems to apply (e.g. you find
+the project clearly has b-roll but the brief doesn't say so),
+**don't infer it silently** — return to the parent with a flag-
+clarification request. The parent owns the flag values; you don't
+override them.
+
 ### What you must read in full, every spawn
 
 1. **`<edit>/merged_timeline.md`** — END-TO-END. EVERY LINE.
@@ -39,6 +74,15 @@ no token budget concern, no time concern, no efficiency concern, no
    read only the ranges around the user's complaint and assume the
    rest is fine — the user might have asked for a global change
    ("tighten the whole thing") that requires touching every range.
+
+3. **The script (when `script_mode = true`)** — END-TO-END. EVERY
+   LINE. The path is in the parent's brief (typically
+   `<edit>/script.md` / `<edit>/script.txt`). Bracketed directions
+   like `[CUT TO ...]` or `[B-ROLL: ...]` are the user's commands,
+   not hints — bind them. See `references/scripted.md` for the
+   beat-segmentation procedure. If the script is missing despite
+   the flag being true, STOP and report to the parent — do not
+   guess at beats from the voiceover transcript alone.
 
 ### Hard procedure when a file exceeds one `Read` call
 
@@ -128,26 +172,6 @@ the same brief and an angry parent.
    parent must re-run `python helpers/pack_timelines.py --edit-dir
    <edit>` to regenerate it. Do not invent a workaround.
 
-2. **Internalize the priority order:**
-   - **Speech is the spine** — every cut start / end must land on a
-     word boundary from the Parakeet word-level transcript.
-   - **Visual is the second source of truth** — for shot continuity,
-     B-roll candidates, what's actually on screen at a moment.
-   - **Audio events are noisy hints only** — trust them only after
-     cross-checking the visual line at the same timestamp. When
-     `(audio: ...)` and `visual:` disagree about what is on screen,
-     trust visual.
-
-3. **Drill into the per-lane files only when the merged view is
-   ambiguous.** Use `<edit>/speech_timeline.md` for word-level timing
-   detail beyond the merged phrase grouping; `<edit>/visual_timeline.md`
-   for the full 1fps caption stream including `(same)` repeats;
-   `<edit>/audio_timeline.md` for per-window CLAP scoring detail.
-
-4. **If `merged_timeline.md` is missing**, STOP and report — the
-   parent must re-run `python helpers/pack_timelines.py --edit-dir
-   <edit>` to regenerate it. Do not invent a workaround.
-
 ---
 
 ## Inputs the parent's brief gives you
@@ -170,6 +194,9 @@ The bundle includes:
   revision, unless a later quote reverses them.
 - **Strategy** — beats / structure, pacing preset values, target
   runtime, delivery target.
+- **Mode flags** — `script_mode`, `b_roll_mode`, `user_profile`.
+  These gate the cold-path file reads above and set the
+  verification bar; they travel in every brief.
 - **Verbal slips to avoid** — list the parent compiled.
 - **Change-request history** (on revisions) — chronological list of
   every prior revision + diff. Read this so revision N is informed by
@@ -555,3 +582,16 @@ factual, be terse on the report, but be thorough on the EDL itself.
 - **Splitting around every word of filler speech in an otherwise-
   squeezable stretch.** If the speech isn't load-bearing, squeeze
   right over it with `audio_strategy="drop"`.
+- **Ignoring the mode flags in the brief.** If `script_mode = true`
+  and you skip `references/scripted.md`, you'll cut as if the
+  voiceover were a talking head — wrong assembly model. Same for
+  `b_roll_mode = true` and `references/b_roll_selection.md`. The
+  flags exist so the rules apply when they're meant to.
+- **Inferring a mode flag the brief didn't set.** If you discover
+  scripted-mode-shaped material when the brief says
+  `script_mode = false`, return to the parent with a flag-
+  clarification request, don't silently switch modes mid-spawn.
+- **Defaulting the verification bar to "creator" on a
+  `professional` brief.** Top-candidate review and detailed QA
+  notes are mandatory at the professional bar — see
+  `b_roll_selection.md` "How `user_profile` shapes the bar."

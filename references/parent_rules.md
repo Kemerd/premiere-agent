@@ -277,10 +277,74 @@ questions *shaped by what they said*. Collect:
 - Delivery dialect (`cut.fcpxml` for Resolve / FCP X, `cut.xml` for
   Premiere Pro, or both — default is both)
 - **Pacing preset** — MANDATORY. See table below. Default Paced.
+- **Three feature-gating questions** — see "Mode-gating questions"
+  below. These set `script_mode`, `b_roll_mode`, and `user_profile`
+  on the Conversation Context bundle and decide which cold-path
+  references the editor sub-agent loads on spawn.
 
 While conversing, build the **Conversation Context bundle** in your
 working memory (see `shared_rules.md` Agent roles for the structure).
 You will forward this bundle into every sub-agent brief.
+
+#### Mode-gating questions
+
+Three short questions — ask once per session, persist the answers in
+`project.md` so subsequent sessions inherit defaults. Always still
+confirm; users change modes between sessions on the same project.
+
+If `<edit>/project.md` already records a value, default to it and
+ask the user to confirm or change ("Last session you were in scripted
+mode — sticking with that?"). If no project.md exists, ask all three
+fresh.
+
+**1. "Are you using a script?"** → sets `script_mode`
+
+- `false` (default) — talking-head / interview / vlog / workshop /
+  travel / event recap where the speaker's recorded audio carries
+  the cut. The default speech-first cut model applies.
+- `true` — the user has written a script AND has a separate
+  voiceover (or will record one). The editor will assemble b-roll
+  matched to the voiceover; the script anchors the beats. The
+  editor sub-agent reads `references/scripted.md` on spawn when
+  this is true.
+- Edge case: user wrote a script but is reading it on camera (no
+  separate VO). Treat as `script_mode = false` but forward the
+  script in the brief as a structural hint — `scripted.md` covers
+  this case.
+
+**2. "Are you using b-roll / cutaways?"** → sets `b_roll_mode`
+
+- `false` — single-source dialogue with no cutaway material.
+- `true` — there is b-roll / cutaway material to layer over the
+  A-roll OR the project is full scripted assembly under a
+  voiceover. The editor sub-agent reads
+  `references/b_roll_selection.md` on spawn when this is true.
+- In practice, scripted assembly is always `b_roll_mode = true`
+  too (the b-roll IS the visual track). Don't ask twice — when the
+  user confirms `script_mode = true`, set `b_roll_mode = true`
+  automatically and confirm with the user that's right ("So we'll
+  also have b-roll under the voiceover?").
+
+**3. "Is this personal, a creator project, or a professional /
+client deliverable?"** → sets `user_profile`
+
+- `personal` — own use, family, hobby. Default verification bar.
+- `creator` — own channel / social / portfolio. Default
+  verification bar; QA notes in EDL `reason` fields stay terse.
+- `professional` — working for a company, client, sponsor, agency,
+  or paid deliverable. **Verification bar goes up:** the editor
+  sub-agent's brief carries this flag, the editor must do
+  top-candidate review on every named-subject b-roll beat,
+  QA notes in `reason` fields list rejected candidates with
+  reasons, every specific-mention fallback (e.g. couldn't find the
+  exact game, used closest verifiable match) is explicitly flagged
+  so the parent surfaces it.
+
+These three flags travel together with the Conversation Context
+bundle into every sub-agent brief. The editor uses `script_mode` and
+`b_roll_mode` to decide which cold-path references to read; the
+editor uses `user_profile` to set the verification / QA-note
+discipline.
 
 ### 5. Propose strategy
 
@@ -484,12 +548,26 @@ STEP 0 (mandatory before anything else):
   Those two files are your operating manual. The ABSOLUTE READ
   MANDATE in subagent_editor_rules.md binds you specifically.
 
+  Mode-gated cold-path reads (read each file IN FULL only if the
+  matching flag below is true; skip silently if false):
+    - script_mode   = <true | false>   -> references/scripted.md
+    - b_roll_mode   = <true | false>   -> references/b_roll_selection.md
+  These bind in addition to your default rules; they do not replace
+  the merged-view spine read in STEP 1.
+
 STEP 1:
   Read <edit>/merged_timeline.md END-TO-END. EVERY LINE. (Per the
   ABSOLUTE READ MANDATE.) No first-N-lines, no grep-and-cut, no
   "I have enough." If the file exceeds one Read call, issue
   sequential Reads with offset/limit until every line is covered.
   Same applies to the prior edl.json on revisions.
+
+  If script_mode = true: also read the script itself end-to-end
+  (path forwarded below or at <edit>/script.md / <edit>/script.txt).
+  If b_roll_mode = true and a clip index exists, the parent will
+  list <edit>/clip_index/index.json below; you may use it as a
+  shortlisting aid in scripted-mode step 4. Verification (stage 2)
+  still binds.
 
 CONVERSATION CONTEXT (from parent):
   Project summary: <complete description in parent's words>
@@ -504,6 +582,18 @@ CONVERSATION CONTEXT (from parent):
     - "<quote>" (context: ...)
   Things user explicitly rejected:
     - "<quote>" (context: ...)
+
+  Feature mode flags (asked & confirmed in step 4):
+    script_mode   = <true | false>
+    b_roll_mode   = <true | false>
+    user_profile  = <personal | creator | professional>
+
+  When script_mode = true:
+    Script path:    <edit>/script.md (or absolute path)
+    Voiceover path: <abs path to VO file>
+    Voiceover transcript (cached): <edit>/transcripts/<vo_stem>.json
+  When b_roll_mode = true and a clip index exists:
+    Clip index path: <edit>/clip_index/index.json (shortlisting aid only)
 
 STRATEGY (parent locked in):
   Beats / structure: <archetype + beat list>
@@ -609,6 +699,10 @@ Append one section per session at `<edit>/project.md`:
 
 **Strategy:** one paragraph describing the approach.
 **Pacing:** preset name + the four expanded ms values.
+**Mode flags:**
+  script_mode  = <true | false>
+  b_roll_mode  = <true | false>
+  user_profile = <personal | creator | professional>
 **Decisions:** take choices, cuts, grades, animations + why.
 **Reasoning log:** one-line rationale for non-obvious decisions.
 **Outstanding:** deferred items.
@@ -622,6 +716,14 @@ On startup, read `project.md` if it exists and summarize the last
 session in one sentence before asking whether to continue. The
 Conversation Context snapshot at the bottom lets next session's parent
 re-build the bundle without re-asking the user every preference.
+
+The **Mode flags** block is what persists across sessions for the
+three step-4 questions: when the user opens a project tomorrow that
+was scripted today, the parent reads this block and defaults the
+gating questions to last session's answers (still asks to confirm
+— users change projects mid-stream). If the block is missing
+(legacy `project.md` from before this format), treat as "ask all
+three fresh."
 
 ---
 
@@ -772,13 +874,34 @@ and spawn a sub-agent via the `Task` / `Agent` tool per
 
 ---
 
-## Subtitles, Animations — load on demand
+## Cold-path references — load on demand
 
-Cold-path features. Each is ~10% of sessions. Read the matching file
-before proposing strategy for that feature:
+Cold-path features the **editor sub-agent** loads only when the
+matching mode flag is true in its brief, plus a couple of
+parent-side feature references. Read the matching file before
+proposing strategy for that feature; do not read pre-emptively.
 
-- Subtitles  -> `references/subtitles.md`
-- Animations -> `references/animations.md`
+**Editor cold-path (gated by step-4 questions):**
+
+- `references/scripted.md` — script + voiceover assembly
+  procedure, beat segmentation, vo-anchored timing, source-in-point
+  synchronisation on named subjects. Editor reads when
+  `script_mode = true`.
+- `references/b_roll_selection.md` — b-roll selection preference
+  order (signage / product / gameplay / booth / stage / people),
+  rejection rules, stability bias, diversification, optimized
+  matching philosophy (caching / two-stage / clip index). Editor
+  reads when `b_roll_mode = true`. Common combo: scripted assembly
+  triggers both.
+
+**Parent-side cold-path (read when the feature is in scope):**
+
+- `references/subtitles.md` — chunking / case / placement,
+  `bold-overlay` and `natural-sentence` worked styles, FCPXML
+  delivery and the always-emitted `master.srt` sidecar.
+- `references/animations.md` — animation sub-agent brief template,
+  PIL / Manim / Remotion timing and easing, parallel-spawn
+  discipline (Hard Rule 10).
 
 The Hard Rules that bind these features stay in `shared_rules.md`
 — output-timeline SRT (Rule 5) and parallel sub-agents for
@@ -797,6 +920,14 @@ in the NLE.
 - **Editing `edl.json` by hand for "trivial" tweaks.** Always re-spawn.
 - **Curating `audio_vocab.txt` by hand.** Always re-spawn.
 - **Skipping the pacing prompt.** Hard Rule 13.
+- **Skipping the three mode-gating questions in step 4.** They set
+  `script_mode`, `b_roll_mode`, `user_profile` — the editor sub-
+  agent's cold-path reads + verification bar all depend on them.
+  Default-guessing the flags ships the wrong cut.
+- **Forgetting to forward the mode flags into the editor brief.**
+  Without them the editor falls back to non-scripted, non-b-roll,
+  default-bar behaviour even if the user is on a scripted client
+  deliverable.
 - **Inventing ad-hoc cut-padding numbers.** Pacing preset is the
   contract.
 - **Paraphrasing user quotes in the brief.** Quote verbatim. Vibes

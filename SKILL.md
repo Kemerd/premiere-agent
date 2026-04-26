@@ -70,6 +70,27 @@ You point spawned sub-agents at these via their briefs (templates in
   styles, FCPXML delivery (ship `master.srt` alongside via
   `helpers/build_srt.py`).
 
+- **`references/scripted.md`** — script + voiceover assembly
+  procedure (beat segmentation, vo-anchored timing, source-in-point
+  sync on named subjects). The **editor sub-agent** loads this when
+  the parent's brief says `script_mode = true`. The parent gates
+  this in step 4 of the 9-step process by asking "are you using a
+  script?"
+
+- **`references/b_roll_selection.md`** — b-roll selection
+  preferences (signage / product / gameplay / booth / stage / people),
+  rejection rules, stability bias, diversification, optimized
+  matching (caching / two-stage / clip index). The **editor sub-
+  agent** loads this when the parent's brief says
+  `b_roll_mode = true`. Common combo: scripted assembly triggers
+  both.
+
+The parent collects these flags + a `user_profile` field
+(`personal | creator | professional` — sets the editor's
+verification bar) in step 4 of the 9-step process and persists
+them in `<edit>/project.md` so subsequent sessions inherit
+defaults. See `parent_rules.md` for the exact question templates.
+
 ## What this architecture buys you
 
 - **Token economy.** Token-heavy timeline reads happen in fresh sub-

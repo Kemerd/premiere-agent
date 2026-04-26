@@ -17,6 +17,24 @@ After reading this file, continue to your role-specific rules:
 If you do not know which role you are, you are the parent. Sub-agents are
 told their role explicitly by the parent in their spawn brief.
 
+**Cold-path references** — feature-specific rules loaded on demand,
+not at session start:
+
+- `references/subtitles.md` — caption styling, chunking, FCPXML
+  delivery (parent reads when subtitle styling is in scope).
+- `references/animations.md` — animation sub-agent brief template
+  (also the animation sub-agent's own operating manual).
+- `references/scripted.md` — script + voiceover assembly procedure
+  (editor reads when the parent's brief says `script_mode = true`).
+- `references/b_roll_selection.md` — b-roll selection rules +
+  optimized matching philosophy (editor reads when the parent's
+  brief says `b_roll_mode = true`).
+
+The two editor cold-path files are gated by mode flags the parent
+collects in step 4 of the 9-step process — see `parent_rules.md`
+for the question templates and `subagent_editor_rules.md` for the
+conditional-read mandate.
+
 ---
 
 ## Principle
