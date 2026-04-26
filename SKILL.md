@@ -256,6 +256,7 @@ This split-evenly-by-ratio rule keeps the head/tail balance the user picked whil
 - **Visual context is the second source of truth.** Before committing to *any* non-trivial cut, check the `visual:` lines around the cut point in `merged_timeline.md`. If captions show a continuous action ("person holding drill") spanning your cut, you're cutting in the middle of a shot — usually fine, but be deliberate. Use the visual lane to find B-roll cutaway candidates, match cuts, shot changes, and to decide whether a moment is worth preserving even when speech is silent. Drill into `visual_timeline.md` when you need the full 1-fps caption stream (the merged view drops `(same)` repeats).
 - **Audio events are noisy hints, not signals.** The `(audio: ...)` lines in `merged_timeline.md` carry `(drill 0.87)`, `(applause 0.92)`, `(laughter)`, `(power_tool)` markers from CLAP scored against the agent-curated vocab. **The model is approximate** — it mis-labels (music tagged as speech, hammers tagged as drums, room tone tagged as applause), especially when the vocabulary is too small or too generic. Use a marker only as a prompt to *go look* at the visual line (and if needed `timeline_view`) at that timestamp. **Never cut purely on a CLAP label.** When CLAP and Florence-2 disagree about what's happening, trust Florence-2. Drill into `audio_timeline.md` when you want the full per-window scoring instead of the collapsed merged form.
 - **Silence gaps are cut candidates — EVERYWHERE, not just at phrase boundaries.** Use the pacing preset's `min_silence_to_remove` as your threshold (Calm 500ms → Jumpy 50ms) and apply it to every adjacent word pair in the speech lane, including gaps that sit *inside* a phrase as the speaker pauses to breathe or think. Splitting a phrase mid-sentence to drop a 400ms thinking pause is the whole point of the preset; it's how you cut runtime without cutting content. The user picked Energetic because they want every breath gone — give them every breath. (Anything shorter than the preset threshold stays as the natural rhythm of the speech. <30ms is always unsafe — mid-phoneme.)
+- **Cut out filler words and disfluencies by default.** "uh", "um", "umm", "uhh", "er", "erm", "ah", "ahh", "hmm", "mm", "like" (when used as a verbal tic, not as a verb / preposition / simile), "you know" (filler usage), "I mean" (false-start usage), "so yeah", "kinda", "sorta" (filler usage), single-syllable false starts ("th-", "wh-", "the the", "we we", "I I"), repeated stutter words (the speaker says the same word twice while collecting their thought), and trailing "..."s where the speaker abandons a sentence and restarts. **Treat each as a cut candidate equivalent to a silence gap** — split the EDL range around the filler so the kept words concatenate cleanly. The Parakeet lane preserves them verbatim precisely so you can find them and remove them; do not leave them in out of "respect for the speaker's natural voice." A clean tight delivery is the speaker's voice with the friction removed. **Exceptions** (keep the filler): (a) the filler IS the punchline / the joke / the emotional beat ("…uhhhh, that's not what I expected"), (b) removing it would break a load-bearing rhythm the user explicitly asked for, (c) the surrounding take is so much worse that the filler-version is genuinely the best option — note it in `reason` when this happens. When you cut a filler, the resulting two adjacent EDL ranges from the same source must each still satisfy word-boundary alignment (Hard Rule 6) and pacing-preset margin clamping (so the lead/trail pads don't re-introduce the filler you just removed; the same `combined_pad_ms <= gap_ms - 60` rule from the silence-removal pass applies). On rare doubled-word repeats where Parakeet emits zero gap between the two instances, snap the cut to the END of the first instance / the START of the second; do not cut mid-word.
 - **Cut padding comes from the pacing preset**, not from per-cut taste. Expand each range by `lead_margin` at the head and `trail_margin` at the tail (see "Pacing presets"). Hard Rule 7's 30–200ms working window still bounds anything outside the preset table — never go below 30ms.
 - **Never reason audio and video independently.** Every cut must work on both tracks.
 
@@ -503,6 +504,33 @@ RULES:
           (leaves room for the 30ms afade pair at each boundary)
   - Discard any kept clip whose net speech duration is < min_talk_to_keep
     (filters single-syllable false starts that survived silence trimming).
+  - CUT OUT FILLER WORDS AND DISFLUENCIES BY DEFAULT. Treat each occurrence
+    as an inline cut candidate exactly like a silence gap — split the EDL
+    range around it so the kept words concatenate cleanly:
+        "uh", "um", "umm", "uhh", "er", "erm", "ah", "ahh", "hmm", "mm",
+        "like" (verbal-tic usage only — keep it when it's the verb / a
+                preposition / a simile),
+        "you know" (filler usage),
+        "I mean" (false-start usage, not when it's correcting meaning),
+        "so yeah", "kinda", "sorta" (filler usage),
+        single-syllable false starts ("th-", "wh-", "the the", "we we",
+                "I I", "and and"),
+        repeated stutter words (same word twice while collecting thought),
+        abandoned sentence fragments where the speaker restarts.
+    The Parakeet lane preserves these verbatim so you can find and remove
+    them. Do NOT leave them in out of "respect for the natural voice" —
+    a clean tight delivery IS the speaker's voice with the friction
+    removed. EXCEPTIONS (keep the filler, note it in `reason`):
+      (a) the filler IS the punchline / joke / emotional beat,
+      (b) removing it would break a load-bearing rhythm the user
+          explicitly asked for,
+      (c) every surrounding take is worse and this one is genuinely best.
+    When cutting a filler, the resulting two adjacent same-source ranges
+    must each still snap to word boundaries (Hard Rule 6) and the
+    combined-pad clamp from the silence-removal pass applies (so the
+    lead/trail margins don't re-introduce the filler you just cut).
+    For zero-gap repeated words, snap to the END of the first instance /
+    the START of the second — never mid-word.
   - Cross-reference visual_timeline.md before committing to a cut whose
     audio looks clean — make sure you're not cutting in the middle of a
     visually continuous action you wanted to keep whole. The visual lane
@@ -652,3 +680,4 @@ Things that consistently fail regardless of style:
 - **Picking `speed` so the squeezed result lands < 5s or > 30s.** Under 5s the viewer doesn't register the activity; over 30s it overstays its welcome. Re-pick speed to land in the 5–30s sweet spot, OR split a long source stretch into multiple squeezes with a beat between, OR cut some of it.
 - **Setting `speed > 10.0` and expecting it to apply.** Both helpers clamp to 10.0 (1000%) with a warning. Beyond that retime decimates frames and looks broken; if you wanted >10x you should have cut.
 - **Splitting around every word of filler speech inside an otherwise-squeezable stretch.** If the speech isn't load-bearing, squeeze right over it with `audio_strategy="drop"`. A hundred 1× micro-ranges interleaved with a hundred speed=8 micro-ranges is worse cut than one honest squeeze that drops the rambling. The video is for the viewer.
+- **Leaving "uh" / "um" / "like" / "you know" / repeated-word stutters in the cut.** They are inline cut candidates by default — split the EDL range around each one so the kept words concatenate cleanly. The Parakeet lane preserves them verbatim precisely so you can find and remove them; do not preserve them out of "respect for the speaker's natural voice." A tight delivery IS the speaker's voice with the friction removed. Exceptions (filler as punchline, load-bearing rhythm the user asked for, every other take is worse) get kept with a one-line note in `reason`. See "Cut craft" and the Editor sub-agent brief for the full list and the cut-snap rules for zero-gap repeats.
