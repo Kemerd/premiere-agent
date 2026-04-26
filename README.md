@@ -37,13 +37,15 @@ A session is split between a **parent agent** that runs the conversation and **s
 2. Phase A preprocess speech (Parakeet ONNX) ‖ visual (Florence-2) on one GPU
                       with a VRAM-aware scheduler — cached on disk so it's
                       one-shot per source, not per revision
-3. Vocab spawn        a sub-agent reads the speech + visual merged timeline and
-                      writes a project-specific CLAP vocabulary (audio_vocab.txt)
+3. Vocab spawn        a sub-agent reads speech_timeline.md + audiovisual_timeline.md
+                      (BOTH end-to-end) and writes a project-specific CLAP
+                      vocabulary (audio_vocab.txt)
 4. Phase B preprocess CLAP scores the audio against that vocabulary, pack_timelines
-                      folds the third lane into merged_timeline.md
+                      folds the audio lane into audiovisual_timeline.md
 5. Strategy           parent proposes a cut shape (pacing, J/L policy, b-roll, retime,
                       subtitles), waits for user OK
-6. Editor spawn       a sub-agent reads merged_timeline.md, writes edl.json with
+6. Editor spawn       a sub-agent reads audiovisual_timeline.md AND speech_timeline.md
+                      (BOTH, end-to-end, line by line), writes edl.json with
                       ranges, transitions, retime, overlay slots — re-spawned per
                       revision request, never hand-editing the EDL
 7. Self-eval          timeline_view runs at every cut boundary against the source
@@ -84,17 +86,23 @@ Pre-processing produces three small markdown files per session, each addressable
   [015] hands placing the drill down on a workbench
 ```
 
-`pack_timelines.py` also emits a `merged_timeline.md` by default that interleaves all three lanes chronologically — this is the editor sub-agent's default reading surface, so it gets the full multimodal context for every moment from a single file. Pass `--no-merge` to skip it. The per-lane files above remain on disk as drill-down references for ambiguous moments.
+`pack_timelines.py` also emits an `audiovisual_timeline.md` by default that interleaves the audio + visual lanes chronologically — speech is intentionally NOT in this file. The editor and vocab sub-agents read TWO files end-to-end side by side: `audiovisual_timeline.md` (audio + visual, scannable per-second cadence) and `speech_timeline.md` (phrase ranges with outer-aligned `floor(start)..ceil(end)` rounding). Splitting the lanes this way keeps the AV view dense and the speech view word-precise, and lets `helpers/find_quote.py` map any integer range from the speech file straight back to a sub-second window in `transcripts/<stem>.json` without off-by-one fences. Pass `--no-audiovisual` (legacy alias `--no-merge`) to skip the AV view. The per-lane files above remain on disk as drill-down references.
 
 ```
-[00:12:04] S0 "okay now we're going to drill the pilot holes"
-[00:12:09] AUDIO drill (0.87), power_tool (0.71)
-[00:12:09] VISUAL a person holding a cordless drill above a metal panel
-[00:12:18] S0 "good, pass me the deburring tool"
-[00:12:24] AUDIO metal_scraping (0.62)
+0:12 (drill 0.87, power_tool 0.71)
+0:12 [a person holding a cordless drill above a metal panel]
+0:13 + [close-up of a drill bit entering metal, sparks visible]
+0:24 (metal_scraping 0.62)
 ```
 
-> The CLAP audio lane is a **separate Phase B step** invoked after `preprocess.py` (or `preprocess_batch.py`) finishes. The first `pack_timelines.py` run produces a two-lane `merged_timeline.md` (speech + visual, interleaved by timestamp); the vocab agent reads that single file, writes a project-specific vocabulary to `audio_vocab.txt`, and then `helpers/audio_lane.py` scores against it. A second `pack_timelines.py` run folds the new audio events into the merged view for the editor. Pass `--include-audio` to the preprocessor to instead run CLAP inline against a baked-in baseline vocabulary (smoke tests, agent-less runs).
+…paired with the speech file:
+
+```
+0:11-0:18 [S0] "okay now we're going to drill the pilot holes"
+0:18-0:22 [S0] "good, pass me the deburring tool"
+```
+
+> The CLAP audio lane is a **separate Phase B step** invoked after `preprocess.py` (or `preprocess_batch.py`) finishes. The first `pack_timelines.py` run produces an `audiovisual_timeline.md` carrying only the visual lane (audio hasn't scored yet) plus the standalone `speech_timeline.md`; the vocab agent reads BOTH end-to-end, writes a project-specific vocabulary to `audio_vocab.txt`, and then `helpers/audio_lane.py` scores against it. A second `pack_timelines.py` run folds the new audio events into `audiovisual_timeline.md` for the editor. Pass `--include-audio` to the preprocessor to instead run CLAP inline against a baked-in baseline vocabulary (smoke tests, agent-less runs).
 
 ### On-demand visual drill-down
 
@@ -588,9 +596,10 @@ Color is the colorist's job; the skill never emits a grade.
 ├── <source files, untouched>
 └── edit/
     ├── project.md               ← memory; appended every session
-    ├── merged_timeline.md       ← DEFAULT reading surface (all 3 lanes
-    │                              interleaved chronologically by timestamp)
-    ├── speech_timeline.md       ← lane 1, drill-down
+    ├── audiovisual_timeline.md  ← MANDATORY read #1 (audio + visual lanes
+    │                              interleaved chronologically; NO speech)
+    ├── speech_timeline.md       ← MANDATORY read #2 (phrase ranges, outer-
+    │                              aligned floor-start / ceil-end rounding)
     ├── audio_timeline.md        ← lane 2, drill-down
     ├── visual_timeline.md       ← lane 3, drill-down
     ├── edl.json                 ← cut decisions

@@ -104,7 +104,7 @@ dependencies = [
     # ── Caveman compression for the visual lane (default-on) ──
     # spaCy drives the NLP-based "caveman compression" pass that strips
     # stop words / determiners / auxiliaries / weak adverbs from every
-    # Florence-2 caption before it lands in merged_timeline.md. Cuts the
+    # Florence-2 caption before it lands in audiovisual_timeline.md. Cuts the
     # editor-side token cost by 40-60% on detailed-caption footage with
     # zero loss of editorial signal (entities, actions, colours, shot
     # composition all survive). Runs in a per-file process pool with

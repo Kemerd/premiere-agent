@@ -701,7 +701,7 @@ def main() -> None:
              "(default: 1.0). Fractional values are accepted: 0.5 = "
              "one frame every 2 s, 0.25 = every 4 s. Useful for slow / "
              "static / long-form content where 1 fps over-samples and "
-             "bloats merged_timeline.md. Cost scales linearly.",
+             "bloats audiovisual_timeline.md. Cost scales linearly.",
     )
     ap.add_argument("--wealthy", action="store_true",
                     help="Speed knob for 24GB+ GPUs. Bigger batches in all "
