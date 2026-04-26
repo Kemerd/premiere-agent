@@ -1,9 +1,9 @@
 # Parent Rules — operating manual for the orchestrator agent
 
-You have already read `references/shared_rules.md`. If you have not,
-stop and read it now — it defines the agent hierarchy you sit at the
-top of, and reading these rules without that context will lead you to
-do a sub-agent's work yourself.
+You have already read `references/shared_rules.md`. If not, stop and
+read it now — it defines the agent hierarchy you sit at the top of,
+and reading these rules without that context will lead you to do a
+sub-agent's work yourself.
 
 You are the **parent agent** for a video-use-premiere session. You run
 the entire pipeline:
@@ -16,10 +16,10 @@ the entire pipeline:
   (`ffprobe`, `health.py`, `preprocess_batch.py`, `pack_timelines.py`,
   `audio_lane.py`, `export_fcpxml.py`, `build_srt.py`,
   `timeline_view.py`, etc.). All bash invocations are yours.
-- **Error handling** — when a helper fails, you read the traceback,
-  diagnose, fix, and re-run. Sub-agents do not debug infrastructure.
-- **Sub-agent dispatch** — spawn the editor sub-agent for cuts, the
-  vocab sub-agent for Phase B, animation sub-agents in parallel for
+- **Error handling** — when a helper fails, read the traceback,
+  diagnose, fix, re-run. Sub-agents do not debug infrastructure.
+- **Sub-agent dispatch** — spawn the editor subagent for cuts, the
+  vocab subagent for Phase B, animation subagents in parallel for
   overlays. Forward the Conversation Context bundle into every brief.
 - **Output translation** — read sub-agent return values (EDL JSON,
   vocab.txt, animation reports), translate back to the user in plain
@@ -30,15 +30,15 @@ What you DO NOT do:
 - **Read `merged_timeline.md`, `speech_timeline.md`,
   `visual_timeline.md`, or `audio_timeline.md` directly.** Token-heavy
   reads of caption / transcript content are sub-agent territory; that
-  is the entire reason the architecture exists. The parent dispatches
+  is why the architecture exists. The parent dispatches
   reads, never performs them.
 - **Edit `edl.json` by hand.** Every change re-spawns the editor.
 - **Curate `audio_vocab.txt` by hand.** Always re-spawn vocab.
-- **Open source video files** to look at frames. If a frame inspection
-  is needed, spawn a scout sub-agent and let it call
+- **Open source video files** to inspect frames. If a frame inspection
+  is needed, spawn a scout subagent and let it call
   `helpers/timeline_view.py`.
 
-Sub-agents are SPECIALIZED workers spawned for token-heavy reading
+Subagents are SPECIALIZED workers spawned for token-heavy reading
 tasks (timeline ingestion, vocabulary curation, animation rendering).
 The parent does *everything else* in this skill.
 
@@ -47,7 +47,7 @@ The parent does *everything else* in this skill.
 ## Directory layout
 
 The skill lives in `video-use-premiere/`. User footage lives wherever
-they put it. All session outputs go into `<videos_dir>/edit/`.
+they put it. All session outputs land in `<videos_dir>/edit/`.
 
 ```
 <videos_dir>/
@@ -104,19 +104,19 @@ they put it. All session outputs go into `<videos_dir>/edit/`.
   Optional: `pip install -e .[flash]` for Flash Attention 2 (Florence-2
   speedup), `pip install -e .[diarize]` for pyannote, `pip install -e
   .[parakeet]` to pre-install the NVIDIA Parakeet NeMo fallback (only
-  needed when ONNX Runtime can't load on the host).
+  needed when ONNX Runtime cannot load on the host).
 - **Speech lane backends**: default is `parakeet_onnx_lane.py` —
   NVIDIA Parakeet TDT 0.6B on ONNX Runtime through a multi-session
   pool (TensorRT / CUDA / DirectML / CPU EP ladder, English v2 /
   multilingual v3 auto-routed by language). The only sanctioned
   alternative is `parakeet_lane.py` (NeMo torch-mode) for hosts where
-  ORT can't load — pin via `VIDEO_USE_SPEECH_LANE=nemo`. Output JSON
+  ORT cannot load — pin via `VIDEO_USE_SPEECH_LANE=nemo`. Output JSON
   shape is byte-identical between the two. `helpers/health.py --json`
   surfaces non-default backends in `fallbacks_active` so you know
-  which one is running before the lane fires. **Air-gapped?** Pre-
+  which one runs before the lane fires. **Air-gapped?** Pre-
   download the ONNX directory and set `PARAKEET_ONNX_DIR=/path/to/
-  parakeet-onnx`; the lane skips all network calls. There is no
-  Whisper backend in this codebase by design — Whisper hallucinates on
+  parakeet-onnx`; the lane skips all network calls. No Whisper backend
+  exists in this codebase by design — Whisper hallucinates on
   silence and has a known word-timestamp memory regression that
   crashes long-form runs.
 - **`yt-dlp`, `manim`, Remotion** installed only on first use.
@@ -137,9 +137,9 @@ auto-invalidates when `python` / `torch` / `transformers` /
 triggers a fresh check.
 
 Cache lives at `~/.video-use-premiere/health.json` — **outside** the
-per-session `<videos_dir>/edit/` so it persists across projects. This
-is the one exception to Hard Rule 12, and it's intentional: skill-
-environment health is a per-machine property, not a per-session one.
+per-session `<videos_dir>/edit/` so it persists across projects. The
+one exception to Hard Rule 12, intentional: skill-environment health
+is a per-machine property, not a per-session one.
 
 **Reading the JSON:**
 
@@ -159,7 +159,7 @@ environment health is a per-machine property, not a per-session one.
 |---|---|
 | `ok`   | Silent. Don't bother the user. Proceed to inventory. |
 | `warn` | One-line note: "skipped X check(s), continuing." Proceed. |
-| `fail` | **Stop.** Print the failure list + the `advice` strings verbatim. Ask the user to run the fix and re-invoke. Don't pretend the rest of the skill will work — broken `ffmpeg` or missing `transformers` will silently corrupt every subsequent step. |
+| `fail` | **Stop.** Print the failure list + the `advice` strings verbatim. Ask the user to run the fix and re-invoke. Do not pretend the rest will work — broken `ffmpeg` or missing `transformers` silently corrupts every subsequent step. |
 
 **Commands:**
 
@@ -177,15 +177,15 @@ python helpers/health.py --clear         # wipe cache (next call re-runs)
 **Optional heavy-tier verification** (~2 GB downloads on first run,
 exercises real Parakeet ONNX + Florence-2 + CLAP on a synthetic 2s
 clip): tell the user to run `python tests.py --heavy` once after
-install. Cached separately under the same TTL. Don't trigger this
-autonomously — it's an explicit user action.
+install. Cached separately under the same TTL. Do not trigger this
+autonomously — it is explicit user action.
 
 ### 1. Inventory + Phase A preprocess
 
 `ffprobe` every source. **You may run `ffprobe` because it is metadata-
-only** — it does not give you a view of the *content*, just duration /
-codec / framerate / channels. That is parent-allowable. Anything that
-returns content (frames, transcript text, captions) is sub-agent
+only** — it gives no view of the *content*, just duration / codec /
+framerate / channels. That is parent-allowable. Anything that returns
+content (frames, transcript text, captions) is sub-agent
 territory.
 
 #### Audio-only sources are first-class
@@ -206,48 +206,48 @@ What this means in practice:
 - `helpers/preprocess_batch.py` discovers BOTH buckets in the source
   directory and prints a summary line like `discovered 12 video(s) +
   1 audio-only source(s) in <videos_dir>` so the user immediately
-  knows whether their voiceover.wav was picked up.
-- `<edit>/audio_16k/<stem>.wav` is produced for every source by the
+  knows if their voiceover.wav was picked up.
+- `<edit>/audio_16k/<stem>.wav` is produced for every source via the
   same ffmpeg `-vn` resample, so the speech lane and CLAP audio lane
-  see audio-only sources exactly the same as video sources.
+  see audio-only sources exactly like video sources.
 - `<edit>/transcripts/<stem>.json` ships for every source, including
-  audio-only ones — Parakeet doesn't care whether the WAV came from
+  audio-only ones — Parakeet does not care whether the WAV came from
   a `.mov` or a `.wav`.
 - `<edit>/visual_caps/<stem>.json` is **not** produced for audio-only
   stems; the visual lane is scoped out of them. `pack_timelines.py`
   handles missing visual_caps gracefully (the merged timeline simply
   shows no visual captions for those stems).
-- If the entire batch is audio-only (e.g. user is rendering a
+- If the whole batch is audio-only (e.g. user is rendering a
   scripted podcast assembly with no footage at all), the visual lane
   is skipped entirely and the orchestrator logs `visual lane skipped
   — no video sources in this batch`.
 
-You don't have to do anything special — just confirm in the inventory
+You need not do anything special — just confirm in the inventory
 recap that you noticed any audio-only files (`"I see your shoot has
 12 .mp4 clips plus voiceover_final.wav as an audio-only source —
 that'll get transcribed alongside the footage."`) so the user knows
-they weren't dropped.
+they were not dropped.
 
 #### Paired-audio detection (dual-mic recordings)
 
 Some camera + recorder combos produce a video file AND a stand-alone
 audio file with the **same stem** — the universal convention across
-Sony / Zoom / DJI / GoPro / Tascam rigs. The most common shape is:
+Sony / Zoom / DJI / GoPro / Tascam rigs. The most common shape:
 
 ```
 SHOT_0042.mp4    ← camera body (H.264, on-camera mic)
 SHOT_0042.wav    ← Zoom F2 / Tascam DR-10L / clip-on lav recording
 ```
 
-When you see a stem collision between a video and an audio file in
+When you see a stem collision between a video and audio file in
 the inventory, **stop and ask the user** before preprocessing —
-guessing wrong silently corrupts the cut. Two valid interpretations:
+guessing wrong silently corrupts the cut. Two valid readings:
 
 1. **`dual_mic`** — the .wav is a second-mic recording of the same
    shot, usually a lav with cleaner audio than the on-camera mic.
    Both files get transcribed; the editor picks the higher-quality
    transcript per cut.
-2. **`ignore`** — the .wav is a redundant backup of the camera audio
+2. **`ignore`** — the .wav is a redundant backup of camera audio
    (some rigs auto-mirror) or a copy the user dragged in by mistake.
    Drop it from preprocessing entirely.
 
@@ -272,7 +272,7 @@ guessing wrong silently corrupts the cut. Two valid interpretations:
    }
    ```
 
-   `pair_count: 0` means no collisions and you can preprocess
+   `pair_count: 0` means no collisions; you can preprocess
    normally — skip the rest of this section.
 
 2. **Ask the user** before preprocessing. Standard wording:
@@ -290,7 +290,7 @@ guessing wrong silently corrupts the cut. Two valid interpretations:
    > C) **Mixed** — pause and we'll go file-by-file."
 
    Quote their answer back when you confirm. If they pick C, ask
-   them to either separate the dual-mic recordings into a `dual_mic/`
+   them to either move the dual-mic recordings into a `dual_mic/`
    subfolder (and re-run detection), or hand-list which stems are
    which — then re-run detection.
 
@@ -303,7 +303,7 @@ guessing wrong silently corrupts the cut. Two valid interpretations:
    ```
 
    The script REFUSES to proceed (rc=2) if pairs are detected and
-   `--paired-audio-mode` is missing — that's the safety net. Don't
+   `--paired-audio-mode` is missing — that is the safety net. Do not
    try to work around it; the gate exists because silent defaults
    here corrupt the cut.
 
@@ -311,8 +311,8 @@ guessing wrong silently corrupts the cut. Two valid interpretations:
 
 The paired `.wav` is hardlinked to
 `<edit>/.paired_audio/<stem>.audio.<ext>` (zero-cost on NTFS / ext4 /
-APFS; falls back to a copy on cross-volume rigs). The lane scripts
-see two files with unique stems, so cache outputs land in:
+APFS; falls back to copy on cross-volume rigs). The lane scripts
+see two files with unique stems, so cache outputs land at:
 
 - `<edit>/audio_16k/SHOT_0042.wav`     ← from the video
 - `<edit>/audio_16k/SHOT_0042.audio.wav` ← from the paired .wav (alias)
@@ -338,29 +338,29 @@ The mapping is recorded in `<edit>/source_pairs.json`:
 ```
 
 This file is **forwarded into every editor brief** (see step 4).
-The editor sub-agent uses it to know that
+The editor subagent uses it to know that
 `transcripts/SHOT_0042.json` and `transcripts/SHOT_0042.audio.json`
-belong to the same shot and to pick the higher-confidence one for
+belong to the same shot, and picks the higher-confidence one for
 cut decisions. It also lets the user later opt into "swap the audio
-track at export" inside their NLE — the EDL points at the video file
+track at export" in their NLE — the EDL points at the video file
 but the editor's QA notes call out which paired alias was the
 preferred audio per cut.
 
 ##### What `ignore` does
 
-The paired `.wav`s are simply filtered out of the preprocess input
+Paired `.wav`s are simply filtered out of the preprocess input
 list. Unpaired audio-only files (a real voiceover.wav with NO video
 sibling) are unaffected. `<edit>/source_pairs.json` is still written
 with `"mode": "ignore"` so the editor knows the user explicitly
-declined dual-mic handling — don't surprise them later by treating
+declined dual-mic handling — do not surprise them later by treating
 the same stem-pair shape differently in a follow-up session.
 
 #### Folder convention auto-detection (optional)
 
-Before preprocessing, look at the videos_dir directory tree for
+Before preprocessing, scan the videos_dir directory tree for
 **optional convention subfolders**. Users who organize their
 material this way pre-fill the step-4 mode-gating defaults; users
-who don't get asked fresh in step 4. Detection is case-insensitive
+who do not get asked fresh in step 4. Detection is case-insensitive
 and treats hyphens / underscores as equivalent.
 
 | Folder pattern (any of) | Maps to category | Pre-sets |
@@ -372,7 +372,7 @@ and treats hyphens / underscores as equivalent.
 | `script/` `scripts/` (or any `*.txt` / `*.md` named like `script*`) | `script` | `script_mode = true` (script path identified) |
 
 If a convention folder is detected, **write a small JSON tag map**
-at `<edit>/source_tags.json` mapping every clip's stem to its
+at `<edit>/source_tags.json` mapping every clip's stem to a
 category:
 
 ```json
@@ -390,10 +390,10 @@ category:
 }
 ```
 
-Sources that don't fall under any convention folder go in as
+Sources that miss every convention folder go in as
 `unknown` — the user can clarify at step 4 ("are these b-roll or
 A-roll?") or leave them untyped (the editor scopes its candidate
-search across all sources when nothing's tagged).
+search across all sources when nothing is tagged).
 
 **Confirm detection with the user** before locking the modes — the
 parent's question shape:
@@ -406,7 +406,7 @@ parent's question shape:
 
 If the user says no (e.g. they named a folder `b_roll/` for
 historical reasons but those clips are actually A-roll for THIS
-project), drop the auto-tag and ask the step-4 question fresh.
+project), drop auto-tag and ask the step-4 question fresh.
 
 **No convention folders detected → no `source_tags.json`** is
 written, and the parent asks all four mode-gating questions fresh
@@ -414,7 +414,7 @@ in step 4.
 
 This is **optional convention** — the skill works fine without any
 folder organization. The auto-detection is a UX nicety, not a
-requirement. Don't insist; don't lecture the user about
+requirement. Do not insist; do not lecture the user about
 organization.
 
 Then run Phase A preprocessing — speech (Parakeet ONNX) + visual
@@ -434,23 +434,23 @@ This skill mandates the curated-vocab path (step 2 below).
 `pack_timelines.py` produces `merged_timeline.md` (the editor's
 default reading surface) plus the per-lane drill-down files:
 `speech_timeline.md`, `audio_timeline.md` (only after step 2 runs),
-`visual_timeline.md`. **You don't read any of these.** They exist
-for sub-agents.
+`visual_timeline.md`. **You read none of these.** They exist
+for subagents.
 
 ### 2. Audio events — spawn the vocab sub-agent (mandatory)
 
-Spawn the vocab sub-agent. It reads `speech_timeline.md` +
+Spawn the vocab subagent. It reads `speech_timeline.md` +
 `visual_timeline.md` and produces a project-specific CLAP vocabulary
-at `<edit>/audio_vocab.txt`. This is **not optional** and there is
-**no shortcut to a baseline vocabulary** — generic 527-class
+at `<edit>/audio_vocab.txt`. This is **not optional** and **no
+shortcut to a baseline vocabulary** exists — generic 527-class
 taxonomies mis-label real-world content (workshop tools tagged as
 "music", room tone tagged as "applause"). The agent-curated vocab is
 the only path that produces a usable audio_timeline.
 
-**Brief template (vocab sub-agent):** see "Brief templates" section
+**Brief template (vocab subagent):** see "Brief templates" section
 below. Spawn via the `Task` / `Agent` tool.
 
-After the vocab sub-agent returns `<edit>/audio_vocab.txt`:
+After the vocab subagent returns `<edit>/audio_vocab.txt`:
 
 ```bash
 python helpers/audio_lane.py <video1> [<video2> ...] \
@@ -459,25 +459,25 @@ python helpers/pack_timelines.py --edit-dir <edit>
 ```
 
 The first command runs CLAP zero-shot scoring against the curated
-vocab. The second re-runs the pack so the new audio events are folded
+vocab. The second re-runs the pack so the new audio events fold
 into both `merged_timeline.md` (default) and `audio_timeline.md`.
 
-If the user explicitly says they don't care about audio events at
+If the user explicitly says they do not care about audio events at
 all (rare — usually a single-speaker talking-head with no ambient
-work), you may skip the vocab sub-agent and the `audio_lane.py` run.
-The editor sub-agent will still cut from the merged_timeline using
+work), you may skip the vocab subagent and the `audio_lane.py` run.
+The editor subagent will still cut from the merged_timeline using
 just speech + visual; `(audio: ...)` lines will simply be absent.
 Note the skip in `project.md` so next session knows.
 
 ### 3. Pre-scan for problems — DO NOT DO THIS YOURSELF
 
 In the previous design, the parent would read `merged_timeline.md`
-end-to-end before talking to the user. **That is no longer the parent's
-job.** You don't read it. The editor sub-agent does that on every
+end-to-end before talking to the user. **No longer the parent's
+job.** You do not read it. The editor subagent does that on every
 spawn, in a fresh context window.
 
 If you genuinely need a one-paragraph summary of the project to talk
-intelligently to the user (e.g. user is being vague), spawn a tiny
+intelligently to the user (e.g. user is vague), spawn a tiny
 "scout" sub-agent with a brief like:
 
 ```
@@ -493,7 +493,7 @@ clearly enough that you can write a strategy without scouting.
 ### 4. Converse — your main job
 
 Describe the project back to the user in your own words based on what
-they've told you, plus the `project.md` summary if it exists. Ask
+they have told you, plus the `project.md` summary if it exists. Ask
 questions *shaped by what they said*. Collect:
 
 - Content type (workshop / interview / tutorial / launch / vlog / etc.)
@@ -509,13 +509,13 @@ questions *shaped by what they said*. Collect:
 - **Four feature-gating questions** — see "Mode-gating questions"
   below. These set `script_mode`, `b_roll_mode`, `timelapse_mode`,
   and `user_profile` on the Conversation Context bundle and decide
-  which cold-path references the editor sub-agent loads on spawn,
-  whether time-squeezing is permitted, and what verification bar
+  which cold-path references the editor subagent loads on spawn,
+  whether time-squeezing is permitted, and the verification bar
   the editor uses.
 
 While conversing, build the **Conversation Context bundle** in your
 working memory (see `shared_rules.md` Agent roles for the structure).
-You will forward this bundle into every sub-agent brief.
+Forward this bundle into every subagent brief.
 
 #### Mode-gating questions
 
@@ -527,8 +527,8 @@ If `<edit>/project.md` already records a value, default to it and
 ask the user to confirm or change ("Last session you were in scripted
 mode — sticking with that?"). If no project.md exists, ask all four
 fresh — UNLESS step 1's folder convention auto-detection
-pre-filled some of them, in which case treat the auto-detected
-values as the defaults and confirm rather than re-ask blank
+pre-filled some, in which case treat the auto-detected
+values as the defaults and confirm vs re-ask blank
 ("I detected a `b_roll/` folder — going with `b_roll_mode = true`,
 sound right?").
 
@@ -540,7 +540,7 @@ sound right?").
 - `true` — the user has written a script AND has a separate
   voiceover (or will record one). The editor will assemble b-roll
   matched to the voiceover; the script anchors the beats. The
-  editor sub-agent reads `references/scripted.md` on spawn when
+  editor subagent reads `references/scripted.md` on spawn when
   this is true.
 - Edge case: user wrote a script but is reading it on camera (no
   separate VO). Treat as `script_mode = false` but forward the
@@ -550,21 +550,21 @@ sound right?").
 **2. "Are you using b-roll / cutaways?"** → sets `b_roll_mode`
 
 - `false` — single-source dialogue with no cutaway material.
-- `true` — there is b-roll / cutaway material to layer over the
+- `true` — b-roll / cutaway material exists to layer over the
   A-roll OR the project is full scripted assembly under a
-  voiceover. The editor sub-agent reads
+  voiceover. The editor subagent reads
   `references/b_roll_selection.md` on spawn when this is true.
 - In practice, scripted assembly is always `b_roll_mode = true`
-  too (the b-roll IS the visual track). Don't ask twice — when the
+  too (the b-roll IS the visual track). Do not ask twice — when the
   user confirms `script_mode = true`, set `b_roll_mode = true`
-  automatically and confirm with the user that's right ("So we'll
+  automatically and confirm with the user that is right ("So we'll
   also have b-roll under the voiceover?").
 
 **3. "Does this project use timelapses?"** → sets `timelapse_mode`
 
-- `false` (default for safety) — the editor will NOT emit any
+- `false` (default for safety) — the editor emits NO
   `speed > 1.0` ranges. Even visually-continuous activity stays
-  1x or gets cut. This protects b-roll-heavy projects from the
+  1x or gets cut. This shields b-roll-heavy projects from the
   editor accidentally retiming a stretch the user wanted at
   normal speed.
 - `true` — the editor's time-squeezing rules in
@@ -575,7 +575,7 @@ sound right?").
   (Hard Rule on retime clamp).
 - If step 1 detected a `timelapse/` folder, default this to `true`
   and confirm with the user (they organized for a reason).
-- The user can also use this on a per-project basis — many
+- The user can also use this per-project — many
   scripted assemblies want zero timelapses (the b-roll IS the
   visual track at 1x); workshop / build vlogs want explicit
   timelapse permission.
@@ -588,48 +588,48 @@ client deliverable?"** → sets `user_profile`
   verification bar; QA notes in EDL `reason` fields stay terse.
 - `professional` — working for a company, client, sponsor, agency,
   or paid deliverable. **Verification bar goes up:** the editor
-  sub-agent's brief carries this flag, the editor must do
+  subagent's brief carries this flag, the editor must do
   top-candidate review on every named-subject b-roll beat,
   QA notes in `reason` fields list rejected candidates with
-  reasons, every specific-mention fallback (e.g. couldn't find the
+  reasons, every specific-mention fallback (e.g. could not find the
   exact game, used closest verifiable match) is explicitly flagged
   so the parent surfaces it.
 
 These four flags + `<edit>/source_tags.json` (when present) travel
-together with the Conversation Context bundle into every sub-agent
-brief. The editor uses `script_mode` and `b_roll_mode` to decide
-which cold-path references to read; `timelapse_mode` to decide
-whether to even consider time-squeezing; `user_profile` to set the
-verification / QA-note discipline. The b-roll scout sub-agent (when
+with the Conversation Context bundle into every subagent
+brief. The editor uses `script_mode` and `b_roll_mode` to pick
+cold-path references; `timelapse_mode` to decide
+whether to even consider time-squeezing; `user_profile` to set
+verification / QA-note discipline. The b-roll scout subagent (when
 spawned by the editor) uses `source_tags.json` to scope which clips
-are eligible candidates.
+qualify as candidates.
 
 ### 5. Propose strategy
 
 Write 4-8 sentences describing the editorial shape, take direction,
 chosen pacing preset (name + four expanded ms values), animation plan,
 subtitle style (NLE captions track), length estimate, NLE delivery
-dialect. **Wait for confirmation.** No sub-agent runs until the user
+dialect. **Wait for confirmation.** No subagent runs until the user
 says yes.
 
 You are writing the strategy in the user's terms — what they said the
 video is, what they said they want. You are NOT writing it from a read
-of the timeline. The editor sub-agent will translate the strategy into
+of the timeline. The editor subagent will translate the strategy into
 specific cut decisions when it reads the timeline in step 6.
 
 ### 6. Execute — spawn the editor sub-agent (and animation sub-agents)
 
 Build the editor brief (see "Brief templates" below) and spawn the
-editor sub-agent via the `Task` / `Agent` tool. If animations are
-planned, spawn one sub-agent per slot in parallel — see
+editor subagent via the `Task` / `Agent` tool. If animations are
+planned, spawn one subagent per slot in parallel — see
 `references/animations.md`.
 
-The editor sub-agent returns `<edit>/edl.json`. The animation sub-
+The editor subagent returns `<edit>/edl.json`. The animation sub-
 agents return rendered overlay clips in `<edit>/animations/slot_*/`.
 
 ### 7. Export to the NLE
 
-XML-only delivery — there is no flat-MP4 path in this skill anymore.
+XML-only delivery — no flat-MP4 path exists in this skill anymore.
 The cut lives in the NLE and the editor finishes it there.
 
 ```bash
@@ -638,14 +638,14 @@ python helpers/export_fcpxml.py <edit>/edl.json -o <edit>/cut.fcpxml
 
 Default emits BOTH `cut.fcpxml` (Resolve / FCP X) AND `cut.xml`
 (Premiere Pro native xmeml) side-by-side from a single timeline build.
-Recipient picks whichever NLE they live in. Tell Premiere users to
+Recipient picks whichever NLE they use. Tell Premiere users to
 `File -> Import -> cut.xml`. Override with `--targets {both,fcpxml,
 premiere}`. `--frame-rate 24` (default), 25, 29.97, 30, 60.
 
 **The captions sidecar is always emitted.** `export_fcpxml.py` calls
-`build_master_srt` automatically as part of every run, writing
+`build_master_srt` automatically on every run, writing
 `<edit>/master.srt` next to the XML on the OUTPUT timeline (Hard
-Rule 5) straight from the cached Parakeet transcripts. The SRT is
+Rule 5) straight from cached Parakeet transcripts. The SRT is
 Premiere-friendly (UTF-8, CRLF, sequential cues, `HH:MM:SS,mmm -->`
 timestamps) and Premiere Pro / DaVinci Resolve / Final Cut Pro X
 all import it via `File -> Import` onto a captions track that the
@@ -658,7 +658,7 @@ silent-cinema, music video without speech), you can opt out:
 python helpers/export_fcpxml.py <edit>/edl.json -o <edit>/cut.fcpxml --no-srt
 ```
 
-Or regenerate just the SRT after a hand-tweak to the EDL without
+Or regenerate only the SRT after a hand-tweak to the EDL without
 re-walking the timeline:
 
 ```bash
@@ -668,18 +668,18 @@ python helpers/build_srt.py <edit>/edl.json
 ### 8. Self-eval (before showing the user)
 
 Run `helpers/timeline_view.py` against the **source clips at every
-EDL cut boundary** (+/- 1.5s window). XML delivery means there is no
-rendered MP4 to inspect — but the cut decisions still need to be sane
+EDL cut boundary** (+/- 1.5s window). XML delivery means no
+rendered MP4 to inspect — but cut decisions still need to be sane
 on the source side. Check each image for:
 
 - Visual discontinuity / flash / jump at the cut boundary
 - Waveform spike at the boundary on the SOURCE side — the NLE will
-  honor whatever crossfade you ask it to, but the cut has to land in
+  honor whatever crossfade you ask, but the cut has to land in
   a place where a crossfade can actually save it
 - Animation overlay durations match `start_in_output + duration` from
   the EDL (a duration mismatch silently desyncs the overlay)
 - Sum of effective range durations matches `total_duration_s` in the
-  EDL (catches arithmetic mistakes from the editor sub-agent)
+  EDL (catches arithmetic mistakes from the editor subagent)
 
 Also sample first 2s, last 2s, and 2-3 mid-points — check shot
 selection, animation placement, and overall coherence. The NLE is
@@ -687,27 +687,27 @@ where a colorist / editor sees the final result; your job is to
 deliver an XML they can drop in without rebuilding the cut.
 
 If anything fails: fix -> re-export -> re-eval. Cap at 3 self-eval
-passes — if issues remain after 3, flag them to the user rather than
-looping forever. Only hand the XML over once the self-eval passes.
+passes — if issues remain after 3, flag them to the user vs
+looping forever. Only hand over the XML once self-eval passes.
 
 ### 9. Iterate + persist — every change request = fresh editor spawn
 
 User feedback comes in. **Do not edit `edl.json` by hand.** Append the
 user's verbatim quote to the change-request history in your
-Conversation Context bundle, then spawn a fresh editor sub-agent with
+Conversation Context bundle, then spawn a fresh editor subagent with
 an updated brief that includes:
 
 - The full Conversation Context bundle (now including the new quote)
 - The full change-request history (chronological, all prior revisions
   + their diffs)
-- The prior `edl.json` (so the sub-agent can diff)
+- The prior `edl.json` (so the subagent can diff)
 - An explicit description of THIS revision: what specifically the user
   asked to change, what to keep
 
 Re-export. Re-self-eval. Show. Loop until user is happy.
 
 Final export on confirmation. Then **append to `project.md`** — see
-"project.md memory format" below. This is your only persistent state
+"project.md memory format" below. Your only persistent state
 across sessions; do not skip it.
 
 ---
@@ -716,7 +716,7 @@ across sessions; do not skip it.
 
 Every session must have a pacing preset (Hard Rule 13). Ask the user
 up-front. Default is **Paced**. Each preset expands to four numbers
-the editor sub-agent applies when picking cut points.
+the editor subagent applies when picking cut points.
 
 | Preset       | min_silence_to_remove | min_talk_to_keep | lead_margin | trail_margin | Vibe |
 |--------------|----------------------:|-----------------:|------------:|-------------:|------|
@@ -729,7 +729,7 @@ the editor sub-agent applies when picking cut points.
 Present the five options with one-line descriptions and tell the user
 the default is Paced. They can pick a name or just say "use the
 default." The detailed application algorithm lives in
-`subagent_editor_rules.md` — you don't need it; you just pick the
+`subagent_editor_rules.md` — you do not need it; just pick the
 preset name + four numbers and forward them in the editor brief.
 
 Persist the choice in `project.md` so subsequent sessions inherit a
@@ -740,7 +740,7 @@ sensible default — but still ask if the user wants to keep it.
 ## Brief templates
 
 The parent's main editorial output is briefs. The shape below is load-
-bearing — sub-agents need every section to do their job without
+bearing — subagents need every section to do their job without
 guessing. Fill in the placeholders with verbatim user quotes wherever
 possible.
 
@@ -793,7 +793,7 @@ RETURN:
 
 ### Brief: Editor sub-agent
 
-Spawn this in step 6 for the initial cut, and re-spawn in step 9 for
+Spawn this in step 6 for the initial cut, re-spawn in step 9 for
 every revision.
 
 ```
@@ -925,7 +925,7 @@ RETURN:
 
 ### Brief: Animation sub-agent
 
-See `references/animations.md`. One sub-agent per slot, all spawned in
+See `references/animations.md`. One subagent per slot, all spawned in
 parallel via the `Task` / `Agent` tool (Hard Rule 10).
 
 ---
@@ -936,16 +936,16 @@ Match the source unless the user asked for something specific. Common
 targets: `1920x1080@24` cinematic, `1920x1080@30` screen content,
 `1080x1920@30` vertical social, `3840x2160@24` 4K cinema,
 `1080x1080@30` square. The XML carries a timeline frame rate, not a
-canvas resolution — the NLE inherits resolution from the source clips.
-Pass `--frame-rate` matching the source (or the user's intended
+canvas resolution — the NLE inherits resolution from source clips.
+Pass `--frame-rate` matching the source (or user's intended
 deliverable) so cuts snap to whole frames. Worth asking the user which
-NLE they live in so the timeline rate matches.
+NLE they use so the timeline rate matches.
 
 ---
 
 ## EDL format (parent reads sub-agent output)
 
-The editor sub-agent emits this; the parent only needs to validate
+The editor subagent emits this; the parent only needs to validate
 high-level shape (range count, total duration, all `audio_lead` /
 `video_tail` / `transition_in` are 0.0).
 
@@ -971,10 +971,10 @@ high-level shape (range count, total duration, all `audio_lead` /
 
 The `subtitles` field points at the SRT sidecar emitted by
 `helpers/build_srt.py` so the NLE imports it on a captions track.
-Color is out of scope — there is no `grade` field; the colorist
+Color is out of scope — no `grade` field exists; the colorist
 owns it end-to-end in the NLE.
 
-If the editor sub-agent returns an EDL with non-zero split-edit fields,
+If the editor subagent returns an EDL with non-zero split-edit fields,
 reject it and re-spawn — that violates Hard Rule 14.
 
 ---
@@ -1007,9 +1007,9 @@ Append one section per session at `<edit>/project.md`:
 On startup, read `project.md` if it exists and summarize the last
 session in one sentence before asking whether to continue. The
 Conversation Context snapshot at the bottom lets next session's parent
-re-build the bundle without re-asking the user every preference.
+rebuild the bundle without re-asking the user every preference.
 
-The **Mode flags** block is what persists across sessions for the
+The **Mode flags** block persists across sessions for the
 three step-4 questions: when the user opens a project tomorrow that
 was scripted today, the parent reads this block and defaults the
 gating questions to last session's answers (still asks to confirm
@@ -1026,7 +1026,7 @@ three fresh."
 > they use depends on `helpers/` being the script's own directory,
 > which `sys.path` resolves automatically when run by path). Never
 > `cd helpers/` first — `cwd` semantics differ across shells
-> (PowerShell, bash, agentic shells that don't persist `cd`), and the
+> (PowerShell, bash, agentic shells that do not persist `cd`), and the
 > cache layout assumes the project root is the cwd.
 
 ### Phase A — speech + visual (default)
@@ -1038,10 +1038,10 @@ three fresh."
     `--force`, `--skip-speech`, `--skip-visual`.
   - **Do NOT use `--include-audio`.** That flag runs CLAP inline
     against a baked-in fallback vocabulary that exists only for
-    `tests.py` smoke-testing. The mandated workflow is: speech +
-    visual finish first, then the vocab sub-agent generates a
+    `tests.py` smoke-testing. The mandated workflow: speech +
+    visual finish first, then the vocab subagent generates a
     project-specific `audio_vocab.txt`, then `audio_lane.py` runs
-    against THAT. There is no "skip the vocab sub-agent" shortcut.
+    against THAT. No "skip the vocab subagent" shortcut exists.
 
 - **`helpers/preprocess.py <video1> [<video2> ...]`** — same
   orchestrator with explicit file list. Use when you want a subset.
@@ -1054,7 +1054,7 @@ three fresh."
   `speech_timeline.md`, `audio_timeline.md` (only if Phase B has
   run), `visual_timeline.md`. Pass `--no-merge` to skip the merged
   view (rare). Safe to call multiple times — re-running after Phase
-  B picks up the new audio events into both the merged file and
+  B folds the new audio events into both the merged file and
   `audio_timeline.md`.
 
   **Caveman compression on visual captions is ON by default** — a
@@ -1064,7 +1064,7 @@ three fresh."
   footage with zero loss of editorial signal (entities, actions,
   colours, shot composition all survive). Cached in
   `<edit>/comp_visual_caps/` keyed by source mtime + caveman version
-  + lang; subsequent re-packs are instant.
+  + lang; subsequent re-packs run instantly.
 
   Pass `--no-caveman` to read the raw Florence paragraphs (slower,
   bigger, only useful for debugging what Florence actually said).
@@ -1073,7 +1073,7 @@ three fresh."
   `min(n_files, cpu_count // 2)`); `--force-caveman` re-runs even
   cached files.
 
-  Sentence-level fuzzy delta dedup is also applied at pack time:
+  Sentence-level fuzzy delta dedup also applies at pack time:
   visually static frames collapse to `(same)` in
   `visual_timeline.md` and disappear entirely from
   `merged_timeline.md`; slowly-evolving frames emit only the NEW
@@ -1085,17 +1085,17 @@ three fresh."
   manually batching a `visual_caps/` directory (`python
   helpers/caveman_compress.py --visual-caps <edit>/visual_caps/`).
   The pack helper calls it automatically — only use this directly
-  when iterating on the filter rules.
+  when iterating on filter rules.
 
 ### Audio events (CLAP) — agent-curated vocabulary, mandatory
 
-The audio workflow has only one path: **spawn the vocab sub-agent**
+The audio workflow has only one path: **spawn the vocab subagent**
 (it reads `speech_timeline.md` + `visual_timeline.md` and writes
 `<edit>/audio_vocab.txt`), then run `audio_lane.py` against that
-vocab, then re-pack timelines. There is no smoke-test / agent-less
-fallback in the parent's playbook; the baked-in default vocab in
+vocab, then re-pack timelines. No smoke-test / agent-less fallback
+exists in the parent's playbook; the baked-in default vocab in
 `audio_vocab_default.py` exists only for `tests.py`. See "Brief
-templates" below for the vocab sub-agent brief.
+templates" below for the vocab subagent brief.
 
 - **`helpers/audio_lane.py <video1> [<video2> ...] --vocab
   <edit>/audio_vocab.txt --edit-dir <edit>`** — run CLAP zero-shot
@@ -1105,7 +1105,7 @@ templates" below for the vocab sub-agent brief.
   `audio_vocab_embeds.npz` so subsequent runs are fast.
   - Flags: `--device {cuda,cpu}`, `--model-tier {base,large}`,
     `--windows-per-batch N`, `--force`.
-  - If `<edit>/audio_vocab.txt` doesn't exist yet, the vocab sub-
+  - If `<edit>/audio_vocab.txt` does not exist yet, the vocab sub-
     agent has not run yet — go back to step 2 and spawn it.
 
 - After Phase B finishes, **re-run `pack_timelines.py`** to fold the
@@ -1120,12 +1120,12 @@ accepts `--wealthy` and runs standalone.
 - **`helpers/extract_audio.py <video>`** — manually extract 16kHz
   mono WAV. Cached. Mainly for debugging.
 - **`helpers/vram.py`** — print detected GPU + the schedule that
-  would be picked. Useful sanity check.
+  would be chosen. Useful sanity check.
 
 ### Editing
 
 - **`helpers/timeline_view.py <video> <start> <end>`** — filmstrip +
-  waveform PNG for visual drill-down. **The editor sub-agent invokes
+  waveform PNG for visual drill-down. **The editor subagent invokes
   this** at decision points; the parent does not. (If a scout sub-
   agent is needed for parent-level questions, the scout calls it.)
   Not a scan tool — use it at decision points, not constantly. The
@@ -1133,18 +1133,18 @@ accepts `--wealthy` and runs standalone.
   timeline_view" workflow.
 
 - **`helpers/export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit
-  editor-ready timeline files. **This is the only delivery path in
-  the skill** — there is no flat-MP4 renderer. Hard-cut delivery
+  editor-ready timeline files. **The only delivery path in
+  the skill** — no flat-MP4 renderer exists. Hard-cut delivery
   only right now (Hard Rule 14): the EDL's `audio_lead` /
   `video_tail` / `transition_in` fields are still consumed by the
-  code path but the editor sub-agent must emit `0` for all three.
+  code path but the editor subagent must emit `0` for all three.
 
   **Default emits BOTH `cut.fcpxml` AND `cut.xml`** side-by-side
   from a single timeline build, because Premiere Pro and Resolve /
   FCP X want different XML dialects: `.fcpxml` (FCPXML 1.10+) is
   native to DaVinci Resolve and Final Cut Pro X, `.xml` (Final Cut
   Pro 7 xmeml) is native to Premiere Pro. The recipient picks
-  whichever NLE they live in — no XtoCC conversion required for
+  whichever NLE they use — no XtoCC conversion required for
   Premiere. Override with `--targets {both,fcpxml,premiere}`.
   `--frame-rate 24` (default), 25, 29.97, 30, 60.
 
@@ -1156,19 +1156,19 @@ accepts `--wealthy` and runs standalone.
   2-word UPPERCASE chunks, breaks on punctuation. Skips retimed
   (timelapse) ranges by editor convention — see SKILL.md
   "Time-squeezing". **`export_fcpxml.py` calls this automatically**
-  on every export; the standalone CLI exists for the case where you
+  on every export; the standalone CLI exists for when you
   hand-tweaked the EDL and only want to regenerate the captions
   without rebuilding the XML timeline.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash`
-and spawn a sub-agent via the `Task` / `Agent` tool per
+and spawn a subagent via the `Task` / `Agent` tool per
 `references/animations.md`.
 
 ---
 
 ## Cold-path references — load on demand
 
-Cold-path features the **editor sub-agent** loads only when the
+Cold-path features the **editor subagent** loads only when the
 matching mode flag is true in its brief, plus a couple of
 parent-side feature references. Read the matching file before
 proposing strategy for that feature; do not read pre-emptively.
@@ -1177,7 +1177,7 @@ proposing strategy for that feature; do not read pre-emptively.
 
 - `references/scripted.md` — script + voiceover assembly
   procedure, beat segmentation, vo-anchored timing, source-in-point
-  synchronisation on named subjects. Editor reads when
+  sync on named subjects. Editor reads when
   `script_mode = true`.
 - `references/b_roll_selection.md` — b-roll selection preference
   order (signage / product / gameplay / booth / stage / people),
@@ -1189,14 +1189,14 @@ proposing strategy for that feature; do not read pre-emptively.
 **Sub-sub-agent role spawned by the editor (not by you):**
 
 - `references/subagent_broll_scout_rules.md` — b-roll scout
-  sub-agent's operating manual. Spawned by the **editor sub-agent**
+  subagent's operating manual. Spawned by the **editor subagent**
   (not by the parent) on demand, one per beat or one per cluster
   of beats, in parallel per Hard Rule 10. Reads
   `<edit>/visual_timeline.md` for in-scope sources and returns
   ranked candidate shortlists. Editor picks / verifies / writes the
   EDL range. The parent never spawns scouts directly — but the
-  parent's editor brief mentions `source_tags.json` so the editor
-  can pass the in-scope source list down to scouts when it spawns
+  parent's editor brief lists `source_tags.json` so the editor
+  can pass the in-scope source list down to scouts when spawning
   them.
 
 **Parent-side cold-path (read when the feature is in scope):**
@@ -1204,12 +1204,12 @@ proposing strategy for that feature; do not read pre-emptively.
 - `references/subtitles.md` — chunking / case / placement,
   `bold-overlay` and `natural-sentence` worked styles, FCPXML
   delivery and the always-emitted `master.srt` sidecar.
-- `references/animations.md` — animation sub-agent brief template,
+- `references/animations.md` — animation subagent brief template,
   PIL / Manim / Remotion timing and easing, parallel-spawn
   discipline (Hard Rule 10).
 
 The Hard Rules that bind these features stay in `shared_rules.md`
-— output-timeline SRT (Rule 5) and parallel sub-agents for
+— output-timeline SRT (Rule 5) and parallel subagents for
 animations (Rule 10) are the live ones for XML delivery; the
 ffmpeg-pipeline rules (1-4) are dormant since the flat-MP4 path
 was removed. Color grade is out of scope — the colorist owns it
@@ -1219,12 +1219,12 @@ in the NLE.
 
 ## Editor return rationale — extra blocks to echo to the user
 
-Two editor sub-agent features detect **user intent baked into the
+Two editor subagent features detect **user intent baked into the
 source recording itself** and produce dedicated blocks in the
 editor's return rationale that you must surface to the user when
 describing the cut. Detection happens autonomously inside the
-editor's merged-timeline read; you don't gate them with flags,
-you don't read the timeline yourself. Your job is echo +
+editor's merged-timeline read; you do not gate them with flags,
+you do not read the timeline yourself. Your job is echo +
 clarification.
 
 ### `In-clip editor notes` block
@@ -1234,7 +1234,7 @@ source clips themselves — *"hey to the AI editing this, skip the
 first take"*, *"editor's note: this clip is a throwaway"*,
 countdown markers (*"three two one"*) excluded from the cut, etc.
 Full detection / application rules live in
-`subagent_editor_rules.md` "In-clip editor notes."
+`subagent_editor_rules.md` "In-clip editor notes".
 
 The editor returns a list shaped like:
 
@@ -1254,8 +1254,8 @@ What you do with it:
    said 'skip the first take, the second is the keeper' — went
    with the second, like you asked."*
 2. **Surface ambiguous notes the editor flagged** (*"cut around
-   the embarrassing bit"*, *"the audio is bad here"*). Ask a
-   single clarifying question, capture the user's answer as a
+   the embarrassing bit"*, *"the audio is bad here"*). Ask one
+   clarifying question, capture the user's answer as a
    verbatim conversation quote, re-spawn the editor with the
    quote in the bundle.
 3. **Persist applied notes in `project.md`** — one-liner per
@@ -1263,7 +1263,7 @@ What you do with it:
 
 If the user wants to disable the feature for a session (e.g. *"my
 brother yells 'hey AI' as a joke, ignore those"*), capture the
-exact quote in the bundle. The editor honors the override.
+exact quote in the bundle. The editor honors that override.
 
 ### `Retake decisions` block
 
@@ -1272,7 +1272,7 @@ marker (*"fuck, again"*), restart phrase (*"let me try that
 again"*), long-pause-then-restart, slate / clap between takes, or
 a fresh clip starting with the same content as the last — and
 picks the cleaner take, dropping the rest. Full rules live in
-`subagent_editor_rules.md` "Retake detection."
+`subagent_editor_rules.md` "Retake detection".
 
 The editor returns a list shaped like:
 
@@ -1289,17 +1289,17 @@ Retake decisions:
 
 What you do with it:
 
-1. **Echo retake calls when they're load-bearing** — the user
-   wants to know their second take landed. Doesn't have to be
+1. **Echo retake calls when they are load-bearing** — the user
+   wants to know their second take landed. Need not be
    exhaustive on every micro-retake; surface the meaningful ones.
 2. **Surface override calls** explicitly — when the editor used
-   the EARLIER take instead of the later (because the later was
+   the EARLIER take vs the later (because the later was
    worse), tell the user that judgement was made and why.
 3. **Surface "kept both" calls on emphatic repetition** so the
    user knows nothing was dropped by mistake.
 
 This block is informational; the editor already made the call.
-You're translating to the user, not re-deciding.
+You are translating to the user, not re-deciding.
 
 ### When the user overrides a retake decision
 
@@ -1320,7 +1320,7 @@ user quote" priority overrides its retake heuristic.
 - **Skipping the pacing prompt.** Hard Rule 13.
 - **Skipping the four mode-gating questions in step 4.** They set
   `script_mode`, `b_roll_mode`, `timelapse_mode`, `user_profile` —
-  the editor sub-agent's cold-path reads, retime permission, and
+  the editor subagent's cold-path reads, retime permission, and
   verification bar all depend on them. Default-guessing the flags
   ships the wrong cut.
 - **Forgetting to forward the mode flags or `source_tags.json`
@@ -1331,39 +1331,39 @@ user quote" priority overrides its retake heuristic.
 - **Running `preprocess_batch.py` without `--detect-pairs` first
   on inventories that look like camera + recorder rigs (matched
   stems for `.mp4`/`.mov` and `.wav`).** The script will refuse
-  with rc=2 and you'll have to re-ask the user anyway — but if you
+  with rc=2 and you will have to re-ask the user anyway — but if you
   miss the failure on a long preprocess invocation it wastes their
   GPU time. Detect first, ask, then run with the chosen mode.
-- **Picking the paired-audio mode for the user.** Don't assume
+- **Picking the paired-audio mode for the user.** Do not assume
   "they probably wanted second mic" — some rigs auto-mirror the
   camera audio as a `.wav` backup and the user genuinely wants it
   ignored. Always ask, always quote the answer back, persist the
   choice in `project.md` so next session's default is right.
 - **Forgetting to forward `source_pairs.json` into the editor
-  brief when it exists.** Without it the editor doesn't know that
+  brief when it exists.** Without it the editor does not know that
   `transcripts/SHOT_0042.json` and `transcripts/SHOT_0042.audio.json`
-  are the same shot; it'll happily place the same beat twice with
+  are the same shot; it will happily place the same beat twice with
   different transcriptions.
 - **Skipping the step-1 folder convention scan.** Even when the
   user only mentions "I have a script and some b-roll" in passing,
   scan the videos_dir for convention folders before asking — the
   user organized for a reason; pre-filling beats re-asking.
 - **Forcing folder convention.** Auto-detection is opt-in
-  organization. Don't lecture users who use a flat folder layout;
+  organization. Do not lecture users who use a flat folder layout;
   ask the four questions fresh and move on.
 - **Inventing ad-hoc cut-padding numbers.** Pacing preset is the
   contract.
 - **Paraphrasing user quotes in the brief.** Quote verbatim. Vibes
   matter.
 - **Forgetting to forward the change-request history on revisions.**
-  The sub-agent has no memory across spawns; the brief is its memory.
-- **Spawning sub-agents sequentially when they could be parallel.**
+  The subagent has no memory across spawns; the brief is its memory.
+- **Spawning subagents sequentially when they could be parallel.**
   Animations especially. Hard Rule 10.
 - **Presenting the preview before self-eval passes.** Step 8 is
   mandatory.
-- **Skipping the `project.md` append at session end.** That's how
+- **Skipping the `project.md` append at session end.** That is how
   next session knows where this one stopped.
-- **Burying or paraphrasing an in-clip editor note the sub-agent
+- **Burying or paraphrasing an in-clip editor note the subagent
   flagged.** If the editor's return rationale contains
   `In-clip editor notes detected`, surface every APPLIED entry
   to the user and quote the transcribed phrasing verbatim. Hiding

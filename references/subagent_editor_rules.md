@@ -1,32 +1,32 @@
 # Editor Sub-agent Rules — operating manual for the cut-decision agent
 
-You have already read `references/shared_rules.md`. If you have not,
-stop and read it now — it defines the agent hierarchy, the Hard Rules
-that bind every agent (especially Hard Rule 15, the merged-view spine
-principle), and the philosophy that makes this skill work. Reading
-these rules without that context will produce silently bad cuts.
+You have already read `references/shared_rules.md`. If not, stop and
+read it now — it defines the agent hierarchy, the Hard Rules binding
+every agent (especially Hard Rule 15, the merged-view spine
+principle), and the philosophy making this skill work. Reading these
+rules without that context produces silently bad cuts.
 
-You are the **editor sub-agent**. The parent agent has spawned you to
-produce `<edit>/edl.json` — the cut decisions for one video session.
-You have a fresh context window. Use it.
+You are the **editor sub-agent**. The parent spawned you to produce
+`<edit>/edl.json` — the cut decisions for one video session. You
+have a fresh context window. Use it.
 
 ---
 
 ## ABSOLUTE READ MANDATE — read first, no exceptions
 
-This rule overrides every other consideration in this file. There is
-no token budget concern, no time concern, no efficiency concern, no
-"diminishing returns" argument that justifies stopping early.
+This rule overrides everything else in this file. No token budget
+concern, no time concern, no efficiency concern, no "diminishing
+returns" argument justifies stopping early.
 
 ### Mode-gated cold-path reads (conditional, before the merged-view read)
 
 The parent's brief carries four feature-mode flags
 (`script_mode`, `b_roll_mode`, `timelapse_mode`, `user_profile`)
 plus an optional `source_tags.json` path. For the file-bound
-boolean flags, **if the flag is true, read the matching cold-path
-file IN FULL before reading the merged timeline.** If the flag is
-false, skip the file silently — those rules don't apply this
-session.
+boolean flags, **if true, read the matching cold-path file IN FULL
+before reading the merged timeline.** If false, skip the file
+silently — those rules don't apply this session.
+
 
 | Flag                | If `true`, read this file in full          |
 |---------------------|--------------------------------------------|
@@ -35,37 +35,37 @@ session.
 
 `timelapse_mode` is a permission flag, NOT a file flag:
 
-- `timelapse_mode = false` (the safe default) — **emit zero ranges
+- `timelapse_mode = false` (safe default) — **emit zero ranges
   with `speed != 1.0`**. The "Time-squeezing (timelapse)" section
   later in this file is fully overridden — even when you find a
-  long visually-continuous activity stretch that would be a
-  textbook timelapse candidate, you DO NOT emit `speed > 1.0`.
-  Cut the stretch (drop dead air; pick highlights at 1x), or keep
-  selected 1x ranges, but no retime. The user has explicitly opted
-  out of timelapses for this session — silent retime would damage
-  their material.
+  long visually-continuous activity stretch that's a textbook
+  timelapse candidate, you DO NOT emit `speed > 1.0`. Cut the
+  stretch (drop dead air; pick highlights at 1x), or keep selected
+  1x ranges, but no retime. The user explicitly opted out of
+  timelapses this session — silent retime would damage their
+  material.
 - `timelapse_mode = true` — the time-squeezing rules in this file
   apply normally. Hard ceiling stays `speed = 10.0`.
 
 `user_profile` is `personal | creator | professional` and is NOT a
-file flag — it sets your verification bar. It comes into play when
-you're applying the rules from `b_roll_selection.md` (top-candidate
-review on every named-subject beat at `professional`, default bar
-otherwise) and when you're writing QA notes in EDL `reason` fields
-(terse for personal / creator; detailed list-the-rejected-
-candidates for professional).
+file flag — it sets your verification bar. It applies when you're
+using the rules from `b_roll_selection.md` (top-candidate review
+on every named-subject beat at `professional`, default bar
+otherwise) and when writing QA notes in EDL `reason` fields (terse
+for personal / creator; detailed list-the-rejected-candidates for
+professional).
 
-`source_tags.json` (path may be present in the brief) is a small
-JSON map of clip stems to categories (`a_roll`, `b_roll`,
-`timelapse`, `voiceover`, `unknown`). When the brief lists this
-path, **respect the categorization** for candidate searches:
+`source_tags.json` (path may be in the brief) is a small JSON map
+of clip stems to categories (`a_roll`, `b_roll`, `timelapse`,
+`voiceover`, `unknown`). When the brief lists this path,
+**respect the categorization** for candidate searches:
 
-- B-roll candidate searches (whether you do them in-context or
-  spawn b-roll scout sub-agents) should restrict to clips tagged
+- B-roll candidate searches (whether in-context or via spawned
+  b-roll scout subagents) should restrict to clips tagged
   `b_roll` / `cutaway`, OR `unknown` if the user didn't tag
   everything.
 - A-roll-tagged clips are the primary speech / audio bed in
-  talking-head mode; do not consider them as cutaways unless the
+  talking-head mode; do not treat them as cutaways unless the
   user explicitly asked for the speaker's footage as cutaways.
 - `timelapse`-tagged clips are pre-organized timelapse source
   material; if `timelapse_mode = true`, prefer them as timelapse
@@ -76,8 +76,8 @@ path, **respect the categorization** for candidate searches:
   transcript path in the brief.
 
 If `source_tags.json` is absent from the brief, all sources are
-treated as eligible across all roles (the user didn't organize, so
-you don't pre-filter).
+eligible across all roles (the user didn't organize, so you don't
+pre-filter).
 
 `source_pairs.json` (path may be present in the brief) records the
 parent's resolution of dual-mic / paired-audio detection from step 1.
@@ -100,32 +100,32 @@ Schema:
 
 When `mode = dual_mic`, two transcripts exist for the same shot:
 `transcripts/<stem>.json` (camera audio) and
-`transcripts/<stem>.audio.json` (the lav / external recorder). Both
+`transcripts/<stem>.audio.json` (lav / external recorder). Both
 appear as separate entries in `merged_timeline.md` with the suffixed
 stem visible in the source label. **Treat them as the same shot for
-cut purposes** — do not place the same beat twice. The full handling
+cut purposes** — don't place the same beat twice. The full handling
 procedure is below in "Dual-mic pair handling"; that section is
 mandatory reading whenever `source_pairs.json` is present with
 `mode = dual_mic` in your brief.
 
-When `mode = ignore`, the paired `.wav` was filtered out of
+When `mode = ignore`, the paired `.wav` was filtered from
 preprocessing; only the camera-audio transcript exists. No special
 handling — proceed normally. The file is still recorded so a future
 session knows the user explicitly declined dual-mic on this project.
 
 If `source_pairs.json` is absent from the brief, no stem pairs were
-detected (or the entire batch predates pair detection). Proceed
-normally.
+detected (or the batch predates pair detection). Proceed normally.
+
 
 These cold-path files are **additive** to your default rules — they
-do not replace the merged-view spine read below, the pacing-preset
+don't replace the merged-view spine read below, the pacing-preset
 algorithm, the word-boundary discipline, or any Hard Rule. When
-both `script_mode` and `b_roll_mode` are true (the common combo for
+both `script_mode` and `b_roll_mode` are true (common combo for
 voiceover-driven assembly), read both files; the assembly procedure
 in `scripted.md` references the selection rules in
 `b_roll_selection.md` step-by-step.
 
-If a flag the brief did not mention seems to apply (e.g. you find
+If a flag the brief didn't mention seems to apply (e.g. you find
 the project clearly has b-roll but the brief doesn't say so),
 **don't infer it silently** — return to the parent with a flag-
 clarification request. The parent owns the flag values; you don't
@@ -139,19 +139,19 @@ override them.
    audio events (`(audio: ...)`), and visual captions (`visual: ...`)
    for every source, all interleaved chronologically by timestamp.
    The file is caveman-compressed and sentence-delta-deduped at pack
-   time precisely so it fits comfortably in your fresh context window
-   — typical projects land in the 200KB-1.5MB range — but EVEN IF a
-   project produced a file an order of magnitude larger, the rule is
-   the same: read every line.
+   time so it fits comfortably in your fresh context window —
+   typical projects land in the 200KB-1.5MB range — but EVEN IF a
+   project produced a file an order of magnitude larger, the rule
+   is the same: read every line.
 
 2. **The prior `<edit>/edl.json` (on revisions only)** — END-TO-END.
    EVERY RANGE. EVERY FIELD.
 
    When the parent re-spawns you with a change request, the parent
-   forwards the previous EDL in your brief. Read all of it. Do not
+   forwards the previous EDL in your brief. Read all of it. Don't
    read only the ranges around the user's complaint and assume the
    rest is fine — the user might have asked for a global change
-   ("tighten the whole thing") that requires touching every range.
+   ("tighten the whole thing") requiring every range to be touched.
 
 3. **The script (when `script_mode = true`)** — END-TO-END. EVERY
    LINE. The path is in the parent's brief (typically
@@ -159,7 +159,7 @@ override them.
    like `[CUT TO ...]` or `[B-ROLL: ...]` are the user's commands,
    not hints — bind them. See `references/scripted.md` for the
    beat-segmentation procedure. If the script is missing despite
-   the flag being true, STOP and report to the parent — do not
+   the flag being true, STOP and report to the parent — don't
    guess at beats from the voiceover transcript alone.
 
 ### Hard procedure when a file exceeds one `Read` call
@@ -169,8 +169,8 @@ calls, make 5. If it takes 50, make 50. If it takes 500, make 500.
 If it takes 99,999 calls, make 99,999.
 
 If you exhaust your context budget before finishing the read, **DO
-NOT emit an EDL based on partial coverage.** Return to the parent
-with an explicit error message and halt:
+NOT emit an EDL from partial coverage.** Return to the parent with
+an explicit error message and halt:
 
 ```
 BUDGET_EXHAUSTED
@@ -184,7 +184,7 @@ BUDGET_EXHAUSTED
       revision?) and respawns
 ```
 
-A partial read produces silently bad cuts that the user will ship and
+A partial read produces silently bad cuts the user will ship and
 regret. An explicit budget-exhausted return is recoverable. Always
 pick recoverable.
 
@@ -192,35 +192,35 @@ pick recoverable.
 
 - Reading only the first N lines / last N lines / "a representative
   sample" of `merged_timeline.md`.
-- `grep` / `rg`-ing for keywords and emitting an EDL from the matches
-  alone (loses the chronological structure that makes the merged
-  view useful in the first place).
+- `grep` / `rg`-ing for keywords and emitting an EDL from matches
+  alone (loses the chronological structure making the merged view
+  useful at all).
 - Chunked reads abandoned partway through ("I have enough...", "this
   section is repetitive...", "I can extrapolate from here..."). You
   don't have enough. You can't extrapolate. Finish the file.
 - Skipping a `Read` chunk because the previous chunk "looked
-  similar." The dedup pass already removed the genuinely similar
+  similar." The dedup pass already removed genuinely similar
   frames; what's left is signal.
-- "Smart" chunking that reads chunks 1, 5, 10 and assumes 2-4 and
-  6-9 are interpolatable. They are not.
+- "Smart" chunking reading chunks 1, 5, 10 and assuming 2-4 and
+  6-9 are interpolatable. They aren't.
 - Spawning a SUB-sub-agent to "protect this sub-agent's context
   window." YOU are the editor — this read IS your job. The parent
   already isolated you so this read is affordable; don't outsource
   it again.
 - Treating "the user is in a hurry" as license to skip lines. If the
-  user is in a hurry, the parent reduces target runtime, not coverage
-  of the source.
+  user is in a hurry, the parent reduces target runtime, not source
+  coverage.
 - On revisions: reading only the lines around the user's complaint
   and assuming the rest of the prior EDL is fine. Read the whole
   prior EDL. Read the whole `merged_timeline.md` again. Every spawn,
   every revision, full coverage.
 - Returning a partial-read EDL silently with a note like "(read most
-  of the file, used judgement on the rest)." That note converts a
-  silent failure into a confessed failure but it is still a failure.
-  Use the BUDGET_EXHAUSTED return instead.
+  of the file, used judgement on the rest)." That converts a silent
+  failure into a confessed failure but it's still a failure. Use
+  the BUDGET_EXHAUSTED return instead.
 
 The user explicitly demanded this rule be ironclad. They will catch
-any deviation; the cut will be rejected; you will be re-spawned with
+any deviation; the cut will be rejected; you'll be re-spawned with
 the same brief and an angry parent.
 
 ---
@@ -234,21 +234,21 @@ the same brief and an angry parent.
      B-roll candidates, what's actually on screen at a moment.
    - **Audio events are noisy hints only** — trust them only after
      cross-checking the visual line at the same timestamp. When
-     `(audio: ...)` and `visual:` disagree about what is on screen,
+     `(audio: ...)` and `visual:` disagree about what's on screen,
      trust visual.
 
-2. **Drill into the per-lane files only when the merged view is
+2. **Drill into per-lane files only when the merged view is
    ambiguous.** Use `<edit>/speech_timeline.md` for word-level timing
-   detail beyond the merged phrase grouping; `<edit>/visual_timeline.md`
+   detail beyond merged phrase grouping; `<edit>/visual_timeline.md`
    for the full 1fps caption stream including `(same)` repeats;
    `<edit>/audio_timeline.md` for per-window CLAP scoring detail. The
    per-lane files are also bound by the ABSOLUTE READ MANDATE if you
-   open them — drill into a SPECIFIC moment, but read the surrounding
+   open them — drill into a SPECIFIC moment, but read surrounding
    context fully, not a one-line snippet.
 
 3. **If `merged_timeline.md` is missing**, STOP and report — the
    parent must re-run `python helpers/pack_timelines.py --edit-dir
-   <edit>` to regenerate it. Do not invent a workaround.
+   <edit>` to regenerate it. Don't invent a workaround.
 
 ---
 
@@ -264,11 +264,11 @@ The bundle includes:
 
 - **Project summary** in the parent's words — what the video is about,
   who's in it, what it's for.
-- **Verbatim user quotes** chronological — the original wording matters,
-  do not collapse "make it punchy" into "make it short."
-- **Things user explicitly asked to keep** — these moments survive
-  every revision unless a later quote reverses them.
-- **Things user explicitly rejected** — these moments are cut, every
+- **Verbatim user quotes** chronological — original wording matters,
+  don't collapse "make it punchy" into "make it short."
+- **Things user explicitly asked to keep** — these survive every
+  revision unless a later quote reverses them.
+- **Things user explicitly rejected** — these are cut, every
   revision, unless a later quote reverses them.
 - **Strategy** — beats / structure, pacing preset values, target
   runtime, delivery target.
@@ -284,9 +284,9 @@ The bundle includes:
   the "Dual-mic pair handling" procedure below.
 - **Verbal slips to avoid** — list the parent compiled.
 - **Change-request history** (on revisions) — chronological list of
-  every prior revision + diff. Read this so revision N is informed by
-  revisions 0..N-1.
-- **Prior EDL** (on revisions) — diff your output against this so the
+  every prior revision + diff. Read this so revision N is informed
+  by revisions 0..N-1.
+- **Prior EDL** (on revisions) — diff your output against it so the
   user sees the specific change land, not the whole cut re-shuffled.
 
 ---
@@ -324,12 +324,12 @@ timeline shows:
   override per-handoff if the moment calls for it.
 
 - **Visual context is the second source of truth.** Before committing
-  to any non-trivial cut, check the `visual:` lines around the cut
-  point in `merged_timeline.md`. If captions show a continuous action
-  spanning your cut, you're cutting in the middle of a shot — usually
-  fine, but be deliberate. Use the visual lane to find B-roll cutaway
-  candidates, match cuts, shot changes, and to decide whether a moment
-  is worth preserving even when speech is silent.
+  to any non-trivial cut, check `visual:` lines around the cut point
+  in `merged_timeline.md`. If captions show continuous action
+  spanning your cut, you're cutting mid-shot — usually fine, but be
+  deliberate. Use the visual lane to find B-roll cutaway candidates,
+  match cuts, shot changes, and to decide whether a moment is worth
+  preserving even when speech is silent.
 
 - **Audio events are noisy hints, not signals.** The `(audio: ...)`
   lines carry markers like `(drill 0.87)`, `(applause 0.92)`,
@@ -345,12 +345,12 @@ timeline shows:
   inside a phrase. Splitting a phrase mid-sentence to drop a 400ms
   thinking pause is the whole point of the preset; that's how an
   Energetic pass turns 12-min walk-and-talk into 7 min without losing
-  any words. Anything shorter than the threshold stays as the natural
-  rhythm. <30ms is always unsafe — mid-phoneme.
+  words. Anything shorter than the threshold stays as natural rhythm.
+  <30ms is always unsafe — mid-phoneme.
 
-- **Cut out filler words and disfluencies by default.** Treat each
+- **Cut filler words and disfluencies by default.** Treat each
   occurrence as an inline cut candidate exactly like a silence gap —
-  split the EDL range around it so the kept words concatenate cleanly:
+  split the EDL range around it so kept words concatenate cleanly:
 
       "uh", "um", "umm", "uhh", "er", "erm", "ah", "ahh", "hmm", "mm",
       "like" (verbal-tic usage only — keep it when it's the verb / a
@@ -365,7 +365,7 @@ timeline shows:
 
   The Parakeet lane preserves these verbatim so you can find and
   remove them. **Do NOT leave them in out of "respect for the natural
-  voice."** A clean tight delivery IS the speaker's voice with the
+  voice."** A clean tight delivery IS the speaker's voice with
   friction removed.
 
   Exceptions (keep the filler, note in `reason`):
@@ -378,7 +378,7 @@ timeline shows:
   When cutting a filler, the resulting two adjacent same-source
   ranges must each still snap to word boundaries (Hard Rule 6) and
   the combined-pad clamp from the silence-removal pass applies (so
-  the lead/trail margins don't re-introduce the filler you just cut).
+  lead/trail margins don't re-introduce the filler you just cut).
   For zero-gap repeated words, snap to the END of the first instance
   / the START of the second — never mid-word.
 
@@ -410,10 +410,10 @@ Common shapes:
   hand motion at t=N, and the take starting after.
 
 These are first-class user instructions — the user spoke them into
-the recording precisely so a downstream editor would find them.
-**Detect them, honour them, exclude the preamble from the EDL, and
-surface every one in your return rationale** so the parent echoes
-them back to the user in plain English.
+the recording so a downstream editor would find them. **Detect
+them, honour them, exclude the preamble from the EDL, and surface
+every one in your return rationale** so the parent echoes them
+back to the user in plain English.
 
 ### Trigger-phrase detection
 
@@ -421,8 +421,8 @@ Walk the speech lane in `merged_timeline.md` (and `speech_timeline.md`
 when you need word-level timing) for any phrase the speaker uses to
 **address an editor or AI**. Match liberally — case-insensitive,
 tolerant of mis-transcription — but require **imperative or
-instructional content following the address** before treating as a
-note.
+instructional content after the address** before treating it as
+a note.
 
 Common opening phrasings (non-exhaustive — match the *intent*, not
 a fixed list):
@@ -438,8 +438,8 @@ a fixed list):
 Parakeet may mis-hear these (`"note the editor"` vs
 `"note to the editor"`, `"hey AI editing"` vs `"hey AI editor"`).
 Read for *intent*: if the speaker is clearly addressing a downstream
-editor / AI rather than the on-camera audience, the following
-content is a note candidate.
+editor / AI vs the on-camera audience, the following content is a
+note candidate.
 
 ### Boundary detection — where does the directive end?
 
@@ -453,7 +453,7 @@ The directive runs from the trigger to **the first of**:
 2. **A clap or slate.** Look for an `(audio: clap …)` /
    `(audio: slate …)` event within ~3s of the trigger. Visual
    confirmation (`visual: …hands clapping…` on the same window)
-   strengthens the signal but is not required.
+   strengthens the signal but isn't required.
 3. **A long silence gap** (≥ 1.5s) that clearly separates the
    address from the rest of the clip.
 4. **An obvious topic / register shift** — speaker stops addressing
@@ -461,15 +461,15 @@ The directive runs from the trigger to **the first of**:
    today we're going to…"*).
 
 If none of those land within ~10s of the trigger, the trigger was
-probably a false positive (*"hey editor"* said rhetorically). Do
-not treat as a note; let the words ride as content (still subject to
+probably a false positive (*"hey editor"* said rhetorically). Don't
+treat as a note; let the words ride as content (still subject to
 filler-cut rules).
 
 ### Exclusion from the EDL
 
 Everything from the trigger through the take-start marker
 (inclusive of countdown / *"action"* / clap window) is excluded.
-Concretely: do not start an EDL range inside the preamble; place
+Concretely: don't start an EDL range inside the preamble; place
 the in-point at or after the take-start marker, snapped to a word
 boundary per Hard Rule 6. The pacing preset's `lead_margin` still
 applies on the chosen in-point — but never let it pull the in-point
@@ -505,11 +505,11 @@ Common directive shapes and how to apply them:
 - *"cut around me coughing at minute four"* → split the EDL range
   to drop the cough span.
 - *"speed this up"* — only honour when `timelapse_mode = true`
-  (otherwise note the deferral; gating wins).
+  (else note the deferral; gating wins).
 
 ### Citation in the EDL `reason` field
 
-When an in-clip note shaped a range, cite it in `reason` with the
+When an in-clip note shaped a range, cite it in `reason` with
 source stem and timestamp, quoting verbatim:
 
 ```json
@@ -527,7 +527,7 @@ below is mandatory regardless of profile.
 ### Return rationale — surface every detected note
 
 Include a dedicated `In-clip editor notes` block listing every
-detected directive, what you did about it, and any deviation:
+detected directive, what you did, and any deviation:
 
 ```
 In-clip editor notes detected:
@@ -550,7 +550,7 @@ The parent will translate this into plain English for the user.
 ### Conservative handling — when in doubt, surface, don't act
 
 If a directive is **ambiguous, contradictory, or impossible to
-verify** against the timeline, **do not silently act on it.**
+verify** against the timeline, **don't silently act on it.**
 
 - *"editor cut around the embarrassing bit"* — what counts as
   embarrassing? Don't guess. Flag in rationale; preserve the take.
@@ -569,8 +569,8 @@ question and re-spawn you with the clarification in the bundle.
 If a verbatim conversation-bundle quote says *"ignore any 'hey
 editor' notes in the source"* / *"my brother yells 'hey AI' as a
 joke, don't act on those"*, **respect the override** — treat all
-in-clip notes as normal content for that session and note the
-override at the top of your return rationale.
+in-clip notes as normal content this session and note the override
+at the top of your return rationale.
 
 ---
 
@@ -582,7 +582,7 @@ something a beat later because they didn't like how it landed.
 Sometimes retakes happen across clip boundaries — one source ends
 right before another picks up the same line. Your job: detect the
 repetition, pick the cleanest take, drop the rest. The user
-recorded the better take precisely so you'd use it.
+recorded the better take so you'd use it.
 
 This is distinct from filler removal (per-word *"uh"* / *"um"*) and
 distinct from in-clip editor notes (explicit verbal directives).
@@ -612,7 +612,7 @@ Walk the speech lane looking for these patterns:
    words overlap ≥ 50% with no intervening topic shift is a strong
    cue.
 
-3. **Cross-clip retakes.** Two adjacent sources that start with
+3. **Cross-clip retakes.** Two adjacent sources starting with
    similar content. Source ordering in `merged_timeline.md` is the
    parent's argv order; if filenames suggest sequence (`C0312` then
    `C0313` recorded back-to-back, or `intro_take1.MP4` then
@@ -624,13 +624,13 @@ Walk the speech lane looking for these patterns:
    of the same content — that's a deliberate retake marker.
 
 5. **Long pause followed by restart.** A silence gap ≥ 2s followed
-   by speech that restates what came before the pause (*"…welcome
-   to the show. [3.4s silence] Welcome to the show, today we're…"*).
+   by speech restating what came before the pause (*"…welcome to
+   the show. [3.4s silence] Welcome to the show, today we're…"*).
 
 ### How to pick the keeper
 
 Default heuristic: **prefer the LATER take.** The later take exists
-because the speaker decided the earlier one wasn't good enough —
+because the speaker decided the earlier wasn't good enough —
 respect that decision. Concretely, when you have two semantically
 matched ranges, exclude the earlier from the EDL and use the later.
 
@@ -651,7 +651,7 @@ Override the default when:
   other lacks; one introduces a named subject the script needs;
   one is the *"with the joke"* version the user explicitly asked
   to keep. Trust the conversation bundle on this — verbatim quotes
-  that say *"keep the punchline take"* override the default.
+  saying *"keep the punchline take"* override the default.
 - The keeper take fails the structural test (cuts off mid-thought;
   the speaker walks out of frame; visual continuity breaks). Drop
   to the alternate, note in `reason`.
@@ -661,7 +661,7 @@ Override the default when:
 Not every repetition is a retake. Watch for:
 
 - **Rhetorical / emphatic repetition.** *"Buy now. Buy now. Buy
-  NOW."* — the rhythm IS the beat. Keep all three.
+  NOW."* — rhythm IS the beat. Keep all three.
 - **Comedic repetition / callback.** *"…and then he says 'no'.
   No. Just no."* — beat structure depends on it.
 - **List repetition.** *"It's fast, it's faster, it's the
@@ -689,13 +689,13 @@ sentence. Note the call in `reason`.
 ### Cutting mechanics for retakes
 
 When you've identified an earlier-take range to drop and a later-
-take range to keep, the mechanics are the same as any other inline
-cut (see "Cut craft" above):
+take range to keep, the mechanics match any other inline cut (see
+"Cut craft" above):
 
 - Both surviving / dropped boundaries snap to word boundaries
   (Hard Rule 6).
 - The frustration marker, the curse word, the *"let me try that
-  again"* — **all excluded** from the EDL. They were the connective
+  again"* — **all excluded** from the EDL. They were connective
   tissue between takes; nobody wants them in the cut.
 - The combined-pad clamp from the silence-removal pass applies on
   the gap between the kept earlier audio (before the dropped
@@ -740,20 +740,20 @@ The parent surfaces these to the user.
 
 ### Conservative handling for retakes
 
-- **If you cannot decide which take is cleaner**, default to the
+- **If you can't decide which take is cleaner**, default to the
   later one and flag the call in the rationale so the parent knows
   you guessed.
 - **If both takes contain unique content** (one has a sentence
   the other lacks), keep BOTH and let the speech ride — better to
-  over-include than to silently drop a beat the speaker meant to
-  land.
+  over-include than silently drop a beat the speaker actually
+  meant to land.
 - **Never cut around a frustration marker without confirming a
   matching restart within 10s.** A standalone *"fuck"* with no
   retake might just be the speaker's natural reaction to something
   on camera — that's content, not retake noise. Filler-word rules
-  do not list curse words as default-cut for that reason.
+  don't list curse words as default-cut for that reason.
 - **Cross-clip retake detection requires temporal evidence.** Two
-  clips containing similar speech aren't necessarily takes of each
+  clips with similar speech aren't necessarily takes of each
   other — they might be different days, different scenes. Use clip
   stem ordering (numeric or `_take1` / `_take2` suffixes), an
   explicit user quote about retakes, or a slate / clap audio event
@@ -814,11 +814,11 @@ Stay inside Hard Rule 7's 30-200ms working window. Never go below
 ## Dual-mic pair handling (when `source_pairs.json` mode = `dual_mic`)
 
 When the parent's brief lists `source_pairs.json` with `mode =
-dual_mic`, you have **two transcripts per paired shot** and they are
-the same speech captured by two different microphones. Your job is to
-treat the pair as one shot for cut purposes, pick the better
-transcript per cut, and record which one you used so the parent can
-surface it in the user-facing summary.
+dual_mic`, you have **two transcripts per paired shot** capturing
+the same speech via two different microphones. Your job: treat the
+pair as one shot for cut purposes, pick the better transcript per
+cut, and record which one you used so the parent can surface it in
+the user-facing summary.
 
 ### What appears in `merged_timeline.md`
 
@@ -839,7 +839,7 @@ sections:
 Both sections cover the SAME duration on the SAME wall-clock
 timeline. The `.audio` suffix tells you which one came from the lav /
 external recorder. The video sibling has visual captions; the
-`.audio` sibling does not (no visual lane).
+`.audio` sibling doesn't (no visual lane).
 
 ### Picking the better transcript
 
@@ -863,7 +863,7 @@ order:
 
 4. **Tie-breaker** — prefer the lav (`.audio` sibling). External
    recorders are almost always cleaner than on-camera mics; this
-   matches the user's hardware intent for setting the rig up that
+   matches the user's hardware intent for setting up the rig that
    way in the first place.
 
 ### What goes in the EDL
@@ -871,8 +871,8 @@ order:
 The EDL range still points at the **video file** for both video and
 audio (a paired shot is still one shot at the NLE level). The
 `source` field is the video stem, NOT the `.audio` alias — the alias
-is a preprocessing fiction so the caches don't collide; the user
-never wants the alias path showing up in their NLE bin.
+is a preprocessing fiction so caches don't collide; the user never
+wants the alias path showing up in their NLE bin.
 
 **Do** record which transcript you trusted for each range, in a new
 EDL field:
@@ -896,12 +896,12 @@ audio source in their NLE for that range.
 ### When to call out a swap-the-audio recommendation
 
 If you preferred the lav transcript on a range AND the confidence
-gap was wide (camera mean conf < 0.6 or > 0.20 below the lav), add a
-QA note recommending the user replace the audio track on that range
-with the paired `.wav` inside their NLE. Premiere / Resolve / FCPX
-all support per-clip audio source replacement; the user's
-preprocessed lav file is at `audio_alias_path` from
-`source_pairs.json`. Example QA note:
+gap was wide (camera mean conf < 0.6 or > 0.20 below the lav), add
+a QA note recommending the user replace the audio track on that
+range with the paired `.wav` in their NLE. Premiere / Resolve /
+FCPX all support per-clip audio source replacement; the user's
+preprocessed lav is at `audio_alias_path` from `source_pairs.json`.
+Example QA note:
 
 ```
 QA: SHOT_0042 [82.31 - 89.04] — camera audio is muddy
@@ -913,11 +913,11 @@ QA: SHOT_0042 [82.31 - 89.04] — camera audio is muddy
 
 Don't swap unilaterally — the EDL stays pointing at the video file,
 and you tell the user. They may have a specific reason to keep the
-camera audio (room tone match with the surrounding cuts, etc.).
+camera audio (room tone match with surrounding cuts, etc.).
 
 ### Anti-patterns specific to dual-mic
 
-- **Placing both members of a pair as separate cuts.** They are the
+- **Placing both members of a pair as separate cuts.** They're the
   same shot. If you find yourself emitting two ranges for `SHOT_0042`
   and `SHOT_0042.audio` covering overlapping wall-clock spans, you've
   treated the alias as a real source — go back, merge, pick one
@@ -938,7 +938,7 @@ camera audio (room tone match with the surrounding cuts, etc.).
 ## B-roll scout spawn protocol (when `b_roll_mode = true`)
 
 You may delegate the per-beat b-roll shortlisting work to a **b-roll
-scout sub-agent**. Scouts are sub-sub-agents — you spawn them, they
+scout sub-agent**. Scouts are sub-subagents — you spawn them, they
 return ranked candidate shortlists, you pick / verify / write the
 EDL ranges. The scout's operating manual is
 `references/subagent_broll_scout_rules.md`; it reads
@@ -951,10 +951,10 @@ scouts are worth it.
 
 ### When to spawn scouts
 
-Spawn a scout (or a batch of parallel scouts) when ANY of:
+Spawn a scout (or batch of parallel scouts) when ANY of:
 
 - **Library is large.** `>50` b-roll-eligible clips, or
-  `merged_timeline.md` was a strain on your read budget. Per-beat
+  `merged_timeline.md` strained your read budget. Per-beat
   re-scanning of `visual:` lines is wasteful at this size.
 - **`user_profile = professional`.** Top-candidate review on every
   named-subject beat is mandatory; offloading shortlisting to scouts
@@ -967,11 +967,11 @@ Spawn a scout (or a batch of parallel scouts) when ANY of:
   visual_timeline read can surface candidates you missed.
 
 For small libraries (`<= 30` clips) and `personal` / `creator` bar,
-do the work in-context; the spawn overhead isn't worth it.
+do the work in-context; spawn overhead isn't worth it.
 
 ### Spawning N scouts in parallel
 
-Per Hard Rule 10, when you spawn multiple scouts in one batch (e.g.
+Per Hard Rule 10, when spawning multiple scouts in one batch (e.g.
 one per beat), spawn them **in parallel** via the agent / Task
 tool, not sequentially. Total wall time approximates the slowest
 scout, not the sum.
@@ -979,7 +979,7 @@ scout, not the sum.
 ### Scout brief shape
 
 Build the scout brief with these sections (the scout's rules file
-documents the full input shape; this is your fill-in-the-blanks
+documents the full input shape; this is the fill-in-the-blanks
 template):
 
 ```
@@ -1049,15 +1049,15 @@ OUTPUT:
 - Tiny libraries (<= 5 clips) — read merged_timeline once, decide.
 - Pure talking-head with one A-roll source and 1-2 cutaways — same.
 - The user explicitly said "I want this fast, don't over-engineer
-  it" — note in your return that scouts were skipped per the
-  user's quote.
+  it" — note in your return that scouts were skipped per the user's
+  quote.
 
 ### Using scout returns
 
 When the scout returns:
 
 1. Read the scout's JSON shortlist + rationale.
-2. For each beat, pick the top-ranked candidate that passes YOUR
+2. For each beat, pick the top-ranked candidate passing YOUR
    verification (drill into `merged_timeline.md` around the
    candidate range; check there's no audio-event or speech
    conflict you care about).
@@ -1067,15 +1067,15 @@ When the scout returns:
    scout's `subject_visible_t_s`.
 5. Write the EDL range with a QA note in `reason` listing the
    scout's rejected alternatives (when `user_profile =
-   professional`) — that's the detailed-QA discipline.
+   professional`) — that's detailed-QA discipline.
 6. Note in your final return rationale that scouts were used and
-   how many; the parent will surface this to the user if they ask
+   how many; the parent surfaces this to the user if they ask
    how the cut was made.
 
 If a scout returns `BUDGET_EXHAUSTED`, narrow its in-scope source
-list (drop sources that are clearly out of category) and re-spawn.
-If it still exhausts, fall back to in-context scanning for that
-beat — scouts are an optimization, not a hard requirement.
+list (drop sources clearly out of category) and re-spawn. If it
+still exhausts, fall back to in-context scanning for that beat —
+scouts are an optimization, not a hard requirement.
 
 ---
 
@@ -1087,7 +1087,7 @@ beat — scouts are an optimization, not a hard requirement.
 > `speed != 1.0` — even if a stretch looks textbook timelapse-
 > shaped. The user opted out for a reason (often: "the b-roll IS
 > the visual track at 1x; don't compress it"). Skip this section
-> when the flag is false; do not invent retime decisions the user
+> when the flag is false; don't invent retime decisions the user
 > didn't authorize. If `source_tags.json` exists and a clip is
 > tagged `timelapse`, that clip is OBVIOUSLY pre-meant for retime —
 > but `timelapse_mode = false` still wins (the user might want the
@@ -1118,8 +1118,8 @@ Look for stretches in `merged_timeline.md` where BOTH are true:
 The real test is "does the viewer need to hear this?", not "is anyone
 talking?":
 
-- **Load-bearing speech** (instruction, explanation, narration that
-  carries the cut, the punchline that lands the beat): split AROUND
+- **Load-bearing speech** (instruction, explanation, narration
+  carrying the cut, the punchline landing the beat): split AROUND
   it. Emit a 1x range for the words, then a `speed > 1.0` range for
   the silent / no-words-that-matter middle, then another 1x range for
   whatever talks next.
@@ -1127,11 +1127,11 @@ talking?":
   narration of "okay ... there we go ... hmm"; 30 minutes of casual
   chatter while building that isn't actually teaching anything):
   squeeze right over it. With `audio_strategy="drop"` (the default at
-  `speed != 1.0`) the words vanish along with the room tone, the
-  visual story plays compressed, and the viewer thanks you.
+  `speed != 1.0`) the words vanish along with room tone, the visual
+  story plays compressed, and the viewer thanks you.
 
-When in doubt: lean toward squeezing over filler rather than splitting
-into a hundred tiny 1x ranges. The video is for the viewer.
+When in doubt: lean toward squeezing over filler vs splitting into a
+hundred tiny 1x ranges. The video is for the viewer.
 
 ### How to size the squeeze
 
@@ -1157,8 +1157,8 @@ Two values, picked automatically from `speed`:
   silenced over the squeezed range. Right answer for ~95% of timelapses
   — sustained shop noise / room tone sped up 5-10x sounds awful.
 - `audio_strategy = "keep"`: audio retimed alongside video. Use only
-  when there's a specific reason to keep source audio (recognisable
-  voice in the background, distinctive ambient texture). FCPXML / xmeml
+  with a specific reason to keep source audio (recognisable voice
+  in the background, distinctive ambient texture). FCPXML / xmeml
   output gets a matching retime; editor must toggle "Maintain Audio
   Pitch" in the NLE.
 
@@ -1167,20 +1167,20 @@ Two values, picked automatically from `speed`:
 - **Decide per-stretch: is the speech worth keeping?** Load-bearing
   earns a 1x split around it; filler gets squeezed over with `drop`.
 - **Cut FIRST, squeeze SECOND.** Apply the silence-removal pass first;
-  then identify surviving long stretches that fit the criteria; then
+  then identify surviving long stretches fitting the criteria; then
   squeeze. Squeezing dead air is just slower nothing.
 - **Word-boundary discipline still applies on adjacent 1x ranges**
   (Hard Rule 6 / 7). The squeezed range itself doesn't need word-
   boundary alignment when `audio_strategy="drop"`, but pad it
-  generously (~1-2s on each side of the activity).
+  generously (~1-2s each side of the activity).
 - **`speed` field is OPTIONAL and defaults to 1.0.** Untouched EDLs
   behave exactly as before. Only emit `speed` when actively squeezing.
 - **The retime key is `speed` — NOT `timelapse_speed`, NOT
   `clip_speed`, NOT `retime`.** Recurring agent footgun: beats named
   `*_TIMELAPSE` invite an autocomplete-style `"timelapse_speed": 8`
-  the exporter cannot recognise. The export pipeline does a defensive
-  textual rename of `timelapse_speed -> speed` before parsing, but do
-  NOT rely on it — write the canonical key the first time. The
+  the exporter can't recognise. The export pipeline does a defensive
+  textual rename of `timelapse_speed -> speed` before parsing, but
+  do NOT rely on it — write the canonical key first time. The
   `notes_for_editor` block at the end of the EDL is an especially
   common offender.
 
@@ -1207,13 +1207,13 @@ Two values, picked automatically from `speed`:
 
 J-cuts (`audio_lead`), L-cuts (`video_tail`), and cross-dissolves
 (`transition_in`) are deferred. Emit `audio_lead = video_tail =
-transition_in = 0.0` on EVERY range. Do not use J-cuts, L-cuts, or
+transition_in = 0.0` on EVERY range. Don't use J-cuts, L-cuts, or
 cross-dissolves under any circumstances.
 
 The EDL schema still accepts these fields and the FCPXML exporter
 still consumes them — but you must emit `0.0` for all three. The
 30ms `afade` pair at every boundary (Hard Rule 3) is the only audio
-crossfade available right now and is sufficient to suppress boundary
+crossfade available right now and suffices to suppress boundary
 pops.
 
 If the user explicitly asks for J/L cuts or dissolves: note it in
@@ -1271,9 +1271,9 @@ points at an SRT the parent emits via `helpers/build_srt.py`.
 are OPTIONAL and only appear on time-squeezed ranges.
 
 `preferred_transcript` and `preferred_transcript_reason` are OPTIONAL
-on unpaired shots and **REQUIRED on paired shots** (those whose
-`source` stem appears in `<edit>/source_pairs.json` with
-`mode = dual_mic`). Schema:
+on unpaired shots and **REQUIRED on paired shots** (whose `source`
+stem appears in `<edit>/source_pairs.json` with `mode = dual_mic`).
+Schema:
 
 ```json
 {"source": "SHOT_0042", "start": 82.31, "end": 89.04,
@@ -1290,8 +1290,8 @@ trusted so the user-facing summary can recommend an in-NLE audio
 swap when the camera audio was the loser. See "Dual-mic pair
 handling" above for the decision rules.
 
-There is **no `grade` field** — color is out of scope. The skill
-emits XML for the NLE; the colorist applies the grade there.
+**No `grade` field** — color is out of scope. The skill emits XML
+for the NLE; the colorist applies the grade there.
 
 ---
 
@@ -1306,10 +1306,10 @@ Return:
    `PROBLEM [C0108 14.30-28.90] only take without false start`
 3. **Compromises** — any beat where you had to keep a verbal slip or
    compromise on take selection because no better option existed.
-   Note explicitly so the parent can flag to the user.
+   Note explicitly so the parent can flag it to the user.
 
 The parent will translate this into plain English for the user. Be
-factual, be terse on the report, but be thorough on the EDL itself.
+factual, be terse on the report, but thorough on the EDL itself.
 
 ---
 
@@ -1328,8 +1328,8 @@ factual, be terse on the report, but be thorough on the EDL itself.
   Hard Rule 14.
 - **Using a synonym for `speed`** (`timelapse_speed`, `clip_speed`,
   `retime`). The exporter only knows `speed`.
-- **Squeezing pure dead air** instead of cutting it. Time-squeezing
-  is for visually continuous activity, not for empty rooms.
+- **Squeezing pure dead air** vs cutting it. Time-squeezing is for
+  visually continuous activity, not for empty rooms.
 - **Picking `speed` so the squeezed result lands < 5s or > 30s.**
   Re-pick to land in the sweet spot, OR split into multiple squeezes
   with beats between, OR cut some of it.
@@ -1354,7 +1354,7 @@ factual, be terse on the report, but be thorough on the EDL itself.
   Cut the stretch or keep 1x; never retime without permission.
 - **Spawning b-roll scouts sequentially.** When you spawn N
   scouts, spawn them in parallel (Hard Rule 10). Sequential
-  spawning forfeits the parallelism that makes scouts worthwhile.
+  spawning forfeits the parallelism making scouts worthwhile.
 - **Trusting a scout's top candidate without verification.** The
   scout shortlists; you decide. Verification (drilling
   `merged_timeline.md` around the candidate range) still binds.
@@ -1384,9 +1384,9 @@ factual, be terse on the report, but be thorough on the EDL itself.
   restart.** A standalone *"fuck"* may be content, not retake
   noise. Look both ways before cutting.
 - **Cross-clip retake decisions without temporal evidence.** Two
-  clips containing similar speech might be different scenes
-  entirely. Confirm via stem ordering / recording metadata /
-  explicit user quote before excluding a whole clip as rejected.
+  clips with similar speech might be different scenes entirely.
+  Confirm via stem ordering / recording metadata / explicit user
+  quote before excluding a whole clip as rejected.
 - **Failing to surface retake decisions in the return rationale.**
   The user wants to know which take landed and why; the
   `Retake decisions` block is mandatory whenever a retake call
@@ -1402,9 +1402,9 @@ factual, be terse on the report, but be thorough on the EDL itself.
   always point at the video stem.
 - **Omitting `preferred_transcript` on paired shots.** Required on
   every range whose source stem appears in `source_pairs.json` with
-  `mode = dual_mic`. Without it the parent cannot tell the user
+  `mode = dual_mic`. Without it the parent can't tell the user
   which mic landed in the cut, and the recommendation to swap audio
   in their NLE never reaches them.
 - **Picking the dual-mic transcript by vibes / length.** Use the
   windowed mean per-word confidence first; lean on the lav as
-  tie-breaker. Length is not a quality signal.
+  tie-breaker. Length isn't a quality signal.

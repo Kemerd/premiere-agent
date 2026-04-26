@@ -1,16 +1,16 @@
 # B-roll selection — rules + optimized matching
 
-> Cold-path feature. Loaded on demand by the **editor sub-agent** when
-> the parent's brief says `b_roll_mode = true` (the user confirmed
-> there's b-roll / cutaway material in the project — either as a
-> dedicated library on a scripted assembly, or as cutaways layered on
-> top of a single talking-head A-roll). The parent gates this in step
+> Cold-path. The **editor sub-agent** loads it when
+> the brief says `b_roll_mode = true` (user confirmed
+> b-roll / cutaway material exists — either as a
+> dedicated library for scripted assembly, or cutaways over
+> a single talking-head A-roll). The parent gates this in step
 > 4 of the 9-step process — see `parent_rules.md`. If the project is
 > single-source dialogue with no cutaways, this file is **not** in
 > scope and the editor never reads it.
 >
-> Read this file in full once you're spawned with `b_roll_mode = true`.
-> The selection rules bind every cutaway choice; the matching
+> Read in full when spawned with `b_roll_mode = true`.
+> Selection rules bind every cutaway choice; the matching
 > philosophy (caching / two-stage / index-first) bind how you spend
 > your time.
 
@@ -18,22 +18,22 @@
 
 ## What "b-roll" means in this skill
 
-Two flavours, and the rules in this file apply to both:
+Two flavours; rules here apply to both:
 
 1. **Scripted assembly** — many b-roll clips assembled under a
-   continuous voiceover bed. Every visible range comes from a
-   different source than the audio. See `scripted.md` for the
-   assembly procedure; the rules below decide *which clip* to pick
+   continuous voiceover bed. Every visible range is from a
+   different source than the audio. See `scripted.md` for
+   the procedure; rules below decide *which clip* to pick
    per beat.
 2. **Cutaway b-roll on talking-head A-roll** — a primary source
    (interview / explainer / vlog) carries the audio, and short
-   cutaway ranges from secondary sources hide behind the speaker on
-   a higher video track in the NLE. The audio underneath stays from
-   the A-roll. The cutaway might be 2-6 seconds; the A-roll might
-   run continuously underneath in the NLE.
+   cutaway ranges from secondary sources hide behind speaker on
+   a higher video track. The audio underneath stays from
+   the A-roll. Cutaways might be 2-6 seconds; the A-roll might
+   run continuously underneath.
 
-In both cases you're picking a clip whose visual content reinforces
-what the audio says is happening. The selection rules don't care
+Either way, pick a clip whose visual content reinforces
+what the audio says. The selection rules don't care
 which flavour you're in.
 
 ---
@@ -42,13 +42,13 @@ which flavour you're in.
 
 **The visible thing on screen must match what the audio names.**
 
-If the audio says "Riot Games booth," the b-roll shows a Riot Games
+If the audio says "Riot Games booth," b-roll shows a Riot Games
 booth. Not a generic gaming-event crowd. Not a different company's
-booth. Not the Riot Games booth from a fast pan-by where the logo is
+booth. Not the Riot booth from a fast pan-by where the logo is
 half-visible for 8 frames. A Riot Games booth, clearly visible,
-stable, for at least the duration of the named-subject phrase.
+stable, for at least the named-subject phrase's duration.
 
-Everything else in this file is the procedure for *reliably*
+Everything else here is the procedure for *reliably*
 satisfying that rule.
 
 ---
@@ -80,8 +80,8 @@ candidates by **what's actually visible**, in this preference order:
    beats. The actual stage with the named match / panel / talk on
    it.
 6. **People-heavy shots (crowd, walkby, talking-head, attendees)** —
-   **lowest** priority for named-subject beats. People shots are
-   appropriate when the script is *about* the people (audience,
+   **lowest** priority for named-subject beats. People shots fit
+   when the script is *about* the people (audience,
    crowd reaction, attendees), not when it's about the named
    product / brand / venue.
 
@@ -91,16 +91,16 @@ the default for named-subject beats is "show the named subject."
 
 ## Rejection rules — drop the candidate, no exceptions
 
-A candidate is **rejected** (drop and pick the next one in the
-shortlist) if any of the following are true:
+A candidate is **rejected** (drop and pick next in the
+shortlist) if any of these are true:
 
 - **Visual captions contradict the script beat.** The
   `merged_timeline.md` `visual:` line for the candidate range says
   one thing, the script says another, and they're not the same
   subject. Older filenames or path-based hints don't override the
-  caption — Florence-2 saw what's there; trust it. Example: the file
-  is named `c1_riot_setup.mp4` but the captions say *"AMD signage
-  visible"* — that's an AMD shot, reject it for a Riot beat.
+  caption — Florence-2 saw what's there; trust it. Example: file
+  is named `c1_riot_setup.mp4` but captions say *"AMD signage
+  visible"* — that's an AMD shot, reject for a Riot beat.
 - **The named subject is named-but-not-visible.** Captions say
   *"distant booths in the background"* — the Riot booth might be
   one of those distant booths but you can't tell. Reject; find a
@@ -115,7 +115,7 @@ shortlist) if any of the following are true:
 
 ## Stability bias — prefer steady shots
 
-For the same level of subject match, **prefer stable / static /
+At the same subject-match level, **prefer stable / static /
 smooth source ranges over shaky handheld walking-and-talking
 b-roll.** Reasons:
 
@@ -133,46 +133,46 @@ Practical signals from the visual lane:
 - Captions that mention motion words explicitly (*"walking past"*,
   *"camera moving"*, *"panning across"*) → motion shot. De-prioritise.
 - Captions that change every frame on the candidate range with no
-  `(same)` collapses → camera is moving fast or the scene is
+  `(same)` collapses → camera moving fast or scene is
   chaotic. De-prioritise unless the chaos IS the beat.
 
 If only motion shots exist for a beat (no stable alternative in the
 shortlist), use the motion shot but prefer the **smoothest** one —
 look for runs where consecutive captions describe the same subject
-with mild variation rather than completely different things on each
+with mild variation vs completely different things on each
 frame.
 
 If the parent's brief mentions a `<edit>/clip_index/index.json` with
 stability scores attached (an optional optimization — see "Optimized
-matching" below), use those scores as a tiebreaker; otherwise reason
+matching" below), use them as a tiebreaker; otherwise reason
 from the captions.
 
 ## Diversification — don't repeat distinctive visuals
 
-When a single distinctive visual appears more than once in the
+When one distinctive visual appears more than once in the
 output (same cosplay character, same distinctive booth, same
 distinctive person, same memorable hand gesture), **diversify by
 default**: pick the second-best candidate that shows a different
-visual instead. Reasons:
+visual. Reasons:
 
-- The viewer notices repeats. A repeated cosplay shot 30 seconds
+- Viewers notice repeats. A repeated cosplay shot 30 seconds
   apart reads as "the editor only had one of these."
-- B-roll variety is a quality signal that the user doesn't usually
+- B-roll variety is a quality signal the user doesn't usually
   articulate but always notices.
 
 Exception: when the user explicitly asks for the repeat (a callback,
-a montage that returns to the same character, a recurring motif),
+a montage returning to the same character, a recurring motif),
 keep it. Note in the `reason` field that the repeat is intentional
 and quote the user's request.
 
-The diversification rule binds within roughly a 30-second window of
-the output timeline. Same clip 3 minutes apart in a 7-minute video
+The diversification rule binds within ~30s of the
+output timeline. Same clip 3 minutes apart in a 7-minute video
 is fine.
 
 ## Specific-mention fallback
 
 When the script names a *specific* game / product / character / venue
-that doesn't appear in any candidate's visual captions:
+not present in any candidate's visual captions:
 
 1. Use the **closest visually verifiable** alternative — gameplay
    from the same game series, a different angle on the same product
@@ -197,9 +197,9 @@ exists.
 
 The skill is built around caching: lane outputs (`transcripts/`,
 `visual_caps/`, `audio_tags/`) are immutable products of immutable
-inputs and are reused across sessions. B-roll matching gets cheaper
-the longer a clip library has been processed; the rules below
-describe how to spend that saved time on quality, not lower
+inputs and reused across sessions. B-roll matching gets cheaper
+the longer a clip library has been processed; rules below
+describe how to spend the saved time on quality, not lower
 standards.
 
 ### 1. Build the index once per library, search the index per beat
@@ -227,8 +227,8 @@ The reusable model:
 - **(Optional) clip index** is a parent-managed helper that walks
   `transcripts/` + `visual_caps/` and builds a per-clip
   searchable record. The editor doesn't build it; the parent runs
-  the helper and (if available) mentions the path in the brief.
-  Without an index, you scan `merged_timeline.md` per beat — slower
+  the helper and (if available) names the path in the brief.
+  Without an index, scan `merged_timeline.md` per beat — slower
   but correct.
 
 If the parent's brief says `clip_index_available = true` and points
@@ -240,8 +240,8 @@ binds before any beat-level matching.
 
 For large libraries (`>50` b-roll-eligible clips) OR `user_profile
 = professional` with many named-subject beats OR ambiguous beats
-where the merged view didn't decide it: delegate per-beat
-shortlisting to **b-roll scout sub-agents** per
+where the merged view didn't decide: delegate per-beat
+shortlisting to **b-roll scout subagents** per
 `subagent_editor_rules.md` "B-roll scout spawn protocol". Spawn N
 scouts in parallel (Hard Rule 10), one per beat or one per
 cluster, pass them the in-scope source list from
@@ -249,7 +249,7 @@ cluster, pass them the in-scope source list from
 
 Scouts read `<edit>/visual_timeline.md` in their own fresh context
 window for the in-scope sources only — they don't re-read your
-merged_timeline. Their job is shortlisting; your job is
+merged_timeline. Their job is shortlisting; yours is
 verification + selection + EDL writing. See
 `references/subagent_broll_scout_rules.md` for what scouts do.
 
@@ -279,8 +279,8 @@ single most common scripted-b-roll quality regression.
 
 For high-stakes work (professional / client deliverables, branded
 content, named-subject beats with sponsor implications), spend the
-extra time **reviewing the top 2-3 candidates explicitly** rather
-than accepting the first verified hit. Compare:
+extra time **reviewing the top 2-3 candidates explicitly** vs
+accepting the first verified hit. Compare:
 
 - Which candidate has the longest stable visual evidence?
 - Which lands cleanest at the boundaries (no continuity break against
@@ -289,19 +289,19 @@ than accepting the first verified hit. Compare:
 
 Note the comparison in the `reason` field. The user (especially in
 professional / company / client contexts — see `parent_rules.md`'s
-`user_profile` field) will read those notes as confidence.
+`user_profile` field) reads those notes as confidence.
 
 ### 4. Cache discipline
 
 - **Don't pass `--force` reflexively.** The orchestrator caches
   lanes per source mtime — re-running with `--force` discards
   evidence the index relies on for shortlisting and re-burns GPU
-  time on unchanged media. Pass `--force` only when the source file,
+  time on unchanged media. Pass `--force` only when source file,
   model settings, dependencies, or matching rules changed.
 - **Rebuild the index only when clip-set / captions / inventory /
   matching rules change.** Index rebuild is parent-managed; flag it
-  in the return rationale if your matching uncovered new clips that
-  weren't in the index.
+  in the return rationale if your matching uncovered new clips not
+  in the index.
 - **Network / OneDrive paths:** if the parent has the project on a
   synced volume, local scratch / cache may be used for speed, but
   final deliverables and editable timelines are copied back to the
@@ -322,14 +322,14 @@ cached?
 ## How `timelapse_mode` interacts with b-roll selection
 
 The parent's brief carries `timelapse_mode`. It binds the
-time-squeezing section in `subagent_editor_rules.md`, but it also
+time-squeezing section in `subagent_editor_rules.md`, but also
 shapes b-roll selection in two ways:
 
 - **`timelapse_mode = false` (default).** Any visually-continuous
   long-stretch clip in the b-roll library — workshop builds,
   packing montages, walking shots — is treated as 1x source
   material. You **may** select short ranges from those clips (a
-  4-second cut from a 10-minute build sequence is fine) but you
+  4-second cut from a 10-minute build sequence is fine) but
   **may not** retime any range. If the only candidate for a beat
   is a long stretch that would only "work" as a timelapse, drop
   the beat or pick a different shorter clip; do not retime to fit.
@@ -373,7 +373,7 @@ QA / verification dial.
 - The **assembly procedure** (script + voiceover, beat segmentation,
   vo-anchored timing, source in-points on spoken words) lives in
   `references/scripted.md`. If the parent set both `script_mode =
-  true` and `b_roll_mode = true`, read both files. (This is the
+  true` and `b_roll_mode = true`, read both files. (The
   common combo.)
 - The **pacing preset** binds every range edge — word-boundary
   discipline (Hard Rule 6), 30-200ms padding window (Hard Rule 7),
@@ -388,10 +388,10 @@ QA / verification dial.
 
 ## Anti-patterns specific to b-roll selection
 
-- **Picking by filename / path / metadata instead of visual
+- **Picking by filename / path / metadata vs visual
   captions.** Florence-2 saw what's there; the filename was a guess.
 - **Accepting the first index hit without verifying.** Two-stage
-  matching is the rule. The shortlist suggests; verification decides.
+  matching is the rule. Shortlist suggests; verification decides.
 - **Ignoring stability differences when several candidates match.**
   Same subject + steadier shot wins.
 - **Repeating distinctive visuals within a 30-second window.**
@@ -414,7 +414,7 @@ QA / verification dial.
   this session. Pick a different clip or shorter range; never
   silently retime.
 - **Skipping the b-roll scout protocol on a 100-clip professional
-  brief.** That's where scouts pay off most. The verification +
+  brief.** That's where scouts pay off most. Verification +
   detailed QA notes the professional bar requires are easier to
   write when scouts have done the shortlisting in their own
   fresh-context windows.

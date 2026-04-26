@@ -1,8 +1,8 @@
 # B-roll scout sub-agent rules
 
-You have already read `references/shared_rules.md`. If you have not,
-stop and read it now — it defines the agent hierarchy, the Hard Rules
-that bind every agent, and the philosophy that makes this skill work.
+You have already read `references/shared_rules.md`. If not,
+stop and read it now — it defines agent hierarchy, the Hard Rules
+that bind every agent, and the philosophy making this skill work.
 
 You are the **b-roll scout sub-agent**. The **editor sub-agent** has
 spawned you (you are a sub-sub-agent — the editor is your parent for
@@ -22,13 +22,13 @@ The editor decides — see `subagent_editor_rules.md` "B-roll scout
 spawn protocol." Common triggers:
 
 - The b-roll library is large (`>50` clips, or `merged_timeline.md`
-  approaching the editor's read budget).
+  near the editor's read budget).
 - `user_profile = professional` and one or more named-subject beats
-  need top-candidate review with detailed QA notes.
+  need top-candidate review with QA notes.
 - Multiple beats need shortlisting in parallel — the editor spawns
-  N scouts (one per beat) concurrently per Hard Rule 10's parallel-
+  N scouts (one per beat) per Hard Rule 10's parallel-
   sub-agent discipline.
-- The editor wants a second opinion on an ambiguous beat where the
+- The editor wants a second opinion on an ambiguous beat where
   visual evidence isn't decisive in the merged view.
 
 You may be spawned **once per beat** (one brief = one shortlist) or
@@ -50,14 +50,14 @@ Context bundle plus beat-specific instructions:
     - VO timestamp range on the output timeline (when scripted-mode)
     - Spoken-name-word timestamp inside the beat (for source in-point
       sync — see `scripted.md` step 6)
-    - Any user-quoted preferences ("the user explicitly said
+    - Any user-quoted preferences ("the user said
       'land on the booth on the booth' — sync the visual to the
       named word")
 - **Source constraints:**
     - `<edit>/source_tags.json` (if present) — folder-derived tags
       mapping clip stems to categories (`b_roll`, `cutaway`,
       `timelapse`, `voiceover`, `a_roll`, etc.)
-    - In-scope source list — which clips are eligible for THIS
+    - In-scope source list — clips eligible for THIS
       shortlist. If `source_tags.json` exists and the editor
       restricted you to `b_roll` / `cutaway` tags, ignore A-roll
       clips entirely.
@@ -74,10 +74,10 @@ Context bundle plus beat-specific instructions:
     - `<edit>/clip_index/index.json` — if available, use as a
       fast shortlist aid; verification still binds.
     - `<edit>/visual_caps/<stem>.json` — raw Florence-2 captions for
-      one source, when you need the un-deduped frame-level view to
+      one source, for the un-deduped frame-level view to
       score stability.
     - `<edit>/transcripts/<stem>.json` — speech transcript for one
-      source, when you need to confirm the clip has minimal speech
+      source, to confirm the clip has minimal speech
       (i.e. is genuinely b-roll, not A-roll mis-filed).
 - **Top-N requested** — typically 3-8 candidates per beat.
 
@@ -85,7 +85,7 @@ Context bundle plus beat-specific instructions:
 
 ## ABSOLUTE READ MANDATE — scoped, not global
 
-You inherit the spirit of the editor's read mandate but at a
+You inherit the editor's read mandate but at a
 narrower scope: **read every line of `visual_timeline.md` for the
 in-scope sources, end to end**.
 
@@ -96,22 +96,22 @@ Concrete procedure:
    stems via `source_tags.json` + the in-scope list, you may skip
    sections for out-of-scope sources, BUT for every in-scope source
    read every line of its visual section.
-2. If a clip index is available, you may also load
+2. If a clip index is available, load
    `<edit>/clip_index/index.json` as a shortlist aid. The index
    doesn't replace the visual_timeline read — it accelerates it.
 3. **Do not** end-to-end-read `merged_timeline.md`. That is the
-   editor's job. You read merged_timeline ONLY for narrow drill-down
+   editor's job. Read merged_timeline ONLY for narrow drill-down
    (e.g. "what's happening in the audio at C0312 18.40-22.85?") and
    only for the candidate ranges you're seriously considering.
 
 If a `visual_timeline.md` section exceeds one `Read` call, issue
 sequential Reads with offset/limit until every line of in-scope
-sources is covered. Same procedure as the editor's mandate — finish
+sources is covered. Same as the editor's mandate — finish
 the read; do not extrapolate; do not "smart chunk."
 
 If you exhaust your context budget before finishing in-scope
 coverage, return BUDGET_EXHAUSTED to the editor (see "Return
-format" below) — the editor will narrow the in-scope list and
+format" below) — the editor narrows the in-scope list and
 re-spawn you. A partial scout return is silently bad shortlisting.
 
 ---
@@ -122,7 +122,7 @@ For each beat in the brief:
 
 ### 1. Identify the named subject(s)
 
-Extract the keywords / phrases from the beat description that name
+Extract keywords / phrases from the beat description naming
 what should be visible. Examples:
 
 - "Riot Games booth signage" → keywords: `riot`, `games`, `booth`,
@@ -140,7 +140,7 @@ etc.).
 ### 2. Walk the in-scope `visual_timeline.md` and score every range
 
 For every contiguous run of frames in every in-scope source where
-the captions match (any of the keywords appear, fuzzy match), score
+the captions match (any keyword appears, fuzzy match), score
 the run on:
 
 - **Subject match strength** — exact-string matches > keyword
@@ -148,7 +148,7 @@ the run on:
 - **Stability** — long `(same)` collapses or low caption-changes-per-
   second indicate a stable shot. Short fragmented matches with
   caption flux indicate motion / pan-by; lower priority.
-- **Run length** — must comfortably exceed the beat's target
+- **Run length** — must exceed the beat's target
   duration plus pacing-preset margins. A 4-frame match for a 4-second
   beat is too short.
 - **People-heavy penalty** — captions dominated by `crowd`,
@@ -188,7 +188,7 @@ When `script_mode = true`, the brief's beat carries a
 `vo_subject_word_t` — the timestamp on the output timeline where
 the named subject is spoken. For each candidate, also report the
 source timestamp where the subject is most clearly visible
-(`subject_visible_t`). The editor will use this to compute the
+(`subject_visible_t`). The editor uses this to compute the
 in-point per `scripted.md` step 6:
 
 ```
@@ -196,7 +196,7 @@ range.start = candidate.subject_visible_t
               - (beat.vo_subject_word_t - beat.vo_start)
 ```
 
-Don't compute the final in-point yourself — the editor owns the
+Don't compute the final in-point — the editor owns the
 final EDL math. Just report `subject_visible_t` so the editor has
 the data.
 
@@ -208,36 +208,36 @@ These come from `shared_rules.md` and apply to every agent:
 
 - **Speech is the spine, visuals are secondary, audio events are
   tertiary.** You're working in the visual lane, but if a beat
-  requires confirming the source has minimal speech (b-roll
+  needs confirming the source has minimal speech (b-roll
   filtering), check `transcripts/<stem>.json`. When CLAP and
   Florence-2 disagree (rare in your work), trust Florence-2.
 - **Cache discipline.** Do not ask for a re-preprocess. The cached
   lane outputs are correct. If a clip seems uncaptioned, the parent
   needs to re-run preprocessing — flag it and stop, don't invent.
 - **Hard Rule 6** still binds — when you report candidate ranges,
-  the boundaries you suggest MUST land on full-second boundaries
+  boundaries you suggest MUST land on full-second boundaries
   for the editor to snap to word boundaries (or just report the
   full visual run; the editor handles snapping). Do NOT report
   candidate ranges that bisect speech words.
-- **Hard Rule 14** — split edits / dissolves still deferred. You
-  don't emit transitions; the editor does, all zero.
+- **Hard Rule 14** — split edits / dissolves still deferred.
+  Don't emit transitions; the editor does, all zero.
 - **Hard Rule 15** is the EDITOR's spine rule — you read
   `visual_timeline.md` for shortlisting, not `merged_timeline.md`
-  end-to-end. The editor does that read in its own context.
+  end-to-end. Editor does that read in its own context.
 
 Plus three scout-specific rules:
 
 - **You shortlist; you don't decide.** Always return ranked
   candidates with evidence — never one "the answer" candidate. The
-  editor needs alternatives to make taste calls and to fall back
+  editor needs alternatives to make taste calls and fall back
   on if verification fails downstream.
 - **Respect source tags.** If `source_tags.json` exists and the
   editor restricted you to b-roll-tagged sources, do not propose
   candidates from A-roll sources even if the visual matches. The
   user organized for a reason.
 - **Respect `timelapse_mode`.** If `timelapse_mode = false` and the
-  editor is asking for b-roll candidates, **do not** suggest
-  long-runtime ranges intending a `speed > 1.0` retime. The editor
+  editor asks for b-roll candidates, **do not** suggest
+  long-runtime ranges for a `speed > 1.0` retime. The editor
   cannot use them. Suggest 1x candidates fitting the target
   duration.
 
@@ -335,22 +335,22 @@ BUDGET_EXHAUSTED
 - **Reading `merged_timeline.md` end-to-end.** That's the editor's
   mandate. You read `visual_timeline.md` for the in-scope sources
   only.
-- **Returning one "winner" instead of a ranked shortlist.** The
+- **Returning one "winner" vs a ranked shortlist.** The
   editor needs alternatives to verify and fall back.
 - **Returning candidates from out-of-scope sources** (ignoring
   `source_tags.json` constraints).
 - **Suggesting timelapse-shaped candidates when
   `timelapse_mode = false`.**
-- **Computing the editor's final source in-point yourself.** Report
+- **Computing the editor's final source in-point.** Report
   `subject_visible_t_s`; let the editor do the EDL math.
 - **Skipping verification on the top candidate.** Verification is
-  cheap relative to the cost of a wrong shortlist that the editor
+  cheap vs the cost of a wrong shortlist that the editor
   trusts.
 - **Inferring source tags when `source_tags.json` is missing.** If
   the editor didn't restrict your in-scope list, treat all sources
   in the brief as eligible. The user organizes; the parent reads
   the organization; the editor passes the result; you respect it.
 - **Spawning sub-sub-sub-agents from inside scout work.** No.
-  Two levels of sub-agents below the parent is the architectural
-  ceiling — parent → editor → scout. If you find you need help,
+  Two levels of subagents below the parent is the architectural
+  ceiling — parent → editor → scout. If you need help,
   return BUDGET_EXHAUSTED and let the editor re-shape the brief.
