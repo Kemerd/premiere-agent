@@ -141,37 +141,55 @@ except Exception:
 # `--start 3.12 --end 4.04` after a previous round-trip.
 # ──────────────────────────────────────────────────────────────────────
 
-# Regex covers H:MM:SS, M:SS, SS (with optional fractional part). We
-# anchor with `^...$` so partial matches don't silently succeed —
-# garbage input must error out, not return zero seconds.
-_TIME_RE = re.compile(
-    r"""
-    ^\s*
-    (?:(?P<h>\d+):)?           # optional hours
-    (?:(?P<m>\d+):)?           # optional minutes
-    (?P<s>\d+(?:\.\d+)?)       # mandatory seconds (int or float)
-    \s*$
-    """,
-    re.VERBOSE,
-)
+# Single-component validator — every colon-separated piece must be a
+# non-negative number, with optional fractional part on the seconds
+# slot only. The components are normalised to a uniform H:MM:SS
+# triple before parsing, so this regex fires three times max.
+_TIME_PIECE = re.compile(r"^\d+(?:\.\d+)?$")
 
 
 def _parse_time(value: str) -> float:
-    """Parse `H:MM:SS` / `M:SS` / `SS(.fff)` into float seconds.
+    """Parse `H:MM:SS` / `MM:SS` / `SS(.fff)` into float seconds.
+
+    Strategy: pad-left with `"00"` chunks until the input has three
+    colon-separated components, then read them as hours, minutes,
+    seconds. This makes the rightmost piece ALWAYS seconds (and the
+    speech_timeline.md `M:SS` convention falls out for free):
+
+        "32"       -> "00:00:32"  -> 32.0s
+        "2:32"     -> "00:02:32"  -> 152.0s
+        "1:23:45"  -> "01:23:45"  -> 5025.0s
+        "2:32.5"   -> "00:02:32.5" -> 152.5s
 
     Raises ValueError on garbage so argparse surfaces the bad token
     rather than silently zeroing it.
     """
-    m = _TIME_RE.match(value)
-    if not m:
+    raw = value.strip()
+    if not raw:
         raise ValueError(f"unrecognised time format: {value!r}")
 
-    # The regex's `h:m:s` slots are positional — when only one colon
-    # is present, the value lands in `m` (minutes) and `h` is None,
-    # which matches the M:SS convention used in speech_timeline.md.
-    h = int(m.group("h")) if m.group("h") else 0
-    minutes = int(m.group("m")) if m.group("m") else 0
-    s = float(m.group("s"))
+    # Pad-left with "00" placeholders until we hit the canonical
+    # three-piece H:MM:SS shape. Anything beyond three colons is
+    # malformed input and trips the explicit error below.
+    pieces = raw.split(":")
+    if len(pieces) > 3:
+        raise ValueError(f"unrecognised time format: {value!r}")
+    while len(pieces) < 3:
+        pieces.insert(0, "00")
+
+    # Validate every component is a clean number (the seconds slot
+    # may carry a fractional tail; hours / minutes integer-only).
+    # Any failure here is bad input — surface it.
+    if not all(_TIME_PIECE.match(p) for p in pieces):
+        raise ValueError(f"unrecognised time format: {value!r}")
+    if "." in pieces[0] or "." in pieces[1]:
+        raise ValueError(
+            f"hours and minutes must be integers in {value!r}"
+        )
+
+    h = int(pieces[0])
+    minutes = int(pieces[1])
+    s = float(pieces[2])
     return h * 3600.0 + minutes * 60.0 + s
 
 
