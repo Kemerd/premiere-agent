@@ -238,13 +238,28 @@ the same brief and an angry parent.
      trust visual.
 
 2. **Drill into per-lane files only when the merged view is
-   ambiguous.** Use `<edit>/speech_timeline.md` for word-level timing
-   detail beyond merged phrase grouping; `<edit>/visual_timeline.md`
-   for the full 1fps caption stream including `(same)` repeats;
-   `<edit>/audio_timeline.md` for per-window CLAP scoring detail. The
-   per-lane files are also bound by the ABSOLUTE READ MANDATE if you
-   open them — drill into a SPECIFIC moment, but read surrounding
-   context fully, not a one-line snippet.
+   ambiguous.** Use `<edit>/speech_timeline.md` for **phrase-level**
+   start/end ranges (the merged view shows phrase START only; this
+   file shows the matching END so you can scope a phrase span);
+   `<edit>/visual_timeline.md` for the full 1fps caption stream
+   including `(same)` repeats; `<edit>/audio_timeline.md` for
+   per-window CLAP scoring detail. The per-lane files are also
+   bound by the ABSOLUTE READ MANDATE if you open them — drill
+   into a SPECIFIC moment, but read surrounding context fully,
+   not a one-line snippet.
+
+   **Per-word timestamps live ONLY in `<edit>/transcripts/<stem>.json`**
+   (raw Parakeet `words[]` array with `{text, start, end}` per token).
+   Neither merged nor speech_timeline carry word boundaries — phrase
+   grouping in those files concatenates words for readability and
+   drops the per-token times. When you need to verify a cut at a
+   specific word (which is every cut — see "Word-boundary
+   verification" below), `transcripts/<stem>.json` is the canonical
+   source. The shared_rules anti-pattern about reading transcripts
+   directly is for general timeline SCANNING (use the markdowns —
+   they're 1/10 the tokens); at cut-verification time you read
+   transcripts surgically for the words that bracket your candidate
+   cut, not the whole file.
 
 3. **If `merged_timeline.md` is missing**, STOP and report — the
    parent must re-run `python helpers/pack_timelines.py --edit-dir
@@ -291,6 +306,300 @@ The bundle includes:
 
 ---
 
+## Word-boundary verification — every cut, every spawn
+
+This is the rule that prevents the mid-sentence / mid-word cuts the
+user has been catching. Hard Rule 6 says "never cut inside a word";
+this section is the procedure that enforces it. **No EDL range gets
+emitted until both `start` and `end` have been verified against the
+WORD-level timestamps in `<edit>/transcripts/<stem>.json`.**
+
+The merged view exists for beat planning, not for setting cut times.
+Phrase START times shown in `merged_timeline.md` are rounded to whole
+seconds and carry no information about where the speaker actually
+stopped. Snapping a cut to a merged-view timestamp is guessing; the
+underlying Parakeet word boundaries are sub-second precise and live
+in `transcripts/<stem>.json`. Use them.
+
+### What each file actually carries
+
+| File                            | Granularity      | Use for cuts? |
+|---------------------------------|------------------|---------------|
+| `merged_timeline.md`            | phrase START only, rounded to whole seconds | NO — beat planning only |
+| `speech_timeline.md`            | phrase START-END range, whole seconds       | NO — phrase-span scoping only |
+| `transcripts/<stem>.json`       | per-word `{text, start, end}` sub-second    | **YES — canonical source for every cut anchor** |
+
+### Verification workflow (run on every range you write)
+
+For each candidate range you decide on while reading the merged view:
+
+1. **Identify the words you want to keep.** From the phrase quoted in
+   the merged line, pick the first and last word the kept range
+   should contain — e.g. *"Geared to lock in the uplock hook"* with
+   the user wanting to keep through *"lock in"* gives
+   `first_word = "Geared"`, `last_word = "in"`.
+
+2. **Open `<edit>/transcripts/<S>.json`.** The JSON has a top-level
+   `words` array; entries with `type == "word"` carry the per-token
+   timestamps you need. Walk forward from somewhere near the merged
+   timestamp (which is in seconds) until you find the matching
+   `first_word` / `last_word` instances. Match on `text` (case-
+   insensitive, punctuation-stripped); when a word repeats in the
+   phrase, the merged timestamp tells you which instance.
+
+3. **Snap the cut anchors to actual word boundaries.**
+   - In-point: `kept_first_word.start`
+   - Out-point: `kept_last_word.end`
+   - Never let the cut land between a word's `start` and `end`.
+
+4. **Apply pacing-preset margins** (per the formula in "Pacing
+   preset application algorithm"):
+
+   ```
+   range.start = max(0, kept_first_word.start - lead_margin / 1000)
+   range.end   = min(src_duration, kept_last_word.end + trail_margin / 1000)
+   ```
+
+5. **Clamp adjacent same-source ranges** with the combined-pad rule
+   so the trail_margin of range N + the lead_margin of range N+1
+   don't re-introduce the silence you removed (and leave at least
+   60ms of true silence for the 30ms `afade` pair on each side).
+
+### Worked example — "cut after 'lock in'"
+
+Phrase visible in merged: `0:03 "Geared to lock in the uplock hook."`
+Editor goal: keep through *"lock in"*, drop the rest.
+
+`transcripts/<S>.json` (relevant slice):
+
+```json
+{"type": "word", "text": "Geared", "start": 3.12, "end": 3.45}
+{"type": "word", "text": "to",     "start": 3.46, "end": 3.55}
+{"type": "word", "text": "lock",   "start": 3.56, "end": 3.78}
+{"type": "word", "text": "in",     "start": 3.80, "end": 3.95}
+{"type": "word", "text": "the",    "start": 4.10, "end": 4.18}
+```
+
+- Out-point snaps to `in.end = 3.95` — the last word kept.
+- Naive Paced trail_margin (200ms) would give `range.end = 4.15`,
+  but the next word `the` starts at 4.10. The combined-pad clamp
+  binds: `gap_ms = 4.10 − 3.95 = 150ms`; clamp ceiling
+  `max(0, 150 − 60) = 90ms`. Final `range.end = 3.95 + 0.09 = 4.04`
+  so 60ms of true silence remains for the `afade` pair.
+- In-point uses the same procedure on the FIRST word of the kept
+  range (here `Geared.start = 3.12`, padded by lead_margin with
+  the same clamp against the prior range's tail).
+
+The merged-view timestamp `0:03` was the input to the lookup; the
+EDL number is `3.12` / `4.04`. Sub-second precision came from the
+transcript, never from the merged view.
+
+### What counts as a verification miss (forbidden)
+
+- Emitting `range.end` from a phrase START shown in merged plus a
+  guessed duration. The phrase's actual end is in transcripts; look
+  it up.
+- Treating `speech_timeline.md`'s phrase-end timestamp as your cut
+  point without confirming it matches `last_word.end` in the
+  transcript. Speech_timeline rounds to whole seconds; the
+  underlying word end is sub-second.
+- Setting `range.end` to the timestamp of the NEXT line in merged
+  (the next phrase's start, or a visual caption second). The
+  speaker stopped earlier — Florence-2 sampled at 1fps, the visual
+  line has nothing to do with where the speech ended.
+- Rounding word timestamps to whole seconds because merged shows
+  whole-second times. The merged display is for the editor's eye;
+  the EDL writes the precise word-boundary value.
+- Skipping the lookup on "obviously safe" cuts at the start / end
+  of a phrase. Even those snap to `first_word.start` /
+  `last_word.end` — never to `phrase.start` / `phrase.end` from
+  the markdown views (which are rounded).
+
+### When `transcripts/<stem>.json` is missing
+
+Phase A preprocess didn't finish for that source — STOP and return
+to the parent with a specific error naming the missing stem. Don't
+guess at boundaries from the markdown views; that's exactly the
+failure mode this section exists to prevent.
+
+---
+
+## Sentence integrity — splice grammar at every cut point
+
+Word-boundary verification (above) makes sure cuts land on real word
+edges. This section makes sure the resulting *splice* still reads as
+language when the kept words on either side concatenate. A cut that
+snaps cleanly to `word.end` and `word.start` per Hard Rule 6 can
+still ship a broken sentence — *"…lets do the th- | w- we are
+doing…"* satisfies the word-boundary rule and reads like garbage.
+Both rules bind together.
+
+### Default bias: keep sentences whole
+
+Prefer cut anchors at **sentence boundaries** (a `.` / `?` / `!` in
+the transcript text, OR a gap ≥ `min_silence_to_remove` from the
+pacing preset between adjacent words). The cleanest cut is the one
+between two complete sentences — no splice grammar to worry about,
+no trailing filler to trim, no stutter to skip past.
+
+A mid-sentence cut is **only** justified when at least one of these
+holds:
+
+- A pacing-preset silence gap inside the sentence is removable
+  (intra-phrase `gap_ms ≥ min_silence_to_remove`). The cut just
+  drops dead air; the words on either side were already adjacent in
+  the speaker's intent.
+- A filler / disfluency / false-start spans the cut zone (everything
+  in the "Cut filler words" list below).
+- A retake decision drops the earlier take and joins to a cleaner
+  take of the same content (see "Retake detection").
+- A time-squeeze stretch separates two 1x ranges of load-bearing
+  speech (see "Time-squeezing").
+- The user explicitly asked to remove the spanned content (verbatim
+  conversation-bundle quote).
+
+If none of those hold, **keep the sentence whole even if it's
+slightly loose.** Loose-but-coherent reads better than tight-but-
+broken every time.
+
+### Splice-grammar test (mandatory before emitting any mid-sentence cut)
+
+For every range whose IN-point is mid-sentence OR whose OUT-point is
+mid-sentence (the previous / next concatenated range joins on a
+mid-sentence boundary), read the kept words on each side together as
+if no cut existed and verify:
+
+1. **Does the concatenation read as English?** *"lets do the thing"*
+   + *"now we are doing thing"* → fine. *"lets do the th-"* + *"w we
+   are doing"* → broken (you cut into / out of a partial word).
+2. **Is the FIRST word on the IN side a content-carrying word?**
+   Land on a noun / verb / adverb / adjective, OR on a sentence-
+   starting article / conjunction the speaker actually used. Don't
+   land on a stutter onset (`"w-"`), a half-word fragment (`"th-"`),
+   or a filler the speaker barely emitted (`"uh-"`, `"um-"`).
+3. **Does the LAST word on the OUT side complete its phrase?** If
+   the speaker said *"lets do the thing… uh"* and you want to cut
+   here, the last KEPT word is *"thing"*, not the trailing *"uh"*.
+4. **Is the speaker's intent preserved?** A cut that drops a
+   sentence's subject and lands on a bare verb is not a successful
+   cut, even when the words individually exist.
+
+If any check fails, move the anchor one or two words inward (later
+on the IN side, earlier on the OUT side) and re-verify.
+
+### Trailing-filler trim (out-point side)
+
+When picking `kept_last_word.end`, scan ~1-2s of transcript past your
+candidate out-point for any of these — if found inside the window,
+the last word **before** that material is the keeper:
+
+- Filler tokens from the "Cut filler words" list below (`uh`, `um`,
+  `like`, `you know`, `I mean`, `so yeah`, ...).
+- Single-syllable false starts / abandoned partial words (entries
+  whose `text` ends in `-`, or is a single phoneme-shaped fragment
+  like `"th"`, `"wh"`, `"s"`).
+- Aspirated breath sounds Parakeet sometimes captures as `"hh"` /
+  `"hm"`.
+- Trail-off mumble (sequences of 3+ very short words separated by
+  < 100ms gaps; the speaker is fading, not landing).
+
+The trail is the cut zone — pull `range.end` back to the last
+content word's `end` and let the trail vanish in the splice.
+
+### Stutter / false-start skip (in-point side)
+
+When picking `kept_first_word.start`, scan ~1-2s before your
+candidate in-point for the same patterns — if found, the first
+word **after** that material is the keeper:
+
+- Repeated stutter words: `["the", "the", "drill"]` → in-point at
+  `drill.start`, not `the.start`.
+- Cut-off partial words then redo: `["th-", "the", "drill"]` →
+  in-point at `the.start` (or `drill.start` if the speaker's intent
+  was to start with the noun).
+- Abandoned fragment then restart: `["I", "uh", "we", "walked"]` →
+  in-point at `we.start`; the splice drops the abandoned `"I uh"`.
+- Filler-led sentence: `["um", "now", "we", ...]` → in-point at
+  `now.start`.
+
+### Worked example — splice grammar around a trailing filler
+
+Speaker recording: *"lets do the thing… uh… now we are doing
+thing"*. Editor wants the trail-off and the gap removed.
+
+`transcripts/<S>.json` for the join zone:
+
+```json
+{"text": "thing",  "start":  8.10, "end":  8.42}
+{"text": "uh",     "start":  9.05, "end":  9.18}
+{"text": "now",    "start": 12.20, "end": 12.38}
+{"text": "we",     "start": 12.40, "end": 12.50}
+{"text": "are",    "start": 12.52, "end": 12.65}
+```
+
+PASS — kept_last_word = `"thing"` (not `"uh"`), kept_first_word = `"now"`:
+
+```
+range A end   = 8.42 + trail_margin   (clamped against the gap)
+range B start = 12.20 - lead_margin   (clamped against the gap)
+splice reads: "...lets do the thing | now we are doing thing"
+```
+
+FAIL — out-point ran past the trail and kept the `"uh"`:
+
+```
+range A end   = 9.18 + trail_margin   ← keeps the filler trail
+splice reads: "...lets do the thing uh | now we are doing thing"
+```
+
+FAIL — in-point started inside the speaker's `"w-"` stutter (when
+transcripts show a partial-word entry before `"we"`):
+
+```
+range B start = 12.10 (the "w-" stutter onset)
+splice reads: "...lets do the thing | w- we are doing thing"
+```
+
+The fix in both failure cases is the same: walk one or two words
+further into the transcript toward the cleanest content-word
+boundary and re-snap the anchor to that word's `end` (out-point) or
+`start` (in-point).
+
+### Citation in the EDL `reason` field
+
+When the splice-grammar pass shaped a range, note it tersely:
+
+```
+"reason": "Mid-sentence out-point at 'thing'; trimmed trailing 'uh' (9.05-9.18) before splice."
+"reason": "Mid-sentence in-point at 'now'; skipped 'w-' stutter onset (12.10-12.18)."
+```
+
+Mandatory at `user_profile = professional`, recommended at
+`creator`, optional at `personal` — but the splice-grammar
+verification itself is mandatory at every profile. The note is the
+audit trail; the verification is the rule.
+
+### Reading transcripts efficiently
+
+`transcripts/<stem>.json` can be large for long clips, but you only
+need the words bracketing each candidate cut. Three approaches, any
+of them fine:
+
+- **Targeted Read** with `offset` / `limit` near the merged
+  timestamp's byte range (binary search by reading a chunk and
+  walking until `start` exceeds your target).
+- **Grep** for the exact word text (`"text": "Geared"`) when the
+  word is rare enough that the matches are unambiguous within the
+  phrase span.
+- **Full Read** when the file is small (< ~10k tokens); simpler
+  and still cheap.
+
+Whichever you pick, the rule is: read enough to confirm the words
+that bracket your cut, then write the EDL with the exact `start` /
+`end` values you found.
+
+---
+
 ## Common structural archetypes
 
 Pick one, adapt one, or invent your own based on what the merged
@@ -312,9 +621,13 @@ timeline shows:
 
 - **Speech-first.** Candidate cuts come from word boundaries and
   silence gaps. Parakeet TDT is accurate to the word; the speech lane
-  is the editorial spine. Read it interleaved in `merged_timeline.md`;
-  drill into `speech_timeline.md` when you need word-level timing
-  detail.
+  is the editorial spine. Read speech interleaved in
+  `merged_timeline.md` for beat planning; **verify every cut anchor
+  against `transcripts/<stem>.json` per "Word-boundary verification"
+  above before writing the EDL.** `speech_timeline.md` carries
+  phrase-level start/end ranges — useful for scoping a phrase span,
+  not for setting a sub-phrase cut point (no per-word times in that
+  file).
 
 - **Preserve peaks.** Laughs, punchlines, emphasis beats. Extend past
   punchlines to include reactions — the laugh IS the beat.
@@ -1318,6 +1631,40 @@ factual, be terse on the report, but thorough on the EDL itself.
 - **Skipping the merged_timeline read** to "save time." Violates the
   ABSOLUTE READ MANDATE at the top of this file. The cut is silently
   bad and the user will catch it.
+- **Emitting an EDL range without word-boundary verification against
+  `transcripts/<stem>.json`.** This is the mid-sentence-cut footgun —
+  the merged view rounds to whole seconds, speech_timeline is
+  phrase-level, only `transcripts/<stem>.json` carries the per-word
+  `{start, end}` Hard Rule 6 binds you to. Verify the words bracketing
+  every cut anchor; snap `range.start` to `kept_first_word.start`
+  and `range.end` to `kept_last_word.end` before applying margins.
+  See "Word-boundary verification" above.
+- **Snapping a cut to a phrase end shown in `speech_timeline.md`
+  without confirming it matches the last word's `end` in transcripts.**
+  Speech_timeline rounds to whole seconds; the underlying
+  `last_word.end` is sub-second. Look it up.
+- **Setting `range.end` to the next merged-line timestamp** (next
+  phrase start, or a Florence visual caption second). The speaker
+  stopped earlier; visual captions sample at 1fps and have nothing
+  to do with where speech ended.
+- **Cutting mid-sentence without splice-grammar verification.** A
+  word-boundary-clean cut that splices *"…lets do the th-"* to
+  *"w- we are doing…"* still ships a broken sentence. Read the
+  kept words on each side together; verify the concatenation reads
+  as English; trim trailing filler / skip leading stutter per
+  "Sentence integrity".
+- **Defaulting to mid-sentence cuts when a sentence boundary is
+  available.** The default bias is whole sentences; mid-sentence
+  cuts are reserved for removable silence, fillers, retakes,
+  time-squeeze gaps, or explicit user requests. Loose-but-coherent
+  reads better than tight-but-broken.
+- **Keeping a trailing `"uh"` / `"um"` / partial-word at the
+  out-point of a mid-sentence cut.** Trail-off material is the cut
+  zone — pull `range.end` back to the last content word.
+- **Starting a mid-sentence in-point inside a stutter onset / on a
+  redundant `"the the"` / on `"w- we"`.** The first kept word is
+  the one that carries the sentence forward; skip the stutter and
+  in-point on the content word.
 - **Cutting purely on a CLAP label.** Always cross-check visual.
 - **Leaving "uh" / "um" / "like" / repeated stutters in.** Default is
   to cut them; only the three named exceptions stay.

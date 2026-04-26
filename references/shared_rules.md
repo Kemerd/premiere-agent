@@ -100,7 +100,7 @@ Three kinds of agent make this skill work. **They are not interchangeable.** Tok
 
 ### What this means in practice
 
-- A long iteration session does NOT bloat the parent's context with timeline data, because the parent never reads it. The parent's context grows linearly with conversation, not with file size.
+- A long iteration session does NOT bloat the parent's context with the heavy timeline data (visual captions, audio events, merged view), because the parent never reads those lanes. Speech transcripts the parent does read are text-only and token-cheap. The parent's context grows linearly with conversation, not with caption density.
 - A sub-agent spawned on revision #5 has the same fresh window as one spawned on revision #1, plus the full change history in its brief. It is NOT operating with less context — it has curated context plus a clean read budget.
 - The parent's job is: **listen -> summarize -> quote -> dispatch -> translate.** Nothing else. If you catch yourself reading a timeline file as the parent, stop — write the question into a sub-agent brief instead.
 
@@ -154,7 +154,7 @@ These fail regardless of role:
 - **Hand-tuned moment-scoring functions.** The LLM picks better than any heuristic you can write.
 - **SRT / phrase-level lane output.** Loses sub-second gap data. Always word-level verbatim from the speech lane.
 - **Re-running `helpers/preprocess_batch.py --force` reflexively.** The mtime-based cache is correct; bypass only when the source changed or a model was upgraded.
-- **Reading `transcripts/*.json` directly.** Use the timeline markdowns; same data, 1/10 the tokens, phrase-aligned.
+- **Reading `transcripts/*.json` directly for general timeline scanning.** Use the timeline markdowns; same data, 1/10 the tokens, phrase-aligned. The carve-out: the editor sub-agent reads `transcripts/<stem>.json` *surgically* at cut-verification time — the markdown views drop per-word boundaries (phrase-grouped concatenation) so they cannot satisfy Hard Rule 6 alone. See `subagent_editor_rules.md` "Word-boundary verification".
 - **Editing before confirming the strategy.** Never.
 - **Re-preprocessing cached sources.** Immutable outputs of immutable inputs.
 - **Assuming what kind of video it is.** Look first, ask second, edit last.

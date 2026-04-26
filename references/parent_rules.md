@@ -444,10 +444,15 @@ python helpers/pack_timelines.py --edit-dir <videos_dir>/edit
 ```
 
 `preprocess_batch.py` flags: `--wealthy` (24GB+ GPU), `--diarize`,
-`--language en`, `--force`, `--skip-speech`, `--skip-visual`. **Do
-NOT pass `--include-audio`** — that flag runs CLAP inline against a
-fallback vocabulary that exists only for `tests.py` smoke testing.
-This skill mandates the curated-vocab path (step 2 below).
+`--language en`, `--force`, `--skip-speech`, `--skip-visual`,
+`--visual-fps N` (visual sample rate in frames/sec, default `1.0`,
+fractional accepted — `0.5` = one frame every 2 s, `0.25` = every
+4 s; lower for slow / lecture / static / long-form content where
+1 fps over-samples and bloats merged_timeline.md, cost scales
+linearly). **Do NOT pass `--include-audio`** — that flag runs CLAP
+inline against a fallback vocabulary that exists only for `tests.py`
+smoke testing. This skill mandates the curated-vocab path (step 2
+below).
 
 `pack_timelines.py` produces `merged_timeline.md` (the editor's
 default reading surface) plus the per-lane drill-down files:
@@ -685,10 +690,58 @@ planned, spawn one subagent per slot in parallel — see
 The editor subagent returns `<edit>/edl.json`. The animation sub-
 agents return rendered overlay clips in `<edit>/animations/slot_*/`.
 
-### 7. Export to the NLE
+### 7. Self-eval — QA gate BEFORE export
+
+The deliverable is the FCPXML / xmeml. Don't write it until the
+cut is sane. Self-eval is the gate; export (step 8) only runs once
+this passes. **No XML before QA.** Eval reads `edl.json` plus the
+source clips — it does not need an exported XML, so producing one
+just to QA it would be wasted work that has to be redone if the
+EDL changes.
+
+Run `helpers/timeline_view.py` against the **source clips at every
+EDL cut boundary** (+/- 1.5s window) and inspect each image for:
+
+- Visual discontinuity / flash / jump at the cut boundary
+- Waveform spike at the boundary on the SOURCE side — the NLE will
+  honor whatever crossfade you ask, but the cut has to land in
+  a place where a crossfade can actually save it
+- Animation overlay landing on visible content (not on a hard cut
+  or a black frame)
+
+Also sample first 2s, last 2s, and 2-3 mid-points — check shot
+selection, animation placement, and overall coherence on the
+source side. The NLE is where a colorist / editor sees the final
+result; your job is to hand them an EDL whose cut decisions are
+already sane.
+
+Then validate the EDL structurally — folded in from what the
+exporter would otherwise crash on, so you catch arithmetic /
+schema problems here instead of after a wasted export pass:
+
+- Sum of effective range durations matches `total_duration_s` in
+  the EDL (catches arithmetic mistakes from the editor subagent)
+- Required keys present on every range and animation entry
+- No negative or zero-length ranges; no overlapping ranges on the
+  same track; no gaps that weren't explicitly placed
+- Every animation `start_in_output + duration` stays inside the
+  timeline, and `duration` matches what the animation sub-agent
+  was asked to render (mismatch silently desyncs the overlay)
+- Every clip path referenced by a range exists on disk
+
+If anything fails: re-spawn the editor sub-agent with a brief that
+quotes the specific eval failure, get a new `edl.json`, re-eval.
+Cap at 3 self-eval passes — if issues remain after 3, flag them
+to the user vs looping forever. Only proceed to step 8 once
+self-eval passes.
+
+### 8. Export to the NLE — publish on pass
 
 XML-only delivery — no flat-MP4 path exists in this skill anymore.
-The cut lives in the NLE and the editor finishes it there.
+The cut lives in the NLE and the editor finishes it there. This
+step runs ONCE, after step 7 passes, and produces the deliverable
+artifacts. If the user later requests a change (step 9), eval
+gates the next export the same way.
 
 ```bash
 python helpers/export_fcpxml.py <edit>/edl.json -o <edit>/cut.fcpxml
@@ -723,31 +776,6 @@ re-walking the timeline:
 python helpers/build_srt.py <edit>/edl.json
 ```
 
-### 8. Self-eval (before showing the user)
-
-Run `helpers/timeline_view.py` against the **source clips at every
-EDL cut boundary** (+/- 1.5s window). XML delivery means no
-rendered MP4 to inspect — but cut decisions still need to be sane
-on the source side. Check each image for:
-
-- Visual discontinuity / flash / jump at the cut boundary
-- Waveform spike at the boundary on the SOURCE side — the NLE will
-  honor whatever crossfade you ask, but the cut has to land in
-  a place where a crossfade can actually save it
-- Animation overlay durations match `start_in_output + duration` from
-  the EDL (a duration mismatch silently desyncs the overlay)
-- Sum of effective range durations matches `total_duration_s` in the
-  EDL (catches arithmetic mistakes from the editor subagent)
-
-Also sample first 2s, last 2s, and 2-3 mid-points — check shot
-selection, animation placement, and overall coherence. The NLE is
-where a colorist / editor sees the final result; your job is to
-deliver an XML they can drop in without rebuilding the cut.
-
-If anything fails: fix -> re-export -> re-eval. Cap at 3 self-eval
-passes — if issues remain after 3, flag them to the user vs
-looping forever. Only hand over the XML once self-eval passes.
-
 ### 9. Iterate + persist — every change request = fresh editor spawn
 
 User feedback comes in. **Do not edit `edl.json` by hand.** Append the
@@ -762,7 +790,8 @@ an updated brief that includes:
 - An explicit description of THIS revision: what specifically the user
   asked to change, what to keep
 
-Re-export. Re-self-eval. Show. Loop until user is happy.
+Re-self-eval. Re-export only on pass. Show. Loop until the user is
+happy — every revision repeats the same gate (eval before XML).
 
 Final export on confirmation. Then **append to `project.md`** — see
 "project.md memory format" below. Your only persistent state
@@ -1445,8 +1474,10 @@ user quote" priority overrides its retake heuristic.
   The subagent has no memory across spawns; the brief is its memory.
 - **Spawning subagents sequentially when they could be parallel.**
   Animations especially. Hard Rule 10.
-- **Presenting the preview before self-eval passes.** Step 8 is
-  mandatory.
+- **Exporting XML before self-eval passes, or presenting the
+  preview before self-eval passes.** Step 7 gates step 8 — no
+  `cut.fcpxml` / `cut.xml` / `master.srt` written until the EDL
+  passes QA. Self-eval is mandatory.
 - **Skipping the `project.md` append at session end.** That is how
   next session knows where this one stopped.
 - **Burying or paraphrasing an in-clip editor note the subagent
