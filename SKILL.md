@@ -1,7 +1,15 @@
 ---
 name: video-use-premiere
-description: Edit any video by conversation. Local two-phase preprocessing — Phase A runs Parakeet ONNX speech + Florence-2 visual captions in parallel; Phase B runs CLAP zero-shot audio events against an agent-curated vocabulary derived from the speech + visual timelines. Cut, color grade, generate overlay animations, burn subtitles, OR export FCPXML to Premiere/Resolve/FCP with split edits. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
+description: Edit any video by conversation. Local two-phase preprocessing — Phase A runs Parakeet ONNX speech + Florence-2 visual captions in parallel; Phase B runs CLAP zero-shot audio events against an agent-curated vocabulary derived from the speech + visual timelines. Reasons over the timelines and exports FCPXML / FCP7 xmeml to Premiere / Resolve / Final Cut Pro X — XML-only delivery with native J/L cuts, dissolves, and timelapse retime. Generates overlay animations and a `master.srt` captions sidecar; the colorist owns color in the NLE. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
 ---
+
+> **Agent: read ONE entry point, not both.** This file (`SKILL.md`) is
+> for **Claude Code**'s skill loader — the YAML frontmatter above is
+> what triggers progressive-disclosure activation. A byte-identical
+> copy of the body lives at `AGENTS.md` (no frontmatter) for
+> **Codex**'s project-guidance loader. Whichever runtime loaded you
+> already gave you the right one. **Do not read the other** — it's the
+> same content and would just burn tokens.
 
 # Video Use Premiere — Entry point
 
@@ -30,7 +38,7 @@ Read these two files now, in this order, before doing anything else:
    directory layout, setup checklist, skill health check workflow,
    the 9-step process you run, the helper scripts (`ffprobe`,
    `health.py`, `preprocess_batch.py`, `pack_timelines.py`,
-   `audio_lane.py`, `render.py`, `export_fcpxml.py`, etc.), pacing
+   `audio_lane.py`, `export_fcpxml.py`, `build_srt.py`, etc.), pacing
    presets, brief templates for spawning sub-agents, EDL format,
    `project.md` memory format, and parent-specific anti-patterns.
 
@@ -57,12 +65,10 @@ You point spawned sub-agents at these via their briefs (templates in
 
 ## Cold-path features (load on demand when the user asks for them)
 
-- **`references/color-grade.md`** — ASC CDL mental model, shipped
-  filter chain presets, FCPXML "don't bake the grade" rule.
-
 - **`references/subtitles.md`** — chunking / case / placement
   reasoning, the `bold-overlay` and `natural-sentence` worked
-  styles, FCPXML delivery (ship `master.srt` alongside, don't burn).
+  styles, FCPXML delivery (ship `master.srt` alongside via
+  `helpers/build_srt.py`).
 
 ## What this architecture buys you
 

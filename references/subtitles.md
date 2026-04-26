@@ -14,7 +14,7 @@ The right combo depends on content. Pick deliberately, don't default.
 
 ### `bold-overlay` — short-form tech launch, fast-paced social
 
-2-word chunks, UPPERCASE, break on punctuation, Helvetica 18 Bold, white-on-outline, `MarginV=35`. `render.py` ships with this as `SUB_FORCE_STYLE`.
+2-word chunks, UPPERCASE, break on punctuation, Helvetica 18 Bold, white-on-outline, `MarginV=35`. `helpers/build_srt.py` emits the SRT in this rhythm — apply the style in the NLE's caption panel.
 
 ```
 FontName=Helvetica,FontSize=18,Bold=1,
@@ -38,15 +38,16 @@ Invent a third style if neither fits.
 
 ## Hard rules
 
-1. **Subtitles are applied LAST in the filter chain**, after every overlay (Hard Rule 1 in main SKILL.md). Otherwise overlays cover captions. Silent failure.
-2. **Master SRT uses output-timeline offsets** (Hard Rule 5): `output_time = word.start - segment_start + segment_offset`. Otherwise captions drift after segment concat.
-3. **Word-level boundaries from the speech lane.** Never invent chunk timing — the Parakeet word timestamps already give you exact in/out. Group N words into a line; the line's `start` is `words[0].start` and its `end` is `words[-1].end`.
+1. **Master SRT uses output-timeline offsets** (Hard Rule 5): `output_time = word.start - segment_start + segment_offset`. Otherwise captions drift across the cut timeline.
+2. **Word-level boundaries from the speech lane.** Never invent chunk timing — the Parakeet word timestamps already give you exact in/out. Group N words into a line; the line's `start` is `words[0].start` and its `end` is `words[-1].end`.
 
 ## FCPXML / xmeml delivery
 
-Ship `master.srt` alongside `cut.fcpxml` and `cut.xml`. Most NLEs (Premiere, Resolve, FCP X) import SRT as a captions track that the editor can restyle in their own caption panel. Don't burn subtitles into the segments for the NLE path — the editor will want to control style themselves.
+```bash
+python helpers/build_srt.py edit/edl.json
+```
 
-For the flat MP4 path (`render.py`), subtitles are baked into the final pass via the `subtitles=…:force_style=…` filter, applied LAST after every overlay.
+This writes `<edit>/master.srt` straight from the cached Parakeet transcripts in `<edit>/transcripts/`, on the OUTPUT timeline. Ship it alongside `cut.fcpxml` and `cut.xml`. Most NLEs (Premiere, Resolve, FCP X) import SRT as a captions track the editor can restyle in their own caption panel. The skill never burns subtitles into a flat MP4 — XML-only delivery means the NLE owns the final pixels and the editor controls caption style end-to-end.
 
 ## Decision shortcuts
 

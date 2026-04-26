@@ -14,7 +14,7 @@ the entire pipeline:
   filesystem, persist `project.md` memory across sessions.
 - **Script execution** — run every helper script in `helpers/`
   (`ffprobe`, `health.py`, `preprocess_batch.py`, `pack_timelines.py`,
-  `audio_lane.py`, `render.py`, `export_fcpxml.py`, `grade.py`,
+  `audio_lane.py`, `export_fcpxml.py`, `build_srt.py`,
   `timeline_view.py`, etc.). All bash invocations are yours.
 - **Error handling** — when a helper fails, you read the traceback,
   diagnose, fix, and re-run. Sub-agents do not debug infrastructure.
@@ -69,7 +69,7 @@ they put it. All session outputs go into `<videos_dir>/edit/`.
     │                              (lane 3, drill-down for editor)
     ├── edl.json                 ← cut decisions (editor sub-agent
     │                              writes; parent reads to validate
-    │                              shape, hands to render.py)
+    │                              shape, hands to export_fcpxml.py)
     ├── transcripts/<name>.json  ← cached raw Parakeet words
     ├── audio_tags/<name>.json   ← cached raw CLAP (label, score)
     ├── audio_vocab.txt          ← vocab sub-agent writes; parent
@@ -79,11 +79,10 @@ they put it. All session outputs go into `<videos_dir>/edit/`.
     ├── comp_visual_caps/<name>.json  ← caveman-compressed visual caps
     ├── audio_16k/<name>.wav     ← shared 16kHz mono PCM
     ├── animations/slot_<id>/    ← per-animation source + render
-    ├── clips_graded/            ← per-segment extracts + grade + fades
     ├── master.srt               ← output-timeline subtitles
+    │                              (build_srt.py; ships alongside the
+    │                              FCPXML so the NLE imports captions)
     ├── verify/                  ← debug frames / timeline PNGs
-    ├── preview.mp4
-    ├── final.mp4                ← flattened deliverable (ffmpeg)
     ├── cut.fcpxml               ← editor-ready FCPXML 1.10+
     │                              (Resolve / Final Cut Pro X)
     └── cut.xml                  ← editor-ready FCP7 xmeml
@@ -273,8 +272,10 @@ questions *shaped by what they said*. Collect:
 - Aesthetic / brand direction
 - Must-preserve moments (quote the user verbatim)
 - Must-cut moments (quote the user verbatim)
-- Animation / grade / subtitle preferences
-- Delivery target (flattened mp4 vs FCPXML to NLE)
+- Animation / subtitle preferences (the colorist owns the grade — XML
+  delivery never bakes a grade)
+- Delivery dialect (`cut.fcpxml` for Resolve / FCP X, `cut.xml` for
+  Premiere Pro, or both — default is both)
 - **Pacing preset** — MANDATORY. See table below. Default Paced.
 
 While conversing, build the **Conversation Context bundle** in your
@@ -285,8 +286,9 @@ You will forward this bundle into every sub-agent brief.
 
 Write 4-8 sentences describing the editorial shape, take direction,
 chosen pacing preset (name + four expanded ms values), animation plan,
-grade direction, subtitle style, length estimate, delivery format.
-**Wait for confirmation.** No sub-agent runs until the user says yes.
+subtitle style (NLE captions track), length estimate, NLE delivery
+dialect. **Wait for confirmation.** No sub-agent runs until the user
+says yes.
 
 You are writing the strategy in the user's terms — what they said the
 video is, what they said they want. You are NOT writing it from a read
@@ -303,23 +305,14 @@ planned, spawn one sub-agent per slot in parallel — see
 The editor sub-agent returns `<edit>/edl.json`. The animation sub-
 agents return rendered overlay clips in `<edit>/animations/slot_*/`.
 
-Apply grade per-segment as part of the render step (see step 7).
+Grade is the colorist's job — XML delivery never bakes a grade. Pass
+the taste call along in `project.md` so the colorist starts from
+your direction.
 
-### 7. Render
+### 7. Export to the NLE
 
-For flat MP4 delivery:
-
-```bash
-python helpers/render.py <edit>/edl.json -o <edit>/preview.mp4 --preview
-```
-
-`--preview` is 1080p fast; `--draft` is 720p ultrafast. Pass
-`--build-subtitles` to generate `master.srt` inline. The renderer bakes
-the 30ms `afade` boundary pair (Hard Rule 3), per-segment extract +
-concat (Hard Rule 2), overlay PTS shifting (Hard Rule 4), and
-subtitles-LAST (Hard Rule 1).
-
-For NLE handoff:
+XML-only delivery — there is no flat-MP4 path in this skill anymore.
+The cut lives in the NLE and the editor finishes it there.
 
 ```bash
 python helpers/export_fcpxml.py <edit>/edl.json -o <edit>/cut.fcpxml
@@ -331,25 +324,41 @@ Recipient picks whichever NLE they live in. Tell Premiere users to
 `File -> Import -> cut.xml`. Override with `--targets {both,fcpxml,
 premiere}`. `--frame-rate 24` (default), 25, 29.97, 30, 60.
 
+If subtitles are part of the brief, build the captions sidecar:
+
+```bash
+python helpers/build_srt.py <edit>/edl.json
+```
+
+This writes `<edit>/master.srt` on the OUTPUT timeline (Hard Rule 5)
+straight from the cached Parakeet transcripts. Ship it alongside the
+XML — every major NLE imports SRT cleanly onto a captions track that
+the editor can restyle.
+
 ### 8. Self-eval (before showing the user)
 
-Run `helpers/timeline_view.py` on the rendered output (not the
-sources) at every cut boundary (+/- 1.5s window). Check each image
-for:
+Run `helpers/timeline_view.py` against the **source clips at every
+EDL cut boundary** (+/- 1.5s window). XML delivery means there is no
+rendered MP4 to inspect — but the cut decisions still need to be sane
+on the source side. Check each image for:
 
-- Visual discontinuity / flash / jump at the cut
-- Waveform spike at the boundary (audio pop that slipped past the
-  30ms fade)
-- Subtitle hidden behind an overlay (Rule 1 violation)
-- Overlay misaligned or showing wrong frames (Rule 4 violation)
+- Visual discontinuity / flash / jump at the cut boundary
+- Waveform spike at the boundary on the SOURCE side — the NLE will
+  honor whatever crossfade you ask it to, but the cut has to land in
+  a place where a crossfade can actually save it
+- Animation overlay durations match `start_in_output + duration` from
+  the EDL (a duration mismatch silently desyncs the overlay)
+- Sum of effective range durations matches `total_duration_s` in the
+  EDL (catches arithmetic mistakes from the editor sub-agent)
 
-Also sample first 2s, last 2s, and 2-3 mid-points — check grade
-consistency, subtitle readability, overall coherence. Run `ffprobe`
-on the output to verify duration matches the EDL expectation.
+Also sample first 2s, last 2s, and 2-3 mid-points — check shot
+selection, animation placement, and overall coherence. The NLE is
+where a colorist / editor sees the final result; your job is to
+deliver an XML they can drop in without rebuilding the cut.
 
-If anything fails: fix -> re-render -> re-eval. Cap at 3 self-eval
+If anything fails: fix -> re-export -> re-eval. Cap at 3 self-eval
 passes — if issues remain after 3, flag them to the user rather than
-looping forever. Only present the preview once the self-eval passes.
+looping forever. Only hand the XML over once the self-eval passes.
 
 ### 9. Iterate + persist — every change request = fresh editor spawn
 
@@ -365,9 +374,9 @@ an updated brief that includes:
 - An explicit description of THIS revision: what specifically the user
   asked to change, what to keep
 
-Re-render. Re-self-eval. Show. Loop until user is happy.
+Re-export. Re-self-eval. Show. Loop until user is happy.
 
-Final render on confirmation. Then **append to `project.md`** — see
+Final export on confirmation. Then **append to `project.md`** — see
 "project.md memory format" below. This is your only persistent state
 across sessions; do not skip it.
 
@@ -539,10 +548,11 @@ parallel via the `Task` / `Agent` tool (Hard Rule 10).
 Match the source unless the user asked for something specific. Common
 targets: `1920x1080@24` cinematic, `1920x1080@30` screen content,
 `1080x1920@30` vertical social, `3840x2160@24` 4K cinema,
-`1080x1080@30` square. `render.py` defaults the scale to 1080p from
-any source. For FCPXML delivery, pass `--frame-rate` matching the
-source (or the user's intended deliverable) so cuts snap to whole
-frames. Worth asking the user which delivery format matters.
+`1080x1080@30` square. The XML carries a timeline frame rate, not a
+canvas resolution — the NLE inherits resolution from the source clips.
+Pass `--frame-rate` matching the source (or the user's intended
+deliverable) so cuts snap to whole frames. Worth asking the user which
+NLE they live in so the timeline rate matches.
 
 ---
 
@@ -572,6 +582,11 @@ high-level shape (range count, total duration, all `audio_lead` /
   "total_duration_s": 87.4
 }
 ```
+
+The `grade` field is a taste-call note forwarded to the colorist via
+`project.md` — XML delivery never bakes a grade. The `subtitles` field
+points at the SRT sidecar emitted by `helpers/build_srt.py` so the NLE
+imports it on a captions track.
 
 If the editor sub-agent returns an EDL with non-zero split-edit fields,
 reject it and re-spawn — that violates Hard Rule 14.
@@ -716,24 +731,12 @@ accepts `--wealthy` and runs standalone.
   `visual_timeline.md` replaces 90% of the old "scan with
   timeline_view" workflow.
 
-- **`helpers/render.py <edl.json> -o <out>`** — per-segment extract
-  -> concat -> overlays (PTS-shifted) -> subtitles LAST -> loudness
-  norm -> final.mp4.
-  - `--preview` for 1080p fast, `--draft` for 720p ultrafast,
-    `--build-subtitles` to generate `master.srt` inline.
-  - Bakes a 30ms `afade` at every boundary (Hard Rule 3) — that's
-    the current "small audio crossfade." J/L cuts and dissolves are
-    DEFERRED (Hard Rule 14); if any are present in the EDL the
-    renderer warns and flattens them.
-
-- **`helpers/grade.py <in> -o <out>`** — ffmpeg filter chain grade.
-  Presets + `--filter '<raw>'` for custom.
-
 - **`helpers/export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit
-  editor-ready timeline files. Hard-cut delivery only right now
-  (Hard Rule 14): the EDL's `audio_lead` / `video_tail` /
-  `transition_in` fields are still consumed by the code path but the
-  editor sub-agent must emit `0` for all three.
+  editor-ready timeline files. **This is the only delivery path in
+  the skill** — there is no flat-MP4 renderer. Hard-cut delivery
+  only right now (Hard Rule 14): the EDL's `audio_lead` /
+  `video_tail` / `transition_in` fields are still consumed by the
+  code path but the editor sub-agent must emit `0` for all three.
 
   **Default emits BOTH `cut.fcpxml` AND `cut.xml`** side-by-side
   from a single timeline build, because Premiere Pro and Resolve /
@@ -743,6 +746,14 @@ accepts `--wealthy` and runs standalone.
   whichever NLE they live in — no XtoCC conversion required for
   Premiere. Override with `--targets {both,fcpxml,premiere}`.
   `--frame-rate 24` (default), 25, 29.97, 30, 60.
+
+- **`helpers/build_srt.py <edl.json>`** — emit `<edit>/master.srt`
+  on the OUTPUT timeline (Hard Rule 5) from the cached Parakeet
+  transcripts in `<edit>/transcripts/`. Pair this with the FCPXML /
+  xmeml so the NLE imports captions on a track the editor can
+  restyle. 2-word UPPERCASE chunks, breaks on punctuation. Skips
+  retimed (timelapse) ranges by editor convention — see SKILL.md
+  "Time-squeezing".
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash`
 and spawn a sub-agent via the `Task` / `Agent` tool per
@@ -760,9 +771,10 @@ before proposing strategy for that feature:
 - Animations -> `references/animations.md`
 
 The Hard Rules that bind these features stay in `shared_rules.md`
-(subtitles LAST = Rule 1, per-segment grade = Rule 2, 30ms afade =
-Rule 3, overlay setpts = Rule 4, output-timeline SRT = Rule 5,
-parallel sub-agents for animations = Rule 10).
+— output-timeline SRT (Rule 5) and parallel sub-agents for
+animations (Rule 10) are the live ones for XML delivery; the
+ffmpeg-pipeline rules (1-4) are dormant since the flat-MP4 path
+was removed.
 
 ---
 

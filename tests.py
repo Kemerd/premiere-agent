@@ -267,7 +267,7 @@ HELPER_MODULES = (
     "pack_timelines", "preprocess", "preprocess_batch",
     "diarize", "parakeet_onnx_lane", "parakeet_lane",
     "audio_lane", "audio_vocab_default", "visual_lane",
-    "render", "export_fcpxml",
+    "build_srt", "export_fcpxml",
 )
 
 
@@ -437,7 +437,7 @@ def test_pack_timelines(R: Results, tmp: Path) -> None:
         # sliding window. Matches the canonical shape produced by the
         # real `helpers/audio_lane.py` (see its module docstring + the
         # _process_one writer). Two events at different start times so
-        # the renderer exercises the per-range grouping path.
+        # the packer exercises the per-range grouping path.
         (edit / "audio_tags" / "C0001.json").write_text(json.dumps({
             "source_path": "/tmp/C0001.mp4",
             "model": "Xenova/clap-htsat-unfused",
