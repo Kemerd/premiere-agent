@@ -6,6 +6,12 @@ Drop raw footage in a folder, chat with your agent ([Claude Code](https://docs.c
 
 ## What it does
 
+It's a **conversational video editor** — you talk to it like an assistant editor ("trim the filler, J/L the dialogue, timelapse the build sequence, ship it") and you get back an XML cut you import straight into your NLE.
+
+Drop your raw clips in a folder, run `claude` or `codex` in that folder, and the agent walks the loop with you: it inventories the sources, asks a few questions about what you're going for, runs a one-time preprocess that reduces hours of footage to three small text timelines, proposes a strategy, waits for your OK, writes the cut, **self-evaluates every boundary against the source clips**, and only then drops `cut.fcpxml` + `cut.xml` + `master.srt` next to your sources. Don't like a cut? Tell it. Want a different pace? Tell it. The preprocess is cached, so iteration is just re-reasoning over the same timelines — no re-watching, no re-transcribing.
+
+What ends up in the cut you get back:
+
 - **Cuts out filler words** (`umm`, `uh`, false starts) and dead space between takes
 - **J/L cuts on speaker handoffs** so dialogue overlaps the visual cut like a real edit
 - **Time-squeezes long activity stretches into timelapses** — 30 minutes of shop work becomes 8 seconds of compressed visual progress, with the audio dropped (or pitch-corrected if you keep it). Speed clamps at 1000%; FCPXML gets `<timeMap>` blocks, Premiere xmeml gets a `Time Remap` filter
@@ -18,7 +24,34 @@ Drop raw footage in a folder, chat with your agent ([Claude Code](https://docs.c
 
 ## How it works
 
-The LLM never watches the video. It **reads** it — through three timestamp-aligned timelines plus an on-demand visual drill-down.
+The LLM never watches the video. It **reads** it — through three timestamp-aligned timelines plus an on-demand visual drill-down. Same idea as browser-use giving an LLM a structured DOM instead of a screenshot, but for video.
+
+### The agent loop
+
+A session is split between a **parent agent** that runs the conversation and **sub-agents** that do the heavy timeline reading in fresh context windows — long iteration sessions cost the same per spawn as the first revision because the parent's context grows linearly with the conversation, not with caption density.
+
+```
+1. Inventory          parent reads ffprobe metadata, detects folder conventions
+                      (b_roll/, timelapse/, voiceover/), pairs dual-mic .wav to
+                      video stems, asks 4 mode-gating questions
+2. Phase A preprocess speech (Parakeet ONNX) ‖ visual (Florence-2) on one GPU
+                      with a VRAM-aware scheduler — cached on disk so it's
+                      one-shot per source, not per revision
+3. Vocab spawn        a sub-agent reads the speech + visual merged timeline and
+                      writes a project-specific CLAP vocabulary (audio_vocab.txt)
+4. Phase B preprocess CLAP scores the audio against that vocabulary, pack_timelines
+                      folds the third lane into merged_timeline.md
+5. Strategy           parent proposes a cut shape (pacing, J/L policy, b-roll, retime,
+                      subtitles), waits for user OK
+6. Editor spawn       a sub-agent reads merged_timeline.md, writes edl.json with
+                      ranges, transitions, retime, overlay slots — re-spawned per
+                      revision request, never hand-editing the EDL
+7. Self-eval          timeline_view runs at every cut boundary against the source
+                      clips; mid-word cuts and visual discontinuities block export
+8. Export             cut.fcpxml + cut.xml + master.srt next to the sources
+9. Persist            project.md gets appended so next week's session inherits the
+                      brief, source tags, mode flags, and the change-request history
+```
 
 ### The three lanes
 
@@ -69,8 +102,6 @@ Pre-processing produces three small markdown files per session, each addressable
 
 > Naive approach: 30,000 frames × 1,500 tokens = **45M tokens of noise**.
 > premiere-agent: **three ~12KB text files + a handful of PNGs**.
-
-Same idea as browser-use giving an LLM a structured DOM instead of a screenshot — but for video.
 
 ## Pipeline
 
