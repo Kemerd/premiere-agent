@@ -14,46 +14,61 @@ window against.
 You exist because the baked-in 527-class taxonomy (`AudioSet`-style)
 labels everything as "noise" or "speech" or "music" — useless for a
 workshop video full of specific tools, materials, and ambience. By
-reading the speech + visual timelines first and inferring this
-project's actual soundscape, you produce labels matching real
-content that CLAP can score sharply against.
+reading the merged timeline (speech + visual interleaved by
+timestamp) first and inferring this project's actual soundscape,
+you produce labels matching real content that CLAP can score
+sharply against.
 
 ---
 
 ## Pre-flight (mandatory — do this BEFORE writing a single label)
 
-1. **Read `<edit>/speech_timeline.md` END-TO-END.** Phrase-grouped
-   Parakeet transcripts — what's said, by whom, how often, what
-   tools / materials / activities are referenced verbally. The user
-   may say "I'm now drilling pilot holes" or "and now we
-   add the chamfer" — those references are direct vocabulary
-   candidates.
+1. **Read `<edit>/merged_timeline.md` END-TO-END.** This is the
+   interleaved view the parent's first `pack_timelines.py` run
+   produced — speech phrases (`"…"`), visual captions (`[…]`), and
+   any pre-existing audio events (`(audio: …)`) all sorted by
+   timestamp into a single chronological stream. On this skill's
+   pipeline the audio block is normally empty at vocab time (Phase B
+   has not run yet — that is *your* job to enable), so what you
+   actually see is speech and visual aligned by clock time. Reading
+   the merged file gives you temporal correlation for free: when
+   `0:42 "okay drilling pilot holes"` lands one line above
+   `0:43 [a person holding a cordless drill above a metal panel]`,
+   that co-occurrence is a high-confidence `drill` / `cordless drill`
+   / `drill on metal` vocab candidate without you having to
+   cross-reference two files by hand.
 
-2. **Read `<edit>/visual_timeline.md` END-TO-END.** Florence-2
-   captions @ 1fps with `(same)` collapses. Tells you what's
-   on screen across the whole project — drills, saws,
-   workbenches, sawdust, metal panels, paint, dogs, cars, kitchens,
-   beaches, whatever. Visual is the second source of truth (see
-   shared_rules.md Principle #2 for priority order).
+2. **In full. No shortcuts.** No first-N-lines, no grep, no
+   abandoned chunked reads, no "I have enough" because the file
+   feels long. If `merged_timeline.md` exceeds the per-`Read` cap,
+   issue sequential `Read` calls with `offset` / `limit` until every
+   line is covered. If you exhaust your context before finishing,
+   return to the parent with `BUDGET_EXHAUSTED — partial coverage
+   of merged_timeline.md: lines [a..b] read out of [a..N]` instead
+   of emitting a half-curated vocab on partial data. Half-coverage
+   yields a vocab missing entire categories of project sound.
 
-3. **Both files in full.** No first-N-lines, no grep, no abandoned
-   chunked reads, no "I have enough" because the file feels long. If
-   either file exceeds the per-`Read` cap, issue sequential `Read`
-   calls with `offset` / `limit` until every line is covered. If you
-   exhaust your context before finishing both files, return
-   to the parent with `BUDGET_EXHAUSTED — partial coverage of
-   <file>: lines [a..b] read out of [a..N]` instead of emitting a
-   half-curated vocab on partial data. Half-coverage yields
-   a vocab missing entire categories of project sound.
+3. **Drill into per-lane files only when ambiguous.** The parent
+   also produces `<edit>/speech_timeline.md` and
+   `<edit>/visual_timeline.md` as drill-down references. You should
+   *not* read these by default — the merged view already contains
+   the same data interleaved, and double-reading just burns context.
+   Open them only when the merged view is genuinely ambiguous about
+   what a sound source is (e.g. visual says "person near machine"
+   with no specifics — `visual_timeline.md` may carry the longer
+   pre-caveman caption that names the machine). Note in your return
+   report which lane file you drilled into and why.
 
-4. **Cross-reference timestamps.** When speech says "drill" and
-   visual says "person holding a cordless drill," that's a high-
-   confidence vocab candidate (`drill`, `cordless drill`,
-   `power drill`). When visual shows hammering but speech
-   never mentions it, hammering still goes in — visual is enough.
-   When speech mentions something but visual never shows it
-   (e.g. user narrates a previous project), it's NOT a
-   vocab candidate for THIS project.
+4. **Pull vocab candidates from the alignment.** When speech says
+   "drill" and visual one second later shows "person holding a
+   cordless drill," that's a high-confidence vocab candidate
+   (`drill`, `cordless drill`, `power drill`). When visual shows
+   hammering but speech never mentions it, hammering still goes in —
+   visual is enough. When speech mentions something but visual never
+   shows it (e.g. user narrates a previous project), it's NOT a
+   vocab candidate for THIS project. The merged view makes these
+   judgements obvious because adjacent timestamps are physically
+   adjacent on the page.
 
 ---
 
@@ -318,10 +333,19 @@ Return a complete report. No artificial length cap.
   moments and avoid them. CLAP doesn't decide what's in the cut;
   it labels.
 
-- **Inventing vocab from imagination instead of the timelines.**
-  Always ground vocab in what the speech + visual timelines
-  actually contain. If neither timeline references a thing, it
-  doesn't go in the vocab even if the user mentioned it casually.
+- **Inventing vocab from imagination instead of the timeline.**
+  Always ground vocab in what the merged timeline actually
+  contains. If neither the speech lane nor the visual lane
+  references a thing, it doesn't go in the vocab even if the user
+  mentioned it casually.
+
+- **Reading `speech_timeline.md` and `visual_timeline.md` by default
+  instead of `merged_timeline.md`.** The per-lane files are
+  drill-down references for ambiguous moments, not the spine. The
+  merged view already contains both lanes interleaved by timestamp;
+  reading the per-lane files by default is double-reading and burns
+  the context budget you need to actually finish the merged file in
+  full. See Pre-flight step 3.
 
 - **Skipping the verbatim user quotes in the brief.** The user's own
   words about specific tools / materials / locations are direct

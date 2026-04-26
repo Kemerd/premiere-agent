@@ -439,9 +439,10 @@ for subagents.
 
 ### 2. Audio events — spawn the vocab sub-agent (mandatory)
 
-Spawn the vocab subagent. It reads `speech_timeline.md` +
-`visual_timeline.md` and produces a project-specific CLAP vocabulary
-at `<edit>/audio_vocab.txt`. This is **not optional** and **no
+Spawn the vocab subagent. It reads `<edit>/merged_timeline.md` —
+the interleaved speech + visual view step 1's pack already
+produced — and writes a project-specific CLAP vocabulary at
+`<edit>/audio_vocab.txt`. This is **not optional** and **no
 shortcut to a baseline vocabulary** exists — generic 527-class
 taxonomies mis-label real-world content (workshop tools tagged as
 "music", room tone tagged as "applause"). The agent-curated vocab is
@@ -461,6 +462,18 @@ python helpers/pack_timelines.py --edit-dir <edit>
 The first command runs CLAP zero-shot scoring against the curated
 vocab. The second re-runs the pack so the new audio events fold
 into both `merged_timeline.md` (default) and `audio_timeline.md`.
+
+**`pack_timelines.py` runs TWICE per session — this is a rule, not
+an accident.** First run (step 1, after preprocess) produces a
+merged timeline with two lanes — speech and visual — which the
+vocab sub-agent reads to curate `audio_vocab.txt`. Second run
+(this step, after `audio_lane.py`) folds the freshly-scored audio
+events into the same `merged_timeline.md` so the editor sub-agent
+in step 6 reads all three lanes interleaved on one page. Skipping
+the second pack ships the editor a merged view with no
+`(audio: …)` lines and silently breaks Hard Rule 15 (the merged
+view is the editor's spine — it must contain every lane). Always
+run both passes; do not try to "save a pack" by skipping either.
 
 If the user explicitly says they do not care about audio events at
 all (rare — usually a single-speaker talking-head with no ambient
@@ -771,9 +784,11 @@ CONVERSATION CONTEXT (from parent):
     - "<quote>" (context: ...)
 
 INPUTS:
-  - <edit>/speech_timeline.md
-  - <edit>/visual_timeline.md
-  Read both end-to-end, in full, in your fresh context window.
+  - <edit>/merged_timeline.md  (speech + visual interleaved by
+    timestamp — the spine; read this end-to-end in full)
+  - <edit>/speech_timeline.md  (drill-down only, do NOT read by
+    default — open only on a specific ambiguity)
+  - <edit>/visual_timeline.md  (drill-down only, same rule)
 
 OUTPUT:
   Write <edit>/audio_vocab.txt — 200-1000 short labels, one per line,
@@ -1057,6 +1072,16 @@ three fresh."
   B folds the new audio events into both the merged file and
   `audio_timeline.md`.
 
+  **Run this exactly TWICE per session.** First call after Phase A
+  preprocess produces a two-lane merged timeline (speech + visual)
+  which the vocab sub-agent reads as its single input — this is
+  why merged exists at vocab time even though audio is empty.
+  Second call after `audio_lane.py` (Phase B) folds the new audio
+  events into the merged view so the editor sub-agent sees all
+  three lanes on one page. Skipping the second pack hands the
+  editor a stale merged file and silently violates Hard Rule 15.
+  See step 2 of the 9-step process for the exact ordering.
+
   **Caveman compression on visual captions is ON by default** — a
   spaCy NLP pass strips stop words / determiners / auxiliaries / weak
   adverbs from every Florence-2 caption before packing, cutting
@@ -1090,7 +1115,7 @@ three fresh."
 ### Audio events (CLAP) — agent-curated vocabulary, mandatory
 
 The audio workflow has only one path: **spawn the vocab subagent**
-(it reads `speech_timeline.md` + `visual_timeline.md` and writes
+(it reads `merged_timeline.md` from step 1's first pack and writes
 `<edit>/audio_vocab.txt`), then run `audio_lane.py` against that
 vocab, then re-pack timelines. No smoke-test / agent-less fallback
 exists in the parent's playbook; the baked-in default vocab in
@@ -1317,6 +1342,14 @@ user quote" priority overrides its retake heuristic.
   agent if a question requires timeline knowledge.
 - **Editing `edl.json` by hand for "trivial" tweaks.** Always re-spawn.
 - **Curating `audio_vocab.txt` by hand.** Always re-spawn.
+- **Skipping the second `pack_timelines.py` run after
+  `audio_lane.py`.** The pack runs TWICE per session by design —
+  first after Phase A preprocess (so the vocab sub-agent has a
+  merged timeline to read), second after Phase B audio scoring (so
+  the editor sub-agent sees all three lanes interleaved). Skipping
+  the second pack ships the editor a merged view with no
+  `(audio: …)` lines, silently violating Hard Rule 15 (merged is
+  the editor's spine — it must contain every lane). See step 2.
 - **Skipping the pacing prompt.** Hard Rule 13.
 - **Skipping the four mode-gating questions in step 4.** They set
   `script_mode`, `b_roll_mode`, `timelapse_mode`, `user_profile` —

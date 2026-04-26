@@ -1128,8 +1128,9 @@ def main() -> None:
              "comments allowed). When omitted, the baked-in default "
              "vocab from helpers/audio_vocab_default.py is used. "
              "Tip: have the Claude agent write a curated vocab from "
-             "speech_timeline.md + visual_timeline.md, then re-run "
-             "this lane with --vocab <edit>/audio_vocab.txt --force.",
+             "merged_timeline.md (produced by the first "
+             "pack_timelines.py run after Phase A), then re-run this "
+             "lane with --vocab <edit>/audio_vocab.txt --force.",
     )
     ap.add_argument(
         "--model", choices=list(MODEL_TIERS.keys()), default=None,

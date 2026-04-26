@@ -61,7 +61,7 @@ Pre-processing produces three small markdown files per session, each addressable
 [00:12:24] AUDIO metal_scraping (0.62)
 ```
 
-> The CLAP audio lane is a **separate Phase B step** invoked after `preprocess.py` (or `preprocess_batch.py`) finishes. The agent reads `speech_timeline.md` + `visual_timeline.md`, generates a project-specific vocabulary in `audio_vocab.txt`, and then runs `helpers/audio_lane.py` against it. Pass `--include-audio` to the preprocessor to instead run CLAP inline against a baked-in baseline vocabulary (smoke tests, agent-less runs).
+> The CLAP audio lane is a **separate Phase B step** invoked after `preprocess.py` (or `preprocess_batch.py`) finishes. The first `pack_timelines.py` run produces a two-lane `merged_timeline.md` (speech + visual, interleaved by timestamp); the vocab agent reads that single file, writes a project-specific vocabulary to `audio_vocab.txt`, and then `helpers/audio_lane.py` scores against it. A second `pack_timelines.py` run folds the new audio events into the merged view for the editor. Pass `--include-audio` to the preprocessor to instead run CLAP inline against a baked-in baseline vocabulary (smoke tests, agent-less runs).
 
 ### On-demand visual drill-down
 

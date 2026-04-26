@@ -51,8 +51,9 @@ You point spawned sub-agents at these via their briefs (templates in
 
 - **`references/subagent_vocab_rules.md`** — vocab sub-agent's
   manual. Spawned once after Phase A speech + visual finishes, to
-  read `speech_timeline.md` + `visual_timeline.md` and produce a
-  project-specific `audio_vocab.txt`. Mandatory step — there is no
+  read `merged_timeline.md` (the two-lane interleaved view step 1's
+  first `pack_timelines.py` run produced) and write a project-
+  specific `audio_vocab.txt`. Mandatory step — there is no
   baseline-vocab shortcut in the parent's playbook.
 
 - **`references/animations.md`** — animation sub-agent's manual.
