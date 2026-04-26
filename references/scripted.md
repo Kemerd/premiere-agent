@@ -80,8 +80,9 @@ Per cut decision in scripted mode:
    script's prose timing. The script tells you *what* is said;
    the voiceover transcript tells you *when*.
 3. **Visual captions decide which clip lands on each beat.** The
-   `visual:` lines in `merged_timeline.md` (Florence-2 captions @ 1
-   fps) are how you verify a clip shows the named subject.
+   `[…]` visual lines in `audiovisual_timeline.md` (Florence-2
+   captions @ 1 fps) are how you verify a clip shows the named
+   subject.
 4. **Audio events are noisy hints only**, same as the default rule
    (Hard Rule on CLAP cross-checks).
 
@@ -214,28 +215,32 @@ voiceover that doesn't mention Riot.
 
 ### 4. Shortlist b-roll candidates per beat
 
-For each beat, you need a clip whose `visual:` captions in
-`merged_timeline.md` describe what the script says is visible.
+For each beat, you need a clip whose `[…]` visual captions in
+`audiovisual_timeline.md` describe what the script says is visible.
 
-The default reading surface is `merged_timeline.md` — read it
+The default reading surface is the dual spine
+(`audiovisual_timeline.md` + `speech_timeline.md`) — read BOTH
 end-to-end (per the ABSOLUTE READ MANDATE in
 `subagent_editor_rules.md`) before this step. The visual lane lines
-(`visual:`) are your search target.
+in `audiovisual_timeline.md` are your search target; the
+`speech_timeline.md` cross-check tells you whether the clip's
+on-camera speech aligns with or contradicts the script beat.
 
 **Three shortlisting paths**, pick whichever fits the library size
 and the user_profile bar:
 
 1. **In-context scan (default for small libraries).** Walk
-   `visual:` lines per beat for matches. Build a shortlist
+   the `[…]` visual lines in `audiovisual_timeline.md` per beat
+   for matches. Build a shortlist
    of 3-8 candidate clips per beat by:
    - Captions containing the beat's named subject ("Riot Games sign"
      → captions mentioning Riot, sign, banner, booth signage, logo).
    - Cross-checking the speech lane on the same source — if a clip's
      speaker is *talking about* the subject, that doesn't help; you
      want the clip *showing* the subject.
-   - Preferring clips with multiple consecutive matching `visual:`
-     lines (>= 3 seconds of stable visual evidence) over a single
-     one-frame hit (which might be a fast pan-through).
+   - Preferring clips with multiple consecutive matching `[…]`
+     visual lines (>= 3 seconds of stable visual evidence) over a
+     single one-frame hit (which might be a fast pan-through).
 
 2. **Spawn b-roll scout subagents (recommended for large libraries
    or `professional` bar).** Per `subagent_editor_rules.md` "B-roll
@@ -264,8 +269,9 @@ respect user organization.
 Pick the highest-evidence clip from the shortlist. Then **verify**
 before committing:
 
-- Read the surrounding `visual:` lines in `merged_timeline.md` (the
-  range you're proposing to cut from + 1-2 seconds before/after).
+- Read the surrounding `[…]` visual lines in
+  `audiovisual_timeline.md` (the range you're proposing to cut from
+  + 1-2 seconds before/after).
   Continuous matching captions = good. A single matching frame
   surrounded by something else = a fast pan, reject.
 - Drill into `<edit>/visual_timeline.md` for the full 1fps caption
@@ -362,10 +368,11 @@ mattered.
   word-boundary discipline (Hard Rule 6) on every cut edge.
 - **Hard Rule 14** still defers J/L cuts and dissolves to `0.0` —
   scripted mode does not unlock split edits.
-- **Hard Rule 15** (merged-view spine) still applies — read
-  `merged_timeline.md` end-to-end, drill into per-lane files at
-  ambiguous moments. The script does not replace the merged read; it
-  *adds* a structural anchor on top of it.
+- **Hard Rule 15** (dual-spine read) still applies — read BOTH
+  `audiovisual_timeline.md` AND `speech_timeline.md` end-to-end,
+  drill into per-lane files at ambiguous moments. The script does
+  not replace the dual-spine read; it *adds* a structural anchor on
+  top of it.
 
 ---
 
@@ -411,7 +418,7 @@ against.
 - **Matching by filename / metadata instead of visual captions.**
   Filenames lie ("riot_booth.mp4" might be a wide of the
   show floor where Riot is barely visible). Always verify against
-  `visual:` lines.
+  the `[…]` visual lines in `audiovisual_timeline.md`.
 - **Picking the first index hit without verifying.** Two-stage
   matching is the rule (shortlist + verify). Skipping verification
   is how brand b-roll lands on the wrong booth.
@@ -439,15 +446,16 @@ against.
 
 Three escalation tiers as your library grows:
 
-- **Tier 1 — in-context scan (small libraries).** Read
-  `merged_timeline.md` end-to-end once, then scan `visual:` lines
-  per beat. Cheap when library fits your read budget and the
-  number of beats is small (<= 8).
+- **Tier 1 — in-context scan (small libraries).** Read both
+  `audiovisual_timeline.md` and `speech_timeline.md` end-to-end
+  once, then scan the `[…]` visual lines in the AV file per beat.
+  Cheap when library fits your read budget and the number of beats
+  is small (<= 8).
 - **Tier 2 — clip index (medium-large libraries, no scouts yet).**
   When parent has built `<edit>/clip_index/index.json` (a
   per-clip text-searchable record from cached captions + speech),
   query the index per beat for shortlisting, then verify the
-  top candidate(s) against `merged_timeline.md` /
+  top candidate(s) against `audiovisual_timeline.md` /
   `visual_timeline.md`. The index is a parent-managed helper
   (`helpers/clip_index.py`-style); it's optional. The index
   accelerates step 4; it doesn't replace verification in step 5.
@@ -462,6 +470,7 @@ Three escalation tiers as your library grows:
   scanning, and it stacks with the index when both are available
   (you can pass the index path to scouts for faster shortlisting).
 
-For ALL tiers: the merged_timeline read in pre-flight is still
+For ALL tiers: the dual-spine pre-flight read
+(`audiovisual_timeline.md` + `speech_timeline.md`) is still
 mandatory; the verification step (step 5) still binds; and source
 in-points (step 6) are computed by you, not by scouts or the index.

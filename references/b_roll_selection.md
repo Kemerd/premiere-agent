@@ -95,7 +95,7 @@ A candidate is **rejected** (drop and pick next in the
 shortlist) if any of these are true:
 
 - **Visual captions contradict the script beat.** The
-  `merged_timeline.md` `visual:` line for the candidate range says
+  `audiovisual_timeline.md` `[…]` visual line for the candidate range says
   one thing, the script says another, and they're not the same
   subject. Older filenames or path-based hints don't override the
   caption — Florence-2 saw what's there; trust it. Example: file
@@ -228,19 +228,20 @@ The reusable model:
   `transcripts/` + `visual_caps/` and builds a per-clip
   searchable record. The editor doesn't build it; the parent runs
   the helper and (if available) names the path in the brief.
-  Without an index, scan `merged_timeline.md` per beat — slower
-  but correct.
+  Without an index, scan `audiovisual_timeline.md` per beat —
+  slower but correct.
 
 If the parent's brief says `clip_index_available = true` and points
 at `<edit>/clip_index/index.json`, treat it as a shortlisting aid
-only — the merged-timeline pre-flight (ABSOLUTE READ MANDATE) still
-binds before any beat-level matching.
+only — the dual-spine pre-flight (ABSOLUTE READ MANDATE on
+`audiovisual_timeline.md` + `speech_timeline.md`) still binds
+before any beat-level matching.
 
 ### 1b. Delegate shortlisting to b-roll scout sub-agents (large libraries / professional bar)
 
 For large libraries (`>50` b-roll-eligible clips) OR `user_profile
 = professional` with many named-subject beats OR ambiguous beats
-where the merged view didn't decide: delegate per-beat
+where the AV view didn't decide: delegate per-beat
 shortlisting to **b-roll scout subagents** per
 `subagent_editor_rules.md` "B-roll scout spawn protocol". Spawn N
 scouts in parallel (Hard Rule 10), one per beat or one per
@@ -249,7 +250,7 @@ cluster, pass them the in-scope source list from
 
 Scouts read `<edit>/visual_timeline.md` in their own fresh context
 window for the in-scope sources only — they don't re-read your
-merged_timeline. Their job is shortlisting; yours is
+dual-spine timelines. Their job is shortlisting; yours is
 verification + selection + EDL writing. See
 `references/subagent_broll_scout_rules.md` for what scouts do.
 
@@ -263,10 +264,11 @@ The non-negotiable structure:
 
 - **Stage 1 (shortlist):** fast text-overlap query against cached
   evidence (clip-index search, or careful read of
-  `merged_timeline.md` `visual:` lines) → top 3-8 candidates per
-  beat.
-- **Stage 2 (verify):** drill into the surrounding `visual:` context
-  (and `visual_timeline.md` for full 1fps detail) on the top
+  `audiovisual_timeline.md` `[…]` visual lines) → top 3-8
+  candidates per beat.
+- **Stage 2 (verify):** drill into the surrounding visual context
+  in `audiovisual_timeline.md` (and `visual_timeline.md` for full
+  1fps detail) on the top
   candidate. If verification fails, descend to the next candidate.
   Optionally invoke `helpers/timeline_view.py` for filmstrip /
   waveform PNG inspection at high-stakes moments.
@@ -381,8 +383,9 @@ QA / verification dial.
 - **Hard Rule 14** still defers J/L cuts and dissolves. B-roll
   cutaways are hard cuts only; the NLE's caption track and the 30ms
   `afade` pair on each boundary handle the soundscape.
-- **Hard Rule 15** — read `merged_timeline.md` end-to-end before any
-  beat-level work; the merged view is your default reading surface.
+- **Hard Rule 15** — read BOTH `audiovisual_timeline.md` AND
+  `speech_timeline.md` end-to-end before any beat-level work; the
+  dual spine is your default reading surface.
 
 ---
 

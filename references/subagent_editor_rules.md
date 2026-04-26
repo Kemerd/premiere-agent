@@ -101,8 +101,9 @@ Schema:
 When `mode = dual_mic`, two transcripts exist for the same shot:
 `transcripts/<stem>.json` (camera audio) and
 `transcripts/<stem>.audio.json` (lav / external recorder). Both
-appear as separate entries in `merged_timeline.md` with the suffixed
-stem visible in the source label. **Treat them as the same shot for
+appear as separate entries in `audiovisual_timeline.md` and
+`speech_timeline.md` with the suffixed stem visible in the source
+label. **Treat them as the same shot for
 cut purposes** — don't place the same beat twice. The full handling
 procedure is below in "Dual-mic pair handling"; that section is
 mandatory reading whenever `source_pairs.json` is present with
@@ -118,7 +119,7 @@ detected (or the batch predates pair detection). Proceed normally.
 
 
 These cold-path files are **additive** to your default rules — they
-don't replace the merged-view spine read below, the pacing-preset
+don't replace the dual-spine read below, the pacing-preset
 algorithm, the word-boundary discipline, or any Hard Rule. When
 both `script_mode` and `b_roll_mode` are true (common combo for
 voiceover-driven assembly), read both files; the assembly procedure
@@ -133,16 +134,34 @@ override them.
 
 ### What you must read in full, every spawn
 
-1. **`<edit>/merged_timeline.md`** — END-TO-END. EVERY LINE.
+1. **TWO mandatory reading surfaces — read BOTH end-to-end, every
+   line, every spawn.**
 
-   This is your default reading surface — speech phrases (`"..."`),
-   audio events (`(audio: ...)`), and visual captions (`visual: ...`)
-   for every source, all interleaved chronologically by timestamp.
-   The file is caveman-compressed and sentence-delta-deduped at pack
-   time so it fits comfortably in your fresh context window —
-   typical projects land in the 200KB-1.5MB range — but EVEN IF a
-   project produced a file an order of magnitude larger, the rule
-   is the same: read every line.
+   1a. **`<edit>/audiovisual_timeline.md`** — END-TO-END. EVERY LINE.
+
+       Audio events (`(...)`) and visual captions (`[...]`) for
+       every source, interleaved chronologically by timestamp.
+       Speech is intentionally NOT in this file — it lives in 1b
+       below. The file is caveman-compressed and sentence-delta-
+       deduped at pack time so it fits comfortably in your fresh
+       context window — typical projects land in the 200KB-1.5MB
+       range — but EVEN IF a project produced a file an order of
+       magnitude larger, the rule is the same: read every line.
+
+   1b. **`<edit>/speech_timeline.md`** — END-TO-END. EVERY LINE.
+
+       Phrase-grouped Parakeet transcripts with `M:SS-M:SS [Sn]
+       "phrase text"` per line. Integer ranges are **outer-aligned**:
+       start rounds DOWN, end rounds UP, so the integer range is a
+       guaranteed SUPERSET of the underlying float [start, end] in
+       `transcripts/<stem>.json`. This means any integer range you
+       read here can be handed straight to `helpers/find_quote.py`
+       (see "Word-boundary verification" below) without off-by-one
+       fences.
+
+   The two files are aligned by `## <stem>` headers — when reasoning
+   about a clip, scroll them in parallel: AV gives you the soundscape
+   + on-screen action, speech gives you the editorial spine.
 
 2. **The prior `<edit>/edl.json` (on revisions only)** — END-TO-END.
    EVERY RANGE. EVERY FIELD.
@@ -174,12 +193,12 @@ an explicit error message and halt:
 
 ```
 BUDGET_EXHAUSTED
-  file: <edit>/merged_timeline.md
-  covered: lines [start..end] of [start..N]
-  reason: file too large for current model context
+  files: <edit>/audiovisual_timeline.md AND/OR <edit>/speech_timeline.md
+  covered: lines [start..end] of [start..N] per file
+  reason: combined size too large for current model context
   recovery options:
     - parent respawns me on a model with a larger context window
-    - parent pre-shards the file (future: pack_timelines.py --shard)
+    - parent pre-shards the file(s) (future: pack_timelines.py --shard)
     - parent reduces the source set (which sources matter for THIS
       revision?) and respawns
 ```
@@ -191,10 +210,15 @@ pick recoverable.
 ### Forbidden behaviours — every one is a violation regardless of how good the resulting cut looks
 
 - Reading only the first N lines / last N lines / "a representative
-  sample" of `merged_timeline.md`.
-- `grep` / `rg`-ing for keywords and emitting an EDL from matches
-  alone (loses the chronological structure making the merged view
-  useful at all).
+  sample" of `audiovisual_timeline.md` or `speech_timeline.md`.
+- Reading only one of the two mandatory files (`audiovisual_timeline.md`
+  alone is missing the editorial spine; `speech_timeline.md` alone is
+  blind to the soundscape and on-screen action). BOTH or neither.
+- `grep` / `rg`-ing for keywords in the timelines and emitting an EDL
+  from matches alone (loses the chronological structure making the
+  AV + speech views useful at all). For sub-second, word-precise
+  quote → time lookup, use `helpers/find_quote.py` against
+  `transcripts/<stem>.json` — never grep transcripts.
 - Chunked reads abandoned partway through ("I have enough...", "this
   section is repetitive...", "I can extrapolate from here..."). You
   don't have enough. You can't extrapolate. Finish the file.
@@ -212,8 +236,9 @@ pick recoverable.
   coverage.
 - On revisions: reading only the lines around the user's complaint
   and assuming the rest of the prior EDL is fine. Read the whole
-  prior EDL. Read the whole `merged_timeline.md` again. Every spawn,
-  every revision, full coverage.
+  prior EDL. Read both `audiovisual_timeline.md` and
+  `speech_timeline.md` again. Every spawn, every revision, full
+  coverage.
 - Returning a partial-read EDL silently with a note like "(read most
   of the file, used judgement on the rest)." That converts a silent
   failure into a confessed failure but it's still a failure. Use
@@ -237,33 +262,39 @@ the same brief and an angry parent.
      `(audio: ...)` and `visual:` disagree about what's on screen,
      trust visual.
 
-2. **Drill into per-lane files only when the merged view is
-   ambiguous.** Use `<edit>/speech_timeline.md` for **phrase-level**
-   start/end ranges (the merged view shows phrase START only; this
-   file shows the matching END so you can scope a phrase span);
-   `<edit>/visual_timeline.md` for the full 1fps caption stream
-   including `(same)` repeats; `<edit>/audio_timeline.md` for
-   per-window CLAP scoring detail. The per-lane files are also
-   bound by the ABSOLUTE READ MANDATE if you open them — drill
-   into a SPECIFIC moment, but read surrounding context fully,
-   not a one-line snippet.
+2. **Drill into the remaining per-lane files only when the dual
+   spine is ambiguous.** `<edit>/visual_timeline.md` for the full
+   1fps caption stream including `(same)` repeats;
+   `<edit>/audio_timeline.md` for per-window CLAP scoring detail.
+   These per-lane files are bound by the ABSOLUTE READ MANDATE if
+   you open them — drill into a SPECIFIC moment, but read
+   surrounding context fully, not a one-line snippet. Note that
+   `speech_timeline.md` is no longer a "drill-down" file — it is
+   one of the two MANDATORY reads from step 1; do not relegate it.
 
    **Per-word timestamps live ONLY in `<edit>/transcripts/<stem>.json`**
    (raw Parakeet `words[]` array with `{text, start, end}` per token).
-   Neither merged nor speech_timeline carry word boundaries — phrase
-   grouping in those files concatenates words for readability and
-   drops the per-token times. When you need to verify a cut at a
-   specific word (which is every cut — see "Word-boundary
-   verification" below), `transcripts/<stem>.json` is the canonical
-   source. The shared_rules anti-pattern about reading transcripts
-   directly is for general timeline SCANNING (use the markdowns —
-   they're 1/10 the tokens); at cut-verification time you read
-   transcripts surgically for the words that bracket your candidate
-   cut, not the whole file.
+   Neither AV nor speech timelines carry word boundaries — phrase
+   grouping in `speech_timeline.md` concatenates words for readability
+   and drops the per-token times. When you need to verify a cut at
+   a specific word (which is every cut — see "Word-boundary
+   verification" below), use **`helpers/find_quote.py`** to crawl
+   `transcripts/<stem>.json` programmatically — it accepts a clip
+   stem + integer time range (which you read directly out of
+   `speech_timeline.md`) and/or a quote substring, and returns
+   word-precise `{start, end}` timestamps as JSON. Do NOT `grep` /
+   hand-parse `transcripts/<stem>.json` — the helper is 50-100x
+   faster and bounds-checks the result against the speech-timeline
+   integer range so off-by-one errors are impossible. Reading
+   `transcripts/<stem>.json` directly is reserved for cases the
+   helper genuinely cannot answer (e.g. inspecting a stem's
+   diarization metadata).
 
-3. **If `merged_timeline.md` is missing**, STOP and report — the
-   parent must re-run `python helpers/pack_timelines.py --edit-dir
-   <edit>` to regenerate it. Don't invent a workaround.
+3. **If `audiovisual_timeline.md` OR `speech_timeline.md` is
+   missing**, STOP and report — the parent must re-run
+   `python helpers/pack_timelines.py --edit-dir <edit>` to
+   regenerate them. Don't invent a workaround. Both files are
+   mandatory; reasoning from one alone is a Hard Rule 15 violation.
 
 ---
 
@@ -314,42 +345,57 @@ this section is the procedure that enforces it. **No EDL range gets
 emitted until both `start` and `end` have been verified against the
 WORD-level timestamps in `<edit>/transcripts/<stem>.json`.**
 
-The merged view exists for beat planning, not for setting cut times.
-Phrase START times shown in `merged_timeline.md` are rounded to whole
-seconds and carry no information about where the speaker actually
-stopped. Snapping a cut to a merged-view timestamp is guessing; the
-underlying Parakeet word boundaries are sub-second precise and live
-in `transcripts/<stem>.json`. Use them.
+The two-file dual spine exists for beat planning, not for setting
+cut times. Phrase ranges in `speech_timeline.md` are outer-aligned
+to whole seconds (`floor(start)..ceil(end)`); they fully ENCLOSE the
+underlying float spans but they do NOT tell you where individual
+words start and end. The Parakeet word boundaries are sub-second
+precise and live in `transcripts/<stem>.json`. Use them — through
+`helpers/find_quote.py`, not through `grep` / hand-parsing.
 
 ### What each file actually carries
 
 | File                            | Granularity      | Use for cuts? |
 |---------------------------------|------------------|---------------|
-| `merged_timeline.md`            | phrase START only, rounded to whole seconds | NO — beat planning only |
-| `speech_timeline.md`            | phrase START-END range, whole seconds       | NO — phrase-span scoping only |
-| `transcripts/<stem>.json`       | per-word `{text, start, end}` sub-second    | **YES — canonical source for every cut anchor** |
+| `audiovisual_timeline.md`       | per-second visual + per-window audio (no speech) | NO — beat planning + soundscape only |
+| `speech_timeline.md`            | phrase START-END range, outer-aligned (start floor / end ceil) | NO — phrase-span scoping; integer range fully encloses the float span |
+| `transcripts/<stem>.json` (via `helpers/find_quote.py`) | per-word `{text, start, end}` sub-second | **YES — canonical source for every cut anchor** |
 
 ### Verification workflow (run on every range you write)
 
-For each candidate range you decide on while reading the merged view:
+For each candidate range you decide on while reading the dual spine:
 
-1. **Identify the words you want to keep.** From the phrase quoted in
-   the merged line, pick the first and last word the kept range
-   should contain — e.g. *"Geared to lock in the uplock hook"* with
-   the user wanting to keep through *"lock in"* gives
+1. **Identify the words you want to keep.** From the phrase quoted
+   in `speech_timeline.md`, pick the first and last word the kept
+   range should contain — e.g. *"Geared to lock in the uplock hook"*
+   with the user wanting to keep through *"lock in"* gives
    `first_word = "Geared"`, `last_word = "in"`.
 
-2. **Open `<edit>/transcripts/<S>.json`.** The JSON has a top-level
-   `words` array; entries with `type == "word"` carry the per-token
-   timestamps you need. Walk forward from somewhere near the merged
-   timestamp (which is in seconds) until you find the matching
-   `first_word` / `last_word` instances. Match on `text` (case-
-   insensitive, punctuation-stripped); when a word repeats in the
-   phrase, the merged timestamp tells you which instance.
+2. **Call `helpers/find_quote.py`** to crawl
+   `<edit>/transcripts/<S>.json` programmatically. Pass the clip
+   stem, the integer time range you read straight off
+   `speech_timeline.md` (which is a guaranteed superset of the
+   actual word span), and either a quote substring or a pair of
+   word anchors. The helper returns word-precise `{start, end}`
+   in JSON, plus the matched word run for sanity-checking. It is
+   bounds-checked, lightning fast (sequential JSON walk under the
+   integer range — typically under 5ms), and removes the off-by-one
+   class of bugs entirely. Example invocation:
 
-3. **Snap the cut anchors to actual word boundaries.**
-   - In-point: `kept_first_word.start`
-   - Out-point: `kept_last_word.end`
+   ```bash
+   python helpers/find_quote.py \
+       --edit-dir <edit> \
+       --clip <S> \
+       --range 0:02-0:18 \
+       --quote "lock in"
+   ```
+
+   Reading `transcripts/<stem>.json` by hand or with `grep` is
+   forbidden — the helper is the supported interface.
+
+3. **Snap the cut anchors to the helper's word boundaries.**
+   - In-point: `result.first_word.start`
+   - Out-point: `result.last_word.end`
    - Never let the cut land between a word's `start` and `end`.
 
 4. **Apply pacing-preset margins** (per the formula in "Pacing
@@ -367,32 +413,41 @@ For each candidate range you decide on while reading the merged view:
 
 ### Worked example — "cut after 'lock in'"
 
-Phrase visible in merged: `0:03 "Geared to lock in the uplock hook."`
+Phrase visible in `speech_timeline.md`:
+`0:03-0:05 [S0] "Geared to lock in the uplock hook."`
 Editor goal: keep through *"lock in"*, drop the rest.
 
-`transcripts/<S>.json` (relevant slice):
+`helpers/find_quote.py` invocation:
 
-```json
-{"type": "word", "text": "Geared", "start": 3.12, "end": 3.45}
-{"type": "word", "text": "to",     "start": 3.46, "end": 3.55}
-{"type": "word", "text": "lock",   "start": 3.56, "end": 3.78}
-{"type": "word", "text": "in",     "start": 3.80, "end": 3.95}
-{"type": "word", "text": "the",    "start": 4.10, "end": 4.18}
+```bash
+python helpers/find_quote.py --edit-dir <edit> --clip <S> \
+    --range 0:03-0:05 --quote "Geared to lock in"
 ```
 
-- Out-point snaps to `in.end = 3.95` — the last word kept.
+Helper output (relevant fields):
+
+```json
+{
+  "first_word": {"text": "Geared", "start": 3.12, "end": 3.45},
+  "last_word":  {"text": "in",     "start": 3.80, "end": 3.95},
+  "next_word":  {"text": "the",    "start": 4.10, "end": 4.18}
+}
+```
+
+- Out-point snaps to `last_word.end = 3.95` — the last word kept.
 - Naive Paced trail_margin (200ms) would give `range.end = 4.15`,
-  but the next word `the` starts at 4.10. The combined-pad clamp
-  binds: `gap_ms = 4.10 − 3.95 = 150ms`; clamp ceiling
-  `max(0, 150 − 60) = 90ms`. Final `range.end = 3.95 + 0.09 = 4.04`
-  so 60ms of true silence remains for the `afade` pair.
+  but the helper also returns `next_word.start = 4.10`. The
+  combined-pad clamp binds: `gap_ms = 4.10 − 3.95 = 150ms`; clamp
+  ceiling `max(0, 150 − 60) = 90ms`. Final `range.end = 3.95 +
+  0.09 = 4.04` so 60ms of true silence remains for the `afade` pair.
 - In-point uses the same procedure on the FIRST word of the kept
   range (here `Geared.start = 3.12`, padded by lead_margin with
   the same clamp against the prior range's tail).
 
-The merged-view timestamp `0:03` was the input to the lookup; the
-EDL number is `3.12` / `4.04`. Sub-second precision came from the
-transcript, never from the merged view.
+The speech-timeline range `0:03-0:05` was the input to the lookup;
+the EDL number is `3.12` / `4.04`. Sub-second precision came from
+the helper crawling `transcripts/<S>.json`, never from the integer
+ranges in the markdown.
 
 ### What counts as a verification miss (forbidden)
 
@@ -621,10 +676,11 @@ timeline shows:
 
 - **Speech-first.** Candidate cuts come from word boundaries and
   silence gaps. Parakeet TDT is accurate to the word; the speech lane
-  is the editorial spine. Read speech interleaved in
-  `merged_timeline.md` for beat planning; **verify every cut anchor
-  against `transcripts/<stem>.json` per "Word-boundary verification"
-  above before writing the EDL.** `speech_timeline.md` carries
+  is the editorial spine. Read `speech_timeline.md` end-to-end (per
+  the dual-spine read mandate) for beat planning; **verify every cut
+  anchor against `transcripts/<stem>.json` via `helpers/find_quote.py`
+  per "Word-boundary verification" above before writing the EDL.**
+  `speech_timeline.md` carries
   phrase-level start/end ranges — useful for scoping a phrase span,
   not for setting a sub-phrase cut point (no per-word times in that
   file).
@@ -637,8 +693,9 @@ timeline shows:
   override per-handoff if the moment calls for it.
 
 - **Visual context is the second source of truth.** Before committing
-  to any non-trivial cut, check `visual:` lines around the cut point
-  in `merged_timeline.md`. If captions show continuous action
+  to any non-trivial cut, check `[...]` visual caption lines around
+  the cut point in `audiovisual_timeline.md`. If captions show
+  continuous action
   spanning your cut, you're cutting mid-shot — usually fine, but be
   deliberate. Use the visual lane to find B-roll cutaway candidates,
   match cuts, shot changes, and to decide whether a moment is worth
@@ -730,9 +787,11 @@ back to the user in plain English.
 
 ### Trigger-phrase detection
 
-Walk the speech lane in `merged_timeline.md` (and `speech_timeline.md`
-when you need word-level timing) for any phrase the speaker uses to
-**address an editor or AI**. Match liberally — case-insensitive,
+Walk `speech_timeline.md` (the editorial spine you read end-to-end
+in step 1b) for any phrase the speaker uses to **address an editor
+or AI**. For sub-second word timing on a matched phrase, hand the
+phrase + speech-timeline range to `helpers/find_quote.py`. Match
+liberally — case-insensitive,
 tolerant of mis-transcription — but require **imperative or
 instructional content after the address** before treating it as
 a note.
@@ -926,8 +985,9 @@ Walk the speech lane looking for these patterns:
    cue.
 
 3. **Cross-clip retakes.** Two adjacent sources starting with
-   similar content. Source ordering in `merged_timeline.md` is the
-   parent's argv order; if filenames suggest sequence (`C0312` then
+   similar content. Source ordering in `audiovisual_timeline.md`
+   and `speech_timeline.md` is the parent's argv order; if
+   filenames suggest sequence (`C0312` then
    `C0313` recorded back-to-back, or `intro_take1.MP4` then
    `intro_take2.MP4`), the second is almost always the keeper for
    any overlap.
@@ -1133,10 +1193,10 @@ pair as one shot for cut purposes, pick the better transcript per
 cut, and record which one you used so the parent can surface it in
 the user-facing summary.
 
-### What appears in `merged_timeline.md`
+### What appears in the timeline files
 
-For a pair with stem `SHOT_0042`, the merged view contains TWO source
-sections:
+For a pair with stem `SHOT_0042`, both `audiovisual_timeline.md`
+and `speech_timeline.md` contain TWO source sections:
 
 ```
 === SHOT_0042 (00:01:23 — 00:01:48) ===
@@ -1266,9 +1326,10 @@ scouts are worth it.
 
 Spawn a scout (or batch of parallel scouts) when ANY of:
 
-- **Library is large.** `>50` b-roll-eligible clips, or
-  `merged_timeline.md` strained your read budget. Per-beat
-  re-scanning of `visual:` lines is wasteful at this size.
+- **Library is large.** `>50` b-roll-eligible clips, or the dual
+  spine (`audiovisual_timeline.md` + `speech_timeline.md`) strained
+  your read budget. Per-beat re-scanning of visual lines is wasteful
+  at this size.
 - **`user_profile = professional`.** Top-candidate review on every
   named-subject beat is mandatory; offloading shortlisting to scouts
   + you doing verification/selection yields better QA notes.
@@ -1276,7 +1337,7 @@ Spawn a scout (or batch of parallel scouts) when ANY of:
   with named-subject b-roll, parallel scouts (Hard Rule 10) finish
   faster than sequential in-context scanning.
 - **Ambiguous beat.** A specific beat where the visual evidence in
-  the merged view didn't decide it — a scout's fresh-context
+  the AV view didn't decide it — a scout's fresh-context
   visual_timeline read can surface candidates you missed.
 
 For small libraries (`<= 30` clips) and `personal` / `creator` bar,
@@ -1359,7 +1420,7 @@ OUTPUT:
 
 ### When to NOT spawn scouts
 
-- Tiny libraries (<= 5 clips) — read merged_timeline once, decide.
+- Tiny libraries (<= 5 clips) — read both timelines once, decide.
 - Pure talking-head with one A-roll source and 1-2 cutaways — same.
 - The user explicitly said "I want this fast, don't over-engineer
   it" — note in your return that scouts were skipped per the user's
@@ -1371,9 +1432,9 @@ When the scout returns:
 
 1. Read the scout's JSON shortlist + rationale.
 2. For each beat, pick the top-ranked candidate passing YOUR
-   verification (drill into `merged_timeline.md` around the
-   candidate range; check there's no audio-event or speech
-   conflict you care about).
+   verification (drill into `audiovisual_timeline.md` +
+   `speech_timeline.md` around the candidate range; check there's
+   no audio-event or speech conflict you care about).
 3. If the top candidate fails verification, descend to candidate 2,
    3, ... — that's why you got a shortlist.
 4. Compute the source in-point per `scripted.md` step 6 using the
@@ -1414,7 +1475,9 @@ a 5-30s timelapse on the output timeline.
 
 ### When to reach for it
 
-Look for stretches in `merged_timeline.md` where BOTH are true:
+Look for stretches in `audiovisual_timeline.md` (cross-checking
+`speech_timeline.md` for any speech you'd be silencing) where BOTH
+are true:
 
 1. **Visually continuous activity** — long runs of `(same)` collapses
    in `visual_timeline.md` OR successive `visual:` lines describing
@@ -1628,14 +1691,19 @@ factual, be terse on the report, but thorough on the EDL itself.
 
 ## Editor-specific anti-patterns
 
-- **Skipping the merged_timeline read** to "save time." Violates the
-  ABSOLUTE READ MANDATE at the top of this file. The cut is silently
-  bad and the user will catch it.
-- **Emitting an EDL range without word-boundary verification against
-  `transcripts/<stem>.json`.** This is the mid-sentence-cut footgun —
-  the merged view rounds to whole seconds, speech_timeline is
-  phrase-level, only `transcripts/<stem>.json` carries the per-word
-  `{start, end}` Hard Rule 6 binds you to. Verify the words bracketing
+- **Skipping either timeline read** to "save time." Violates the
+  ABSOLUTE READ MANDATE at the top of this file. BOTH
+  `audiovisual_timeline.md` AND `speech_timeline.md` are mandatory
+  end-to-end reads, every spawn. The cut is silently bad if you skip
+  one, and the user will catch it.
+- **Emitting an EDL range without word-boundary verification via
+  `helpers/find_quote.py` against `transcripts/<stem>.json`.** This
+  is the mid-sentence-cut footgun — the AV view has no speech, the
+  speech timeline rounds outward to whole seconds (it CONTAINS the
+  word span but doesn't pin it), only `transcripts/<stem>.json`
+  carries the per-word `{start, end}` Hard Rule 6 binds you to, and
+  `find_quote.py` is the supported interface for crawling it. Verify
+  the words bracketing
   every cut anchor; snap `range.start` to `kept_first_word.start`
   and `range.end` to `kept_last_word.end` before applying margins.
   See "Word-boundary verification" above.
@@ -1704,7 +1772,8 @@ factual, be terse on the report, but thorough on the EDL itself.
   spawning forfeits the parallelism making scouts worthwhile.
 - **Trusting a scout's top candidate without verification.** The
   scout shortlists; you decide. Verification (drilling
-  `merged_timeline.md` around the candidate range) still binds.
+  `audiovisual_timeline.md` + `speech_timeline.md` around the
+  candidate range) still binds.
 - **Ignoring `source_tags.json` when proposing b-roll candidates.**
   A-roll-tagged clips don't become cutaways unless the user
   explicitly authorized it. The user organized for a reason.

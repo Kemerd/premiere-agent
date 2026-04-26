@@ -27,10 +27,10 @@ the entire pipeline:
 
 What you DO NOT do:
 
-- **Read `merged_timeline.md`, `visual_timeline.md`, or
+- **Read `audiovisual_timeline.md`, `visual_timeline.md`, or
   `audio_timeline.md` directly.** Those are the token-heavy lanes
   (Florence-2 visual captions at 1fps, CLAP audio events, and the
-  merged interleaved view of all three). They exist for sub-agents
+  AV interleaved view of those two). They exist for sub-agents
   to read in fresh context windows; the parent's accumulating
   context never absorbs caption density.
 - **Edit `edl.json` by hand.** Every change re-spawns the editor.
@@ -70,14 +70,17 @@ they put it. All session outputs land in `<videos_dir>/edit/`.
     ├── project.md               ← memory; appended every session.
     │                              Parent's primary direct-read file
     │                              (alongside speech_timeline.md).
-    ├── merged_timeline.md       ← editor sub-agent's default reading
-    │                              surface — all 3 lanes interleaved
-    │                              chronologically by timestamp.
-    │                              PARENT NEVER OPENS THIS.
-    ├── speech_timeline.md       ← Parakeet phrase-level transcripts
-    │                              (lane 1, drill-down for editor;
-    │                              ALSO parent-readable for content
-    │                              awareness — token-cheap text)
+    ├── audiovisual_timeline.md  ← MANDATORY read #1 for editor + vocab
+    │                              sub-agents — audio + visual lanes
+    │                              interleaved chronologically (NO
+    │                              speech). PARENT NEVER OPENS THIS.
+    ├── speech_timeline.md       ← MANDATORY read #2 for editor + vocab
+    │                              (Parakeet phrase ranges, outer-
+    │                              aligned floor-start/ceil-end so any
+    │                              integer range maps cleanly back into
+    │                              transcripts/<stem>.json). ALSO
+    │                              parent-readable for content awareness
+    │                              — token-cheap text.
     ├── audio_timeline.md        ← CLAP audio events, coalesced
     │                              (lane 2, drill-down for editor,
     │                              produced by Phase B vocab pass.
@@ -448,32 +451,37 @@ python helpers/pack_timelines.py --edit-dir <videos_dir>/edit
 `--visual-fps N` (visual sample rate in frames/sec, default `1.0`,
 fractional accepted — `0.5` = one frame every 2 s, `0.25` = every
 4 s; lower for slow / lecture / static / long-form content where
-1 fps over-samples and bloats merged_timeline.md, cost scales
+1 fps over-samples and bloats audiovisual_timeline.md, cost scales
 linearly). **Do NOT pass `--include-audio`** — that flag runs CLAP
 inline against a fallback vocabulary that exists only for `tests.py`
 smoke testing. This skill mandates the curated-vocab path (step 2
 below).
 
-`pack_timelines.py` produces `merged_timeline.md` (the editor's
-default reading surface) plus the per-lane drill-down files:
-`speech_timeline.md`, `audio_timeline.md` (only after step 2 runs),
-`visual_timeline.md`. **You read `speech_timeline.md` after this
-first pack** to seed the Conversation Context bundle with the
+`pack_timelines.py` produces TWO mandatory sub-agent reading
+surfaces — `audiovisual_timeline.md` (audio + visual interleaved;
+NO speech) and `speech_timeline.md` (phrase ranges with outer-
+aligned `floor(start)..ceil(end)` integer rounding) — plus the per-
+lane drill-down files `audio_timeline.md` (only after step 2 runs)
+and `visual_timeline.md`. **You read `speech_timeline.md` after
+this first pack** to seed the Conversation Context bundle with the
 actual transcript content (see step 3 below). The other three
-files — `merged_timeline.md`, `visual_timeline.md`,
+files — `audiovisual_timeline.md`, `visual_timeline.md`,
 `audio_timeline.md` — are sub-agent territory; they carry the
 token-heavy caption / event density and you never open them.
 
 ### 2. Audio events — spawn the vocab sub-agent (mandatory)
 
-Spawn the vocab subagent. It reads `<edit>/merged_timeline.md` —
-the interleaved speech + visual view step 1's pack already
-produced — and writes a project-specific CLAP vocabulary at
-`<edit>/audio_vocab.txt`. This is **not optional** and **no
-shortcut to a baseline vocabulary** exists — generic 527-class
-taxonomies mis-label real-world content (workshop tools tagged as
-"music", room tone tagged as "applause"). The agent-curated vocab is
-the only path that produces a usable audio_timeline.
+Spawn the vocab subagent. It reads BOTH
+`<edit>/audiovisual_timeline.md` (only the visual lane is populated
+at this point — audio hasn't scored yet, that's exactly what this
+sub-agent's vocab enables) AND `<edit>/speech_timeline.md` — both
+end-to-end, line by line — and writes a project-specific CLAP
+vocabulary at `<edit>/audio_vocab.txt`. This is **not optional**
+and **no shortcut to a baseline vocabulary** exists — generic
+527-class taxonomies mis-label real-world content (workshop tools
+tagged as "music", room tone tagged as "applause"). The agent-
+curated vocab is the only path that produces a usable
+audio_timeline.
 
 **Brief template (vocab subagent):** see "Brief templates" section
 below. Spawn via the `Task` / `Agent` tool.
@@ -488,25 +496,28 @@ python helpers/pack_timelines.py --edit-dir <edit>
 
 The first command runs CLAP zero-shot scoring against the curated
 vocab. The second re-runs the pack so the new audio events fold
-into both `merged_timeline.md` (default) and `audio_timeline.md`.
+into both `audiovisual_timeline.md` (default) and `audio_timeline.md`.
 
 **`pack_timelines.py` runs TWICE per session — this is a rule, not
-an accident.** First run (step 1, after preprocess) produces a
-merged timeline with two lanes — speech and visual — which the
-vocab sub-agent reads to curate `audio_vocab.txt`. Second run
-(this step, after `audio_lane.py`) folds the freshly-scored audio
-events into the same `merged_timeline.md` so the editor sub-agent
-in step 6 reads all three lanes interleaved on one page. Skipping
-the second pack ships the editor a merged view with no
-`(audio: …)` lines and silently breaks Hard Rule 15 (the merged
-view is the editor's spine — it must contain every lane). Always
-run both passes; do not try to "save a pack" by skipping either.
+an accident.** First run (step 1, after preprocess) produces
+`speech_timeline.md` plus an `audiovisual_timeline.md` carrying
+only the visual lane; the vocab sub-agent reads BOTH end-to-end
+to curate `audio_vocab.txt`. Second run (this step, after
+`audio_lane.py`) folds the freshly-scored audio events into the
+same `audiovisual_timeline.md` so the editor sub-agent in step 6
+reads audio + visual interleaved alongside the speech file.
+Skipping the second pack ships the editor an AV view with no
+`(audio: …)` lines and silently breaks Hard Rule 15 (the dual
+spine of `audiovisual_timeline.md` + `speech_timeline.md` — both
+must be current). Always run both passes; do not try to "save a
+pack" by skipping either.
 
 If the user explicitly says they do not care about audio events at
 all (rare — usually a single-speaker talking-head with no ambient
 work), you may skip the vocab subagent and the `audio_lane.py` run.
-The editor subagent will still cut from the merged_timeline using
-just speech + visual; `(audio: ...)` lines will simply be absent.
+The editor subagent will still cut from
+`audiovisual_timeline.md` + `speech_timeline.md` using just visual
++ speech; `(audio: ...)` lines will simply be absent.
 Note the skip in `project.md` so next session knows.
 
 ### 3. Pre-scan for content awareness — speech only, lightly
@@ -534,7 +545,7 @@ What to extract from the read into the Conversation Context bundle:
   called out themselves ("hey editor, skip this take").
 - Anything ambiguous you want to ask the user about by name.
 
-You still **do not** read `merged_timeline.md`,
+You still **do not** read `audiovisual_timeline.md`,
 `visual_timeline.md`, or `audio_timeline.md`. Those carry the
 token-heavy caption / event density and stay in sub-agent
 territory. If a question requires visual or audio knowledge —
@@ -543,8 +554,9 @@ loud here?", "do we see the product in this clip?" — spawn a
 tiny scout sub-agent with a brief like:
 
 ```
-You are a SCOUT sub-agent. Read <edit>/merged_timeline.md (or
-<edit>/visual_timeline.md if the question is purely visual) in full
+You are a SCOUT sub-agent. Read <edit>/audiovisual_timeline.md
+(or <edit>/visual_timeline.md if the question is purely visual,
+or <edit>/audio_timeline.md if purely about sound events) in full
 and return a 3-5 sentence answer to: <the parent's specific
 question>. No EDL, no taste calls. Just a description.
 ```
@@ -857,12 +869,14 @@ CONVERSATION CONTEXT (from parent):
   Things user explicitly rejected:
     - "<quote>" (context: ...)
 
-INPUTS:
-  - <edit>/merged_timeline.md  (speech + visual interleaved by
-    timestamp — the spine; read this end-to-end in full)
-  - <edit>/speech_timeline.md  (drill-down only, do NOT read by
-    default — open only on a specific ambiguity)
-  - <edit>/visual_timeline.md  (drill-down only, same rule)
+INPUTS (BOTH MANDATORY — read each end-to-end, line by line):
+  - <edit>/audiovisual_timeline.md  (audio + visual interleaved by
+    timestamp; at vocab time only the visual lane is populated —
+    audio hasn't scored yet, that's exactly what your vocab enables)
+  - <edit>/speech_timeline.md       (phrase-grouped transcripts, the
+    editorial spine, outer-aligned floor-start/ceil-end ranges)
+  - <edit>/visual_timeline.md       (drill-down only — open only on
+    a specific ambiguity, never as a substitute for the dual read)
 
 OUTPUT:
   Write <edit>/audio_vocab.txt — 200-1000 short labels, one per line,
@@ -871,7 +885,7 @@ OUTPUT:
 
 RETURN:
   A complete report describing:
-    - What kind of soundscape you inferred from the speech + visual
+    - What kind of soundscape you inferred from the AV + speech
       timelines.
     - Categories you covered (tools, materials, ambience, music,
       animals, vehicles, environments, negatives) with counts.
@@ -900,7 +914,7 @@ STEP 0 (mandatory before anything else):
     - script_mode    = <true | false>   -> references/scripted.md
     - b_roll_mode    = <true | false>   -> references/b_roll_selection.md
   These bind in addition to your default rules; they do not replace
-  the merged-view spine read in STEP 1.
+  the dual-spine read in STEP 1.
 
   Time-squeeze permission flag (binds the time-squeezing section of
   your operating manual):
@@ -911,11 +925,14 @@ STEP 0 (mandatory before anything else):
                 visually-continuous stretches only).
 
 STEP 1:
-  Read <edit>/merged_timeline.md END-TO-END. EVERY LINE. (Per the
+  Read BOTH <edit>/audiovisual_timeline.md AND
+  <edit>/speech_timeline.md END-TO-END. EVERY LINE. (Per the
   ABSOLUTE READ MANDATE.) No first-N-lines, no grep-and-cut, no
-  "I have enough." If the file exceeds one Read call, issue
+  "I have enough." If either file exceeds one Read call, issue
   sequential Reads with offset/limit until every line is covered.
-  Same applies to the prior edl.json on revisions.
+  The two files are aligned by `## <stem>` headers — scroll them
+  in parallel when reasoning about a clip. Same full-coverage
+  rule applies to the prior edl.json on revisions.
 
   If script_mode = true: also read the script itself end-to-end
   (path forwarded below or at <edit>/script.md / <edit>/script.txt).
@@ -1137,29 +1154,33 @@ three fresh."
 
 - **`helpers/pack_timelines.py --edit-dir <dir>`** — read the
   available lane caches (`transcripts/`, `audio_tags/`,
-  `visual_caps/`) and produce `merged_timeline.md` (the editor sub-
-  agent's default reading surface, all three lanes interleaved by
-  timestamp) plus the three per-lane drill-down views:
-  `speech_timeline.md`, `audio_timeline.md` (only if Phase B has
-  run), `visual_timeline.md`. Pass `--no-merge` to skip the merged
-  view (rare). Safe to call multiple times — re-running after Phase
-  B folds the new audio events into both the merged file and
-  `audio_timeline.md`.
+  `visual_caps/`) and produce TWO mandatory sub-agent reading
+  surfaces — `audiovisual_timeline.md` (audio + visual lanes
+  interleaved by timestamp; NO speech) and `speech_timeline.md`
+  (phrase ranges, outer-aligned `floor(start)..ceil(end)` integer
+  rounding) — plus the per-lane drill-down views
+  `audio_timeline.md` (only if Phase B has run) and
+  `visual_timeline.md`. Pass `--no-audiovisual` (legacy alias
+  `--no-merge`) to skip the AV view (rare). Safe to call multiple
+  times — re-running after Phase B folds the new audio events into
+  both `audiovisual_timeline.md` and `audio_timeline.md`.
 
   **Run this exactly TWICE per session.** First call after Phase A
-  preprocess produces a two-lane merged timeline (speech + visual)
-  which the vocab sub-agent reads as its single input — this is
-  why merged exists at vocab time even though audio is empty.
-  Second call after `audio_lane.py` (Phase B) folds the new audio
-  events into the merged view so the editor sub-agent sees all
-  three lanes on one page. Skipping the second pack hands the
-  editor a stale merged file and silently violates Hard Rule 15.
-  See step 2 of the 9-step process for the exact ordering.
+  preprocess produces `speech_timeline.md` plus an
+  `audiovisual_timeline.md` carrying only the visual lane (audio
+  hasn't scored yet); the vocab sub-agent reads BOTH end-to-end —
+  that's why the AV file exists at vocab time even though it has
+  no `(audio: ...)` lines. Second call after `audio_lane.py`
+  (Phase B) folds the new audio events into the same
+  `audiovisual_timeline.md` so the editor sub-agent's dual-spine
+  read covers audio + visual + speech. Skipping the second pack
+  hands the editor a stale AV file and silently violates Hard Rule
+  15. See step 2 of the 9-step process for the exact ordering.
 
   **Caveman compression on visual captions is ON by default** — a
   spaCy NLP pass strips stop words / determiners / auxiliaries / weak
   adverbs from every Florence-2 caption before packing, cutting
-  `merged_timeline.md` token cost by ~55-60% on detailed-caption
+  `audiovisual_timeline.md` token cost by ~55-60% on detailed-caption
   footage with zero loss of editorial signal (entities, actions,
   colours, shot composition all survive). Cached in
   `<edit>/comp_visual_caps/` keyed by source mtime + caveman version
@@ -1175,8 +1196,8 @@ three fresh."
   Sentence-level fuzzy delta dedup also applies at pack time:
   visually static frames collapse to `(same)` in
   `visual_timeline.md` and disappear entirely from
-  `merged_timeline.md`; slowly-evolving frames emit only the NEW
-  sentences with a `+ ` prefix (think `git diff` additions).
+  `audiovisual_timeline.md`; slowly-evolving frames emit only the
+  NEW sentences with a `+ ` prefix (think `git diff` additions).
 
 - **`helpers/caveman_compress.py`** — standalone CLI for the caveman
   pass. Useful for debugging the compression on a single caption
@@ -1189,7 +1210,8 @@ three fresh."
 ### Audio events (CLAP) — agent-curated vocabulary, mandatory
 
 The audio workflow has only one path: **spawn the vocab subagent**
-(it reads `merged_timeline.md` from step 1's first pack and writes
+(it reads BOTH `audiovisual_timeline.md` AND `speech_timeline.md`
+from step 1's first pack, end-to-end, line by line, and writes
 `<edit>/audio_vocab.txt`), then run `audio_lane.py` against that
 vocab, then re-pack timelines. No smoke-test / agent-less fallback
 exists in the parent's playbook; the baked-in default vocab in
@@ -1208,7 +1230,7 @@ templates" below for the vocab subagent brief.
     agent has not run yet — go back to step 2 and spawn it.
 
 - After Phase B finishes, **re-run `pack_timelines.py`** to fold the
-  new audio events into both `merged_timeline.md` (default) and
+  new audio events into both `audiovisual_timeline.md` (default) and
   `audio_timeline.md`.
 
 **Individual lanes** (rarely needed — the orchestrator wraps them):
@@ -1322,7 +1344,7 @@ Two editor subagent features detect **user intent baked into the
 source recording itself** and produce dedicated blocks in the
 editor's return rationale that you must surface to the user when
 describing the cut. Detection happens autonomously inside the
-editor's merged-timeline read; you do not gate them with flags,
+editor's dual-timeline read; you do not gate them with flags,
 you do not read the timeline yourself. Your job is echo +
 clarification.
 
@@ -1411,7 +1433,7 @@ user quote" priority overrides its retake heuristic.
 
 ## Parent-specific anti-patterns
 
-- **Reading `merged_timeline.md`, `visual_timeline.md`, or
+- **Reading `audiovisual_timeline.md`, `visual_timeline.md`, or
   `audio_timeline.md`.** See shared_rules.md "Agent roles" — the
   heavy caption / event density stays in sub-agent windows so the
   parent's accumulating context does not bloat. Spawn a scout for
@@ -1427,11 +1449,12 @@ user quote" priority overrides its retake heuristic.
 - **Skipping the second `pack_timelines.py` run after
   `audio_lane.py`.** The pack runs TWICE per session by design —
   first after Phase A preprocess (so the vocab sub-agent has a
-  merged timeline to read), second after Phase B audio scoring (so
-  the editor sub-agent sees all three lanes interleaved). Skipping
-  the second pack ships the editor a merged view with no
-  `(audio: …)` lines, silently violating Hard Rule 15 (merged is
-  the editor's spine — it must contain every lane). See step 2.
+  AV + speech timelines to read), second after Phase B audio scoring
+  (so the editor sub-agent's AV file carries audio + visual). Skipping
+  the second pack ships the editor an AV view with no
+  `(audio: …)` lines, silently violating Hard Rule 15 (the dual
+  spine of `audiovisual_timeline.md` + `speech_timeline.md` — both
+  must be current). See step 2.
 - **Skipping the pacing prompt.** Hard Rule 13.
 - **Skipping the four mode-gating questions in step 4.** They set
   `script_mode`, `b_roll_mode`, `timelapse_mode`, `user_profile` —
