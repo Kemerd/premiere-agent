@@ -51,12 +51,14 @@ echo [video-use-premiere] installing torch from %TORCH_INDEX%
 %PYTHON% -m pip install torch torchvision torchaudio --index-url %TORCH_INDEX% || goto :err
 
 REM ---------------------------------------------------------------------------
-REM 3. The package itself + heavy preprocess + fcpxml extras. Diarize is
-REM    intentionally NOT pulled by default (pyannote is heavy, most users
-REM    don't need speaker IDs).
+REM 3. The package itself. Base deps now include the full preprocess stack
+REM    (Parakeet ONNX + transformers + spaCy + soxr + soundfile) AND the
+REM    OpenTimelineIO FCPXML / xmeml adapters, since every real run needs
+REM    both. Diarize / animations / flash / parakeet-NeMo stay opt-in
+REM    (heavy, niche, or pre-gated).
 REM ---------------------------------------------------------------------------
-echo [video-use-premiere] installing package + preprocess + fcpxml extras
-%PYTHON% -m pip install -e ".[preprocess,fcpxml]" || goto :err
+echo [video-use-premiere] installing package
+%PYTHON% -m pip install -e "." || goto :err
 
 REM ---------------------------------------------------------------------------
 REM 4. ffmpeg PATH check. Not fatal but warn loudly — most failures

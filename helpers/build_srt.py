@@ -1,20 +1,30 @@
 """Build a master SRT from per-source transcripts + an EDL.
 
-Standalone helper kept for the FCPXML delivery path: ship `master.srt`
-alongside `cut.fcpxml` / `cut.xml` so the NLE can import captions on a
-dedicated track that the editor restyles to taste. This module replaces
-the old `render.py --build-subtitles` flow now that the flat-MP4
-renderer is gone — XML-only delivery is the only output target.
+`helpers/export_fcpxml.py` calls `build_master_srt()` automatically as
+part of every export so the NLE handoff always ships a captions
+sidecar alongside `cut.fcpxml` / `cut.xml`. This module is also wired
+as a standalone CLI for the case where you tweaked the EDL and only
+want to regenerate the SRT without re-walking the timeline.
 
-Hard Rule 5 still binds here: SRT timestamps live on the OUTPUT
-timeline, computed as `word.start - segment_start + segment_offset`,
-because the editor sub-agent's EDL ranges are in SOURCE time but the
-captions get attached to the OUTPUT timeline. Mis-applying this turns
-captions into a slow-drifting train wreck after the first concat.
+Hard Rule 5 binds here: SRT timestamps live on the OUTPUT timeline,
+computed as `word.start - segment_start + segment_offset`, because
+the editor sub-agent's EDL ranges are in SOURCE time but the captions
+attach to the OUTPUT timeline. Mis-applying this turns captions into
+a slow-drifting train wreck after the first cut.
 
-Style hint (not used here — the NLE decides): the proven launch-video
-look is 2-word UPPERCASE chunks, Helvetica 18 Bold, MarginV=35. See
-`references/subtitles.md` for the full chunking / case / placement
+Output format — Premiere-friendly:
+  * UTF-8 (no BOM) — modern Premiere / Resolve / FCP X all read this
+    cleanly; the BOM was historically required by Premiere CC 2018
+    and earlier and we don't target those.
+  * CRLF line endings — what Notepad-class editors expect on Windows
+    so the file is human-readable when the operator double-clicks it,
+    and no NLE we target chokes on \r\n.
+  * Sequential numbering from 1, exact `HH:MM:SS,mmm --> HH:MM:SS,mmm`
+    timestamp shape, blank line between cues — the SRT spec proper.
+
+Style hint (not applied here — the NLE decides): the proven launch-
+video look is 2-word UPPERCASE chunks, Helvetica 18 Bold, MarginV=35.
+See `references/subtitles.md` for the chunking / case / placement
 discussion. We just emit the SRT — restyle in your NLE.
 
 Usage:
@@ -230,7 +240,21 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
 
         seg_offset += seg_out_dur
 
-    # Sort by output start time and serialize as SRT.
+    # No captions to write — bail without creating a stub file. Tells
+    # the operator something is structurally wrong (e.g. transcripts
+    # missing) instead of silently shipping an empty SRT to the NLE.
+    if not entries:
+        print(f"  warn: no captions emitted (no transcripts found for any "
+              f"range in {len(edl['ranges'])} ranges); skipping {out_path.name}",
+              file=sys.stderr)
+        return
+
+    # Sort by output start time and serialize as SRT. CRLF line endings
+    # so Notepad-class editors render the file legibly on Windows; SRT
+    # consumers (Premiere, Resolve, FCP X, ffmpeg) all read either flavour.
+    # `newline=""` on write_text disables Python's universal-newline
+    # translation — without it, write_text would re-encode \n -> \r\n on
+    # Windows AND re-encode \r\n -> \r\r\n inside our string, doubling.
     entries.sort(key=lambda e: e[0])
     lines: list[str] = []
     for i, (a, b, t) in enumerate(entries, start=1):
@@ -238,7 +262,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         lines.append(f"{_srt_timestamp(a)} --> {_srt_timestamp(b)}")
         lines.append(t)
         lines.append("")
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    out_path.write_text("\r\n".join(lines), encoding="utf-8", newline="")
     print(f"master SRT -> {out_path.name} ({len(entries)} cues)")
 
 

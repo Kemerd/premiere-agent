@@ -5,28 +5,32 @@ description = "Conversation-driven video editor skill for Claude Code — local-
 requires-python = ">=3.10"
 
 # ---------------------------------------------------------------------------
-# Always-on dependencies. Kept light so the package installs fast in CI / dev
-# environments where you only want the renderer or FCPXML exporter and not
-# the heavy ML preprocessors.
+# Always-on dependencies. The skill is a single end-to-end pipeline:
+# preprocess (Parakeet speech + Florence-2 visuals + CLAP audio events)
+# -> reason -> export FCPXML / xmeml + master.srt. Every real install
+# wants ALL of this, so the heavy ML stack and the OpenTimelineIO
+# adapters live in `dependencies` rather than behind opt-in extras.
+# `pip install -e .` is now sufficient for the canonical run path.
+#
+# torch is NOT listed here because the user typically wants a specific
+# CUDA index URL (cu121, cpu, rocm6.0…). The install scripts handle
+# that step before pulling this list.
+#
+# What's intentionally still opt-in (see [project.optional-dependencies]):
+#   * flash       - flash-attn 2 (fiddly Windows wheel build)
+#   * diarize     - pyannote (gated HF model card, +600 MB)
+#   * parakeet    - NeMo fallback ASR (only when ONNX EP can't load)
+#   * animations  - manim (huge LaTeX dep chain, niche feature)
 # ---------------------------------------------------------------------------
 dependencies = [
+    # ── Core utility: progress / plotting / image manipulation ────────
     "librosa",        # waveform analysis for timeline_view
     "matplotlib",     # timeline_view figure compositing
     "pillow",         # PIL animations + frame manipulation
     "numpy",
     "tqdm",           # frame-level progress in lanes
     "rich>=13.0",     # multi-lane progress display + structured status lines
-]
 
-[project.optional-dependencies]
-# ---------------------------------------------------------------------------
-# Heavy ML preprocessing stack. Pulled in by install.sh / install.bat so a
-# `pip install -e .` for a renderer-only deployment stays minimal.
-#
-# torch is NOT listed here because the user typically wants a specific CUDA
-# index URL (cu121, cpu, rocm6.0…). The install scripts handle that.
-# ---------------------------------------------------------------------------
-preprocess = [
     # ── Speech (PRIMARY): ONNX Runtime Parakeet TDT ──
     # As of 2026-04 the speech lane defaults to a multi-session ONNX
     # Runtime pool driving NVIDIA Parakeet TDT 0.6B (English v2 / multi-
@@ -36,6 +40,11 @@ preprocess = [
     #
     # See helpers/parakeet_onnx_lane.py / helpers/_onnx_pool.py for the
     # full plumbing, helpers/_onnx_providers.py for the EP ladder.
+    # Activate the TensorRT EP at runtime with:
+    #   set VIDEO_USE_PARAKEET_TRT=1     (Windows)
+    #   export VIDEO_USE_PARAKEET_TRT=1  (POSIX)
+    # Without it the lane uses the CUDA EP (still ~57-100x RTFx on
+    # Ampere+) and avoids the first-run TensorRT engine compile cost.
     #
     # `onnx-asr[gpu,hub]` ships:
     #   - the NeMo-compatible mel-spectrogram preprocessor (ONNX)
@@ -109,30 +118,29 @@ preprocess = [
     "spacy>=3.7,<4",
     # ── Shared I/O ──
     "soundfile",               # WAV reading for audio_lane + extract_audio cache
+
+    # ── NLE handoff via OpenTimelineIO (Pixar / ASWF industry standard) ──
+    # Two adapters because Premiere Pro and Resolve / FCP X want
+    # DIFFERENT interchange dialects:
+    #
+    #   * otio-fcpx-xml-adapter -> FCPXML 1.10+ (.fcpxml). Native to
+    #     DaVinci Resolve and Final Cut Pro X. Premiere does NOT read
+    #     this directly (it requires the third-party XtoCC translator).
+    #
+    #   * otio-fcp-adapter      -> Final Cut Pro 7 xmeml (.xml).
+    #     Premiere Pro imports this NATIVELY via File -> Import. This
+    #     is the Premiere handoff path -- no XtoCC, no extra tools.
+    #
+    # helpers/export_fcpxml.py emits BOTH by default so the recipient
+    # can pick whichever NLE they want without re-running the export.
+    # Captions ship as `master.srt` written by helpers/build_srt.py
+    # (called automatically by export_fcpxml).
+    "opentimelineio>=0.17",
+    "otio-fcpx-xml-adapter>=0.2",   # .fcpxml -> Resolve / FCP X
+    "otio-fcp-adapter>=0.2",        # .xml    -> Premiere Pro (FCP7 xmeml)
 ]
 
-# ---------------------------------------------------------------------------
-# Standalone ONNX-Parakeet extra. Same packages as the speech sub-block of
-# `preprocess`, exposed as its own optional install for renderer-only or
-# transcribe-only deployments that don't want the full preprocess stack
-# (transformers / florence). Useful in CI to test the speech lane in
-# isolation. Activate the TensorRT EP at runtime with:
-#
-#   set VIDEO_USE_PARAKEET_TRT=1     (Windows)
-#   export VIDEO_USE_PARAKEET_TRT=1  (POSIX)
-#
-# Without that env var the lane uses the CUDA EP (still ~57-100x RTFx on
-# Ampere+) and avoids the first-run TensorRT engine compile cost.
-# ---------------------------------------------------------------------------
-onnx = [
-    "onnx-asr[gpu,hub]>=0.11.0",
-    # Same OS split as the [preprocess] extra above — see the comment
-    # there for why Darwin gets plain `onnxruntime` (CoreML/CPU EPs)
-    # while Win/Linux get `onnxruntime-gpu` (CUDA/TRT/DML EPs).
-    "onnxruntime-gpu>=1.22.0;platform_system!='Darwin'",
-    "onnxruntime>=1.22.0;platform_system=='Darwin'",
-    "tensorrt-cu12-libs;platform_system!='Darwin' and platform_machine=='x86_64'",
-]
+[project.optional-dependencies]
 
 # ---------------------------------------------------------------------------
 # Optional Flash Attention 2. Modest speedup for Florence-2 visual captioning
@@ -172,40 +180,17 @@ parakeet = [
 ]
 
 # ---------------------------------------------------------------------------
-# NLE handoff via the Pixar / ASWF industry-standard OpenTimelineIO. Cheap
-# to install (pure Python wheels), kept optional so render-only deployments
-# don't pull it.
-#
-# Two adapters are pinned because Premiere Pro and Resolve/FCP X want
-# DIFFERENT interchange dialects:
-#
-#   * otio-fcpx-xml-adapter -> FCPXML 1.10+ (.fcpxml). Native to DaVinci
-#     Resolve and Final Cut Pro X. Premiere does NOT read this directly
-#     (it requires the third-party XtoCC translator).
-#
-#   * otio-fcp-adapter      -> Final Cut Pro 7 xmeml (.xml). Premiere Pro
-#     imports this NATIVELY via File -> Import. This is the Premiere
-#     handoff path -- no XtoCC, no extra tools.
-#
-# helpers/export_fcpxml.py emits BOTH by default so the recipient can
-# pick whichever NLE they want without re-running the export.
-# ---------------------------------------------------------------------------
-fcpxml = [
-    "opentimelineio>=0.17",
-    "otio-fcpx-xml-adapter>=0.2",   # .fcpxml -> Resolve / FCP X
-    "otio-fcp-adapter>=0.2",        # .xml    -> Premiere Pro (FCP7 xmeml)
-]
-
-# ---------------------------------------------------------------------------
-# Animations. Manim is huge; kept opt-in.
+# Animations. Manim is huge (LaTeX dep chain, system-level cairo / ffmpeg
+# bindings) and only used when the user explicitly asks for an animated
+# overlay. Opt-in keeps the base install ~1 GB lighter.
 # ---------------------------------------------------------------------------
 animations = ["manim"]
 
 # ---------------------------------------------------------------------------
-# Convenience meta-extra: install absolutely everything.
+# Convenience meta-extra: install everything opt-in alongside the base.
 # ---------------------------------------------------------------------------
 all = [
-    "video-use-premiere[preprocess,onnx,diarize,fcpxml,animations,flash,parakeet]",
+    "video-use-premiere[diarize,animations,flash,parakeet]",
 ]
 
 [build-system]

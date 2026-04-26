@@ -97,17 +97,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. The package itself + the heavy preprocess + fcpxml extras. We don't pull
-#    [diarize] by default because pyannote pulls a lot and most users won't
-#    need speaker IDs.
+# 3. The package itself. Base deps now include the full preprocess stack
+#    (Parakeet ONNX + transformers + spaCy + soxr + soundfile) AND the
+#    OpenTimelineIO FCPXML / xmeml adapters — every real run needs both,
+#    so there's no point hiding them behind extras. Opt-in extras still
+#    exist for the genuinely-niche bits ([diarize], [animations], [flash],
+#    [parakeet] for the NeMo fallback).
 #
-#    The pyproject markers handle the OS split inside [preprocess]:
+#    The pyproject markers handle the OS split for ONNX Runtime:
 #      * Win/Linux  -> onnxruntime-gpu (CUDA + TRT + DML EPs)
 #      * macOS      -> onnxruntime     (CoreML + CPU EPs; no CUDA on Mac)
 #      * Linux/Win x86_64 only -> tensorrt-cu12-libs
 # ---------------------------------------------------------------------------
-echo "[video-use-premiere] installing package + preprocess + fcpxml extras"
-"$PYTHON" -m pip install -e ".[preprocess,fcpxml]"
+echo "[video-use-premiere] installing package"
+"$PYTHON" -m pip install -e "."
 
 # ---------------------------------------------------------------------------
 # 4. ffmpeg PATH check. Not fatal — user might have it in a non-standard

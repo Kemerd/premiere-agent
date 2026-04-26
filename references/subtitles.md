@@ -1,6 +1,6 @@
-# Subtitles (when requested)
+# Subtitles (always on)
 
-> Loaded on demand from `SKILL.md`. Read this only when the user asks for burned or imported subtitles.
+> Loaded on demand from `SKILL.md`. The SRT sidecar is **always emitted** by `helpers/export_fcpxml.py` — read this when the user asks about caption styling, chunking, or how the NLE picks it up. Skip the SRT only when subtitles are explicitly out of scope (silent cinema, lyric-only music video) by passing `--no-srt`.
 
 Subtitles have three dimensions worth reasoning about:
 
@@ -43,11 +43,35 @@ Invent a third style if neither fits.
 
 ## FCPXML / xmeml delivery
 
+`helpers/export_fcpxml.py` automatically runs `build_master_srt` after the timeline XML is written, so every export drops `<edit>/master.srt` next to `cut.fcpxml` / `cut.xml` in one shot:
+
+```bash
+python helpers/export_fcpxml.py edit/edl.json -o edit/cut.fcpxml
+# writes cut.fcpxml + cut.xml + master.srt
+```
+
+Need to regenerate just the SRT after a hand-tweak to the EDL without rebuilding the XML?
+
 ```bash
 python helpers/build_srt.py edit/edl.json
 ```
 
-This writes `<edit>/master.srt` straight from the cached Parakeet transcripts in `<edit>/transcripts/`, on the OUTPUT timeline. Ship it alongside `cut.fcpxml` and `cut.xml`. Most NLEs (Premiere, Resolve, FCP X) import SRT as a captions track the editor can restyle in their own caption panel. The skill never burns subtitles into a flat MP4 — XML-only delivery means the NLE owns the final pixels and the editor controls caption style end-to-end.
+The SRT is written **on the OUTPUT timeline** straight from the cached Parakeet transcripts in `<edit>/transcripts/`. Format is Premiere-friendly:
+
+- UTF-8 (no BOM) — modern Premiere / Resolve / FCP X all parse this cleanly.
+- CRLF line endings — Notepad-class editors render the file legibly on Windows; every NLE we target accepts \r\n.
+- Sequential numbering from 1, exact `HH:MM:SS,mmm --> HH:MM:SS,mmm` timestamp shape, blank line between cues.
+- Retimed (timelapse) ranges are SKIPPED — by editor convention they contain no speech (see SKILL.md "Time-squeezing"); the offset accumulator advances by the OUTPUT duration so subsequent cues still land correctly.
+
+Importing into the NLE — every major NLE accepts SRT through plain `File → Import`:
+
+| NLE | Path | What you get |
+|---|---|---|
+| Adobe Premiere Pro | `File → Import → master.srt` | A captions clip on the project bin; drag to a captions track. Restyle via the Captions panel. |
+| DaVinci Resolve | `File → Import → Subtitle…` | A subtitle track on the timeline; restyle via the Captions inspector. |
+| Final Cut Pro X | `File → Import → Captions…` | A connected captions clip on the primary storyline; restyle in the inspector. |
+
+The skill never burns subtitles into a flat output — XML-only delivery means the NLE owns the final pixels and the editor controls caption style end-to-end.
 
 ## Decision shortcuts
 

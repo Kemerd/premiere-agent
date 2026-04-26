@@ -61,9 +61,6 @@ You point spawned sub-agents at these via their briefs (templates in
 
 ## Cold-path features (load on demand when the user asks for them)
 
-- **`references/color-grade.md`** — ASC CDL mental model, shipped
-  filter chain presets, FCPXML "don't bake the grade" rule.
-
 - **`references/subtitles.md`** — chunking / case / placement
   reasoning, the `bold-overlay` and `natural-sentence` worked
   styles, FCPXML delivery (ship `master.srt` alongside via

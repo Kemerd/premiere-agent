@@ -272,8 +272,8 @@ questions *shaped by what they said*. Collect:
 - Aesthetic / brand direction
 - Must-preserve moments (quote the user verbatim)
 - Must-cut moments (quote the user verbatim)
-- Animation / subtitle preferences (the colorist owns the grade — XML
-  delivery never bakes a grade)
+- Animation / subtitle preferences (color is out of scope — the
+  colorist owns it in the NLE)
 - Delivery dialect (`cut.fcpxml` for Resolve / FCP X, `cut.xml` for
   Premiere Pro, or both — default is both)
 - **Pacing preset** — MANDATORY. See table below. Default Paced.
@@ -305,10 +305,6 @@ planned, spawn one sub-agent per slot in parallel — see
 The editor sub-agent returns `<edit>/edl.json`. The animation sub-
 agents return rendered overlay clips in `<edit>/animations/slot_*/`.
 
-Grade is the colorist's job — XML delivery never bakes a grade. Pass
-the taste call along in `project.md` so the colorist starts from
-your direction.
-
 ### 7. Export to the NLE
 
 XML-only delivery — there is no flat-MP4 path in this skill anymore.
@@ -324,16 +320,28 @@ Recipient picks whichever NLE they live in. Tell Premiere users to
 `File -> Import -> cut.xml`. Override with `--targets {both,fcpxml,
 premiere}`. `--frame-rate 24` (default), 25, 29.97, 30, 60.
 
-If subtitles are part of the brief, build the captions sidecar:
+**The captions sidecar is always emitted.** `export_fcpxml.py` calls
+`build_master_srt` automatically as part of every run, writing
+`<edit>/master.srt` next to the XML on the OUTPUT timeline (Hard
+Rule 5) straight from the cached Parakeet transcripts. The SRT is
+Premiere-friendly (UTF-8, CRLF, sequential cues, `HH:MM:SS,mmm -->`
+timestamps) and Premiere Pro / DaVinci Resolve / Final Cut Pro X
+all import it via `File -> Import` onto a captions track that the
+editor restyles in their own caption panel.
+
+If subtitles are explicitly out of scope for a session (rare —
+silent-cinema, music video without speech), you can opt out:
+
+```bash
+python helpers/export_fcpxml.py <edit>/edl.json -o <edit>/cut.fcpxml --no-srt
+```
+
+Or regenerate just the SRT after a hand-tweak to the EDL without
+re-walking the timeline:
 
 ```bash
 python helpers/build_srt.py <edit>/edl.json
 ```
-
-This writes `<edit>/master.srt` on the OUTPUT timeline (Hard Rule 5)
-straight from the cached Parakeet transcripts. Ship it alongside the
-XML — every major NLE imports SRT cleanly onto a captions track that
-the editor can restyle.
 
 ### 8. Self-eval (before showing the user)
 
@@ -575,7 +583,6 @@ high-level shape (range count, total duration, all `audio_lead` /
   "pacing": {"min_silence_to_remove_ms": 200,
              "min_talk_to_keep_ms": 200,
              "lead_margin_ms": 200, "trail_margin_ms": 200},
-  "grade": "warm_cinematic",
   "overlays": [{"file": "edit/animations/slot_1/render.mp4",
                 "start_in_output": 0.0, "duration": 5.0}],
   "subtitles": "edit/master.srt",
@@ -583,10 +590,10 @@ high-level shape (range count, total duration, all `audio_lead` /
 }
 ```
 
-The `grade` field is a taste-call note forwarded to the colorist via
-`project.md` — XML delivery never bakes a grade. The `subtitles` field
-points at the SRT sidecar emitted by `helpers/build_srt.py` so the NLE
-imports it on a captions track.
+The `subtitles` field points at the SRT sidecar emitted by
+`helpers/build_srt.py` so the NLE imports it on a captions track.
+Color is out of scope — there is no `grade` field; the colorist
+owns it end-to-end in the NLE.
 
 If the editor sub-agent returns an EDL with non-zero split-edit fields,
 reject it and re-spawn — that violates Hard Rule 14.
@@ -749,11 +756,15 @@ accepts `--wealthy` and runs standalone.
 
 - **`helpers/build_srt.py <edl.json>`** — emit `<edit>/master.srt`
   on the OUTPUT timeline (Hard Rule 5) from the cached Parakeet
-  transcripts in `<edit>/transcripts/`. Pair this with the FCPXML /
-  xmeml so the NLE imports captions on a track the editor can
-  restyle. 2-word UPPERCASE chunks, breaks on punctuation. Skips
-  retimed (timelapse) ranges by editor convention — see SKILL.md
-  "Time-squeezing".
+  transcripts in `<edit>/transcripts/`. Premiere-friendly format
+  (UTF-8, CRLF, sequential cues, `HH:MM:SS,mmm -->` timestamps);
+  imports cleanly via `File -> Import` in Premiere / Resolve / FCP X.
+  2-word UPPERCASE chunks, breaks on punctuation. Skips retimed
+  (timelapse) ranges by editor convention — see SKILL.md
+  "Time-squeezing". **`export_fcpxml.py` calls this automatically**
+  on every export; the standalone CLI exists for the case where you
+  hand-tweaked the EDL and only want to regenerate the captions
+  without rebuilding the XML timeline.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash`
 and spawn a sub-agent via the `Task` / `Agent` tool per
@@ -761,12 +772,11 @@ and spawn a sub-agent via the `Task` / `Agent` tool per
 
 ---
 
-## Color grade, Subtitles, Animations — load on demand
+## Subtitles, Animations — load on demand
 
 Cold-path features. Each is ~10% of sessions. Read the matching file
 before proposing strategy for that feature:
 
-- Color grade -> `references/color-grade.md`
 - Subtitles  -> `references/subtitles.md`
 - Animations -> `references/animations.md`
 
@@ -774,7 +784,8 @@ The Hard Rules that bind these features stay in `shared_rules.md`
 — output-timeline SRT (Rule 5) and parallel sub-agents for
 animations (Rule 10) are the live ones for XML delivery; the
 ffmpeg-pipeline rules (1-4) are dormant since the flat-MP4 path
-was removed.
+was removed. Color grade is out of scope — the colorist owns it
+in the NLE.
 
 ---
 

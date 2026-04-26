@@ -492,7 +492,6 @@ Write to `<edit>/edl.json`:
              "min_talk_to_keep_ms":      200,
              "lead_margin_ms":           200,
              "trail_margin_ms":          200},
-  "grade": "warm_cinematic",
   "overlays": [
     {"file": "edit/animations/slot_1/render.mp4",
      "start_in_output": 0.0, "duration": 5.0}
@@ -502,13 +501,16 @@ Write to `<edit>/edl.json`:
 }
 ```
 
-`grade` is a preset name or raw ffmpeg filter (ignored by FCPXML
-export — colorist's job). `overlays` are rendered animation clips
-(ffmpeg path only). `subtitles` is optional. `pacing_preset` +
-`pacing` record the user's chosen preset. `audio_lead` / `video_tail`
-/ `transition_in` per range are DEFERRED (Hard Rule 14) and must
-always be `0.0`. `speed` and `audio_strategy` are OPTIONAL and only
-appear on time-squeezed ranges.
+`overlays` are rendered animation clips, played as picture-in-picture
+on a higher video track in the NLE. `subtitles` is optional and
+points at an SRT the parent emits via `helpers/build_srt.py`.
+`pacing_preset` + `pacing` record the user's chosen preset.
+`audio_lead` / `video_tail` / `transition_in` per range are DEFERRED
+(Hard Rule 14) and must always be `0.0`. `speed` and `audio_strategy`
+are OPTIONAL and only appear on time-squeezed ranges.
+
+There is **no `grade` field** — color is out of scope. The skill
+emits XML for the NLE; the colorist applies the grade there.
 
 ---
 
