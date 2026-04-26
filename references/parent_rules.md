@@ -27,16 +27,30 @@ the entire pipeline:
 
 What you DO NOT do:
 
-- **Read `merged_timeline.md`, `speech_timeline.md`,
-  `visual_timeline.md`, or `audio_timeline.md` directly.** Token-heavy
-  reads of caption / transcript content are sub-agent territory; that
-  is why the architecture exists. The parent dispatches
-  reads, never performs them.
+- **Read `merged_timeline.md`, `visual_timeline.md`, or
+  `audio_timeline.md` directly.** Those are the token-heavy lanes
+  (Florence-2 visual captions at 1fps, CLAP audio events, and the
+  merged interleaved view of all three). They exist for sub-agents
+  to read in fresh context windows; the parent's accumulating
+  context never absorbs caption density.
 - **Edit `edl.json` by hand.** Every change re-spawns the editor.
 - **Curate `audio_vocab.txt` by hand.** Always re-spawn vocab.
 - **Open source video files** to inspect frames. If a frame inspection
   is needed, spawn a scout subagent and let it call
   `helpers/timeline_view.py`.
+
+What you MAY do:
+
+- **Read `<edit>/speech_timeline.md`** for conversation-side content
+  awareness. Speech is pure text — Parakeet phrase-level transcripts
+  with timestamps, token-cheap, and exactly what you need to talk
+  to the user intelligently about what was actually said, ground
+  must-keep / must-cut quotes in real transcript moments, and
+  summarize the project without always spawning a scout. Read it
+  once after step 1's first pack (to seed the Conversation Context
+  bundle) and again on demand when a user message references
+  something specific the speakers said. Do not loop over it
+  constantly; it is context, not the cut.
 
 Subagents are SPECIALIZED workers spawned for token-heavy reading
 tasks (timeline ingestion, vocabulary curation, animation rendering).
@@ -54,19 +68,23 @@ they put it. All session outputs land in `<videos_dir>/edit/`.
 ├── <source files, untouched>
 └── edit/
     ├── project.md               ← memory; appended every session.
-    │                              The ONE timeline-adjacent file the
-    │                              parent reads directly.
+    │                              Parent's primary direct-read file
+    │                              (alongside speech_timeline.md).
     ├── merged_timeline.md       ← editor sub-agent's default reading
     │                              surface — all 3 lanes interleaved
     │                              chronologically by timestamp.
     │                              PARENT NEVER OPENS THIS.
     ├── speech_timeline.md       ← Parakeet phrase-level transcripts
-    │                              (lane 1, drill-down for editor)
+    │                              (lane 1, drill-down for editor;
+    │                              ALSO parent-readable for content
+    │                              awareness — token-cheap text)
     ├── audio_timeline.md        ← CLAP audio events, coalesced
     │                              (lane 2, drill-down for editor,
-    │                              produced by Phase B vocab pass)
+    │                              produced by Phase B vocab pass.
+    │                              PARENT NEVER OPENS THIS.)
     ├── visual_timeline.md       ← Florence-2 captions @ 1fps
-    │                              (lane 3, drill-down for editor)
+    │                              (lane 3, drill-down for editor.
+    │                              PARENT NEVER OPENS THIS.)
     ├── edl.json                 ← cut decisions (editor sub-agent
     │                              writes; parent reads to validate
     │                              shape, hands to export_fcpxml.py)
@@ -434,8 +452,12 @@ This skill mandates the curated-vocab path (step 2 below).
 `pack_timelines.py` produces `merged_timeline.md` (the editor's
 default reading surface) plus the per-lane drill-down files:
 `speech_timeline.md`, `audio_timeline.md` (only after step 2 runs),
-`visual_timeline.md`. **You read none of these.** They exist
-for subagents.
+`visual_timeline.md`. **You read `speech_timeline.md` after this
+first pack** to seed the Conversation Context bundle with the
+actual transcript content (see step 3 below). The other three
+files — `merged_timeline.md`, `visual_timeline.md`,
+`audio_timeline.md` — are sub-agent territory; they carry the
+token-heavy caption / event density and you never open them.
 
 ### 2. Audio events — spawn the vocab sub-agent (mandatory)
 
@@ -482,26 +504,49 @@ The editor subagent will still cut from the merged_timeline using
 just speech + visual; `(audio: ...)` lines will simply be absent.
 Note the skip in `project.md` so next session knows.
 
-### 3. Pre-scan for problems — DO NOT DO THIS YOURSELF
+### 3. Pre-scan for content awareness — speech only, lightly
 
-In the previous design, the parent would read `merged_timeline.md`
-end-to-end before talking to the user. **No longer the parent's
-job.** You do not read it. The editor subagent does that on every
-spawn, in a fresh context window.
+After the first pack, **read `<edit>/speech_timeline.md`** end-to-end
+once. This is the only timeline file you open. Speech is pure
+text — Parakeet phrase-level transcripts with timestamps — so the
+token cost is small and the upside is real: you know what was
+actually said before you start asking the user about must-keeps,
+must-cuts, retakes, and structure. Without this read you are
+talking blind, and Hard Rule 11 (strategy confirmation before
+execution) becomes a guess instead of a conversation grounded in
+the material.
 
-If you genuinely need a one-paragraph summary of the project to talk
-intelligently to the user (e.g. user is vague), spawn a tiny
-"scout" sub-agent with a brief like:
+What to extract from the read into the Conversation Context bundle:
+
+- One-paragraph project summary in your own words (what kind of
+  video, who appears to be speaking, what they are talking about,
+  the rough arc).
+- Candidate must-keep moments — verbatim quotes that read as
+  load-bearing (the hook line, the punchline, the demo reveal,
+  the emotional beat).
+- Candidate must-cut moments — long filler stretches, retake
+  attempts the speaker abandoned, audible mistakes the speaker
+  called out themselves ("hey editor, skip this take").
+- Anything ambiguous you want to ask the user about by name.
+
+You still **do not** read `merged_timeline.md`,
+`visual_timeline.md`, or `audio_timeline.md`. Those carry the
+token-heavy caption / event density and stay in sub-agent
+territory. If a question requires visual or audio knowledge —
+"what's actually on screen at 0:42?", "is the workshop noise
+loud here?", "do we see the product in this clip?" — spawn a
+tiny scout sub-agent with a brief like:
 
 ```
-You are a SCOUT sub-agent. Read <edit>/merged_timeline.md in full and
-return a 3-5 sentence summary of: what kind of video this appears to
-be, who appears to be in it, what activity dominates, what unique
-moments stand out. No EDL, no taste calls. Just a description.
+You are a SCOUT sub-agent. Read <edit>/merged_timeline.md (or
+<edit>/visual_timeline.md if the question is purely visual) in full
+and return a 3-5 sentence answer to: <the parent's specific
+question>. No EDL, no taste calls. Just a description.
 ```
 
-Keep scouting rare. Most sessions, the user describes the project
-clearly enough that you can write a strategy without scouting.
+Keep visual / audio scouting rare. The speech read covers most
+conversation needs; scouts are for the specific visual or audio
+questions the speech transcript cannot answer.
 
 ### 4. Converse — your main job
 
@@ -1337,9 +1382,17 @@ user quote" priority overrides its retake heuristic.
 
 ## Parent-specific anti-patterns
 
-- **Reading any timeline file.** See shared_rules.md "Agent roles"
-  — the parent never opens timeline files. Always re-spawn a sub-
-  agent if a question requires timeline knowledge.
+- **Reading `merged_timeline.md`, `visual_timeline.md`, or
+  `audio_timeline.md`.** See shared_rules.md "Agent roles" — the
+  heavy caption / event density stays in sub-agent windows so the
+  parent's accumulating context does not bloat. Spawn a scout for
+  visual / audio questions. Reading `speech_timeline.md` for
+  conversation-side content awareness IS allowed and expected
+  (step 3) — speech is text-only and token-cheap.
+- **Skipping the step-3 speech read.** Without it you are talking
+  to the user blind about a video you have no content awareness
+  of. Strategy confirmation (Hard Rule 11) becomes guesswork
+  instead of a conversation grounded in what was actually said.
 - **Editing `edl.json` by hand for "trivial" tweaks.** Always re-spawn.
 - **Curating `audio_vocab.txt` by hand.** Always re-spawn.
 - **Skipping the second `pack_timelines.py` run after

@@ -121,11 +121,15 @@ folder-convention / pair-mode tables.
 
 ## What this architecture buys you
 
-- **Token economy.** Token-heavy timeline reads happen in fresh sub-
-  agent context windows, never in the parent's accumulating one.
-  Long iteration sessions (revision 5+) cost the same per spawn as
-  revision 1 — the parent's context grows linearly with conversation,
-  not with file size.
+- **Token economy.** Token-heavy timeline reads (visual captions
+  at 1fps, audio events, the merged interleaved view) happen in
+  fresh sub-agent context windows, never in the parent's
+  accumulating one. The parent reads `speech_timeline.md` for
+  conversation-side content awareness — text only, token-cheap —
+  but the heavy lanes stay in sub-agents. Long iteration sessions
+  (revision 5+) cost the same per spawn as revision 1; the
+  parent's context grows linearly with conversation, not with
+  caption density.
 
 - **Specialization.** Each sub-agent reads only what binds it, so
   the editor isn't paying tokens on vocab curation guidance and the
@@ -139,9 +143,12 @@ folder-convention / pair-mode tables.
 - **The parent stays light.** Its job is `listen -> summarize ->
   quote -> dispatch -> translate -> run scripts -> handle errors`.
   Conversation, orchestration, helper-script execution, error
-  handling, filesystem management — all parent work. Timeline
-  reading and cut decisions — sub-agent work. The boundary is
-  load-bearing; do not cross it.
+  handling, filesystem management — all parent work. Heavy
+  timeline reading (visual captions, audio events, merged view)
+  and cut decisions — sub-agent work. The parent's one allowed
+  timeline read is `speech_timeline.md` (text-only transcripts)
+  for content awareness during conversation. The boundary is
+  load-bearing; do not cross it on the heavy lanes.
 
 Now go read `references/shared_rules.md` first, then
 `references/parent_rules.md`. After that, you're ready to start the
