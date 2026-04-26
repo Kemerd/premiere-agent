@@ -20,24 +20,64 @@ no token budget concern, no time concern, no efficiency concern, no
 
 ### Mode-gated cold-path reads (conditional, before the merged-view read)
 
-The parent's brief carries three feature-mode flags
-(`script_mode`, `b_roll_mode`, `user_profile`). For the two boolean
-flags, **if the flag is true, read the matching cold-path file IN
-FULL before reading the merged timeline.** If the flag is false,
-skip the file silently — those rules don't apply this session.
+The parent's brief carries four feature-mode flags
+(`script_mode`, `b_roll_mode`, `timelapse_mode`, `user_profile`)
+plus an optional `source_tags.json` path. For the file-bound
+boolean flags, **if the flag is true, read the matching cold-path
+file IN FULL before reading the merged timeline.** If the flag is
+false, skip the file silently — those rules don't apply this
+session.
 
 | Flag                | If `true`, read this file in full          |
 |---------------------|--------------------------------------------|
 | `script_mode`       | `references/scripted.md`                   |
 | `b_roll_mode`       | `references/b_roll_selection.md`           |
 
+`timelapse_mode` is a permission flag, NOT a file flag:
+
+- `timelapse_mode = false` (the safe default) — **emit zero ranges
+  with `speed != 1.0`**. The "Time-squeezing (timelapse)" section
+  later in this file is fully overridden — even when you find a
+  long visually-continuous activity stretch that would be a
+  textbook timelapse candidate, you DO NOT emit `speed > 1.0`.
+  Cut the stretch (drop dead air; pick highlights at 1x), or keep
+  selected 1x ranges, but no retime. The user has explicitly opted
+  out of timelapses for this session — silent retime would damage
+  their material.
+- `timelapse_mode = true` — the time-squeezing rules in this file
+  apply normally. Hard ceiling stays `speed = 10.0`.
+
 `user_profile` is `personal | creator | professional` and is NOT a
-file flag — it sets your verification bar (see below). It comes
-into play when you're applying the rules from
-`b_roll_selection.md` (top-candidate review on every named-subject
-beat at `professional`, default bar otherwise) and when you're
-writing QA notes in EDL `reason` fields (terse for personal /
-creator; detailed list-the-rejected-candidates for professional).
+file flag — it sets your verification bar. It comes into play when
+you're applying the rules from `b_roll_selection.md` (top-candidate
+review on every named-subject beat at `professional`, default bar
+otherwise) and when you're writing QA notes in EDL `reason` fields
+(terse for personal / creator; detailed list-the-rejected-
+candidates for professional).
+
+`source_tags.json` (path may be present in the brief) is a small
+JSON map of clip stems to categories (`a_roll`, `b_roll`,
+`timelapse`, `voiceover`, `unknown`). When the brief lists this
+path, **respect the categorization** for candidate searches:
+
+- B-roll candidate searches (whether you do them in-context or
+  spawn b-roll scout sub-agents) should restrict to clips tagged
+  `b_roll` / `cutaway`, OR `unknown` if the user didn't tag
+  everything.
+- A-roll-tagged clips are the primary speech / audio bed in
+  talking-head mode; do not consider them as cutaways unless the
+  user explicitly asked for the speaker's footage as cutaways.
+- `timelapse`-tagged clips are pre-organized timelapse source
+  material; if `timelapse_mode = true`, prefer them as timelapse
+  retime candidates over discovering retime stretches in arbitrary
+  footage.
+- `voiceover`-tagged clips are the VO source in scripted mode; the
+  parent will have re-preprocessed it and will list the cached
+  transcript path in the brief.
+
+If `source_tags.json` is absent from the brief, all sources are
+treated as eligible across all roles (the user didn't organize, so
+you don't pre-filter).
 
 These cold-path files are **additive** to your default rules — they
 do not replace the merged-view spine read below, the pacing-preset
@@ -357,7 +397,163 @@ Stay inside Hard Rule 7's 30-200ms working window. Never go below
 
 ---
 
+## B-roll scout spawn protocol (when `b_roll_mode = true`)
+
+You may delegate the per-beat b-roll shortlisting work to a **b-roll
+scout sub-agent**. Scouts are sub-sub-agents — you spawn them, they
+return ranked candidate shortlists, you pick / verify / write the
+EDL ranges. The scout's operating manual is
+`references/subagent_broll_scout_rules.md`; it reads
+`<edit>/visual_timeline.md` for in-scope sources and returns
+shortlists with evidence.
+
+This is **optional** — for small libraries you do the work yourself
+in your own context window. The protocol below tells you when
+scouts are worth it.
+
+### When to spawn scouts
+
+Spawn a scout (or a batch of parallel scouts) when ANY of:
+
+- **Library is large.** `>50` b-roll-eligible clips, or
+  `merged_timeline.md` was a strain on your read budget. Per-beat
+  re-scanning of `visual:` lines is wasteful at this size.
+- **`user_profile = professional`.** Top-candidate review on every
+  named-subject beat is mandatory; offloading shortlisting to scouts
+  + you doing verification/selection yields better QA notes.
+- **Many beats need shortlisting.** When scripted mode has 8+ beats
+  with named-subject b-roll, parallel scouts (Hard Rule 10) finish
+  faster than sequential in-context scanning.
+- **Ambiguous beat.** A specific beat where the visual evidence in
+  the merged view didn't decide it — a scout's fresh-context
+  visual_timeline read can surface candidates you missed.
+
+For small libraries (`<= 30` clips) and `personal` / `creator` bar,
+do the work in-context; the spawn overhead isn't worth it.
+
+### Spawning N scouts in parallel
+
+Per Hard Rule 10, when you spawn multiple scouts in one batch (e.g.
+one per beat), spawn them **in parallel** via the agent / Task
+tool, not sequentially. Total wall time approximates the slowest
+scout, not the sum.
+
+### Scout brief shape
+
+Build the scout brief with these sections (the scout's rules file
+documents the full input shape; this is your fill-in-the-blanks
+template):
+
+```
+You are the B-ROLL SCOUT sub-agent for a video-use-premiere session.
+You have a fresh context window. Use it.
+
+STEP 0 (mandatory):
+  Read references/shared_rules.md IN FULL.
+  Read references/subagent_broll_scout_rules.md IN FULL.
+
+CONVERSATION CONTEXT (forwarded from editor):
+  Project summary: <as forwarded by parent to me>
+  Verbatim user quotes (relevant to b-roll selection):
+    [t=...] "<quote>"
+    ...
+  Things the user explicitly asked to keep:
+    - "<quote>"
+  Things the user explicitly rejected:
+    - "<quote>"
+
+MODE FLAGS:
+  script_mode    = <true|false>
+  b_roll_mode    = true                # otherwise we wouldn't be here
+  timelapse_mode = <true|false>        # binds whether you may
+                                       # suggest timelapse-shaped ranges
+  user_profile   = <personal|creator|professional>
+
+SOURCE CONSTRAINTS:
+  source_tags.json:  <edit>/source_tags.json (or "(not present)")
+  In-scope source stems for THIS shortlist:
+    [<list of stems eligible for b-roll candidates>]
+  Out-of-scope (explicitly excluded): [<list>]
+
+INPUTS YOU MAY READ:
+  - <edit>/visual_timeline.md (your default reading surface; read
+    in full for in-scope sources)
+  - <edit>/visual_caps/<stem>.json (drill-down for raw frame
+    captions on a candidate)
+  - <edit>/transcripts/<stem>.json (confirm low speech if a clip
+    looks like A-roll mis-filed)
+  - <edit>/clip_index/index.json (if path forwarded; shortlist aid)
+
+BEATS TO SHORTLIST:
+  Beat 1:
+    label:                 <BEAT_NAME>
+    subject:               <"Riot Games booth signage">
+    target_duration_s:     <seconds>
+    vo_start_s:            <vo timestamp on output timeline> (scripted-mode only)
+    vo_end_s:              <...>
+    vo_subject_word_t_s:   <...>      (when the named subject is spoken)
+    keywords:              [<riot, games, booth, sign, banner, logo>]
+    notes:                 <"user explicitly asked to land on the booth on the booth">
+  Beat 2:
+    ...
+
+TOP-N PER BEAT: <typically 3-8>
+
+OUTPUT:
+  Return the JSON block per references/subagent_broll_scout_rules.md
+  "Return format" plus a 3-6 sentence rationale. Include
+  subject_visible_t_s on every candidate so I can compute the
+  in-point per scripted.md step 6.
+```
+
+### When to NOT spawn scouts
+
+- Tiny libraries (<= 5 clips) — read merged_timeline once, decide.
+- Pure talking-head with one A-roll source and 1-2 cutaways — same.
+- The user explicitly said "I want this fast, don't over-engineer
+  it" — note in your return that scouts were skipped per the
+  user's quote.
+
+### Using scout returns
+
+When the scout returns:
+
+1. Read the scout's JSON shortlist + rationale.
+2. For each beat, pick the top-ranked candidate that passes YOUR
+   verification (drill into `merged_timeline.md` around the
+   candidate range; check there's no audio-event or speech
+   conflict you care about).
+3. If the top candidate fails verification, descend to candidate 2,
+   3, ... — that's why you got a shortlist.
+4. Compute the source in-point per `scripted.md` step 6 using the
+   scout's `subject_visible_t_s`.
+5. Write the EDL range with a QA note in `reason` listing the
+   scout's rejected alternatives (when `user_profile =
+   professional`) — that's the detailed-QA discipline.
+6. Note in your final return rationale that scouts were used and
+   how many; the parent will surface this to the user if they ask
+   how the cut was made.
+
+If a scout returns `BUDGET_EXHAUSTED`, narrow its in-scope source
+list (drop sources that are clearly out of category) and re-spawn.
+If it still exhausts, fall back to in-context scanning for that
+beat — scouts are an optimization, not a hard requirement.
+
+---
+
 ## Time-squeezing (timelapse)
+
+> **Gated by `timelapse_mode` in the parent's brief.** This entire
+> section applies ONLY when `timelapse_mode = true`. When
+> `timelapse_mode = false` (the default), emit zero ranges with
+> `speed != 1.0` — even if a stretch looks textbook timelapse-
+> shaped. The user opted out for a reason (often: "the b-roll IS
+> the visual track at 1x; don't compress it"). Skip this section
+> when the flag is false; do not invent retime decisions the user
+> didn't authorize. If `source_tags.json` exists and a clip is
+> tagged `timelapse`, that clip is OBVIOUSLY pre-meant for retime —
+> but `timelapse_mode = false` still wins (the user might want the
+> clip in 1x for THIS session). Honour the flag.
 
 Real-world footage is often "1 minute of explanation, then 25 minutes
 of silently doing the work, then 2 minutes of wrap-up." Cutting the 25
@@ -595,3 +791,17 @@ factual, be terse on the report, but be thorough on the EDL itself.
   `professional` brief.** Top-candidate review and detailed QA
   notes are mandatory at the professional bar — see
   `b_roll_selection.md` "How `user_profile` shapes the bar."
+- **Emitting `speed > 1.0` on a `timelapse_mode = false` brief.**
+  Even one retime range silently violates the user's opt-out.
+  Cut the stretch or keep 1x; never retime without permission.
+- **Spawning b-roll scouts sequentially.** When you spawn N
+  scouts, spawn them in parallel (Hard Rule 10). Sequential
+  spawning forfeits the parallelism that makes scouts worthwhile.
+- **Trusting a scout's top candidate without verification.** The
+  scout shortlists; you decide. Verification (drilling
+  `merged_timeline.md` around the candidate range) still binds.
+- **Ignoring `source_tags.json` when proposing b-roll candidates.**
+  A-roll-tagged clips don't become cutaways unless the user
+  explicitly authorized it. The user organized for a reason.
+- **Spawning scouts on tiny libraries or single-source projects.**
+  Spawn overhead exceeds savings. Do the work in-context.

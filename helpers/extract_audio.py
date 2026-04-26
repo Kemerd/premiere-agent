@@ -1,10 +1,20 @@
-"""Extract a 16 kHz mono PCM WAV from a source video, exactly once.
+"""Extract a 16 kHz mono PCM WAV from a source media file, exactly once.
 
 Parakeet wants 16 kHz mono PCM, and the CLAP audio lane
-upsamples the same cache to 48 kHz on the fly. Decoding the source video
+upsamples the same cache to 48 kHz on the fly. Decoding the source
 twice is wasteful — a 4K H.265 master can take longer to demux than the
 actual inference. So we extract once, cache the WAV under
 <edit>/audio_16k/, and every audio-consuming lane reads the same file.
+
+Audio-only sources
+------------------
+This helper is intentionally agnostic about whether the input is a
+video container (.mp4, .mov, ...) or an audio-only container (.wav,
+.mp3, .flac, ...). ffmpeg's `-vn` is a no-op when there is no video
+stream, and the resample / channel-fold to 16k mono PCM is the same
+operation either way. So a recorded voiceover.wav lands in
+<edit>/audio_16k/voiceover.wav (resampled if it wasn't already 16k
+mono) and the speech lane sees it like any other source.
 
 Output spec is the canonical ASR-friendly format:
 
@@ -61,10 +71,13 @@ def extract_audio_for(
     force: bool = False,
     verbose: bool = True,
 ) -> Path:
-    """Extract (or reuse cached) 16k mono PCM WAV for the source video.
+    """Extract (or reuse cached) 16k mono PCM WAV for the source media.
 
     Args:
-        source_path: Absolute path to the source video file.
+        source_path: Absolute path to the source media file. Either a
+                     video container (.mp4, .mov, .mkv, ...) or an
+                     audio-only container (.wav, .mp3, .flac, ...) —
+                     ffmpeg handles both with the same command.
         edit_dir:    The session edit directory (e.g. <videos>/edit).
         force:       Bypass the cache check, always re-extract.
         verbose:     Print one line per file. Off in batch contexts.
@@ -78,7 +91,7 @@ def extract_audio_for(
     """
     source_path = source_path.resolve()
     if not source_path.exists():
-        raise FileNotFoundError(f"source video not found: {source_path}")
+        raise FileNotFoundError(f"source media not found: {source_path}")
 
     out_dir = (edit_dir / SUBDIR).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

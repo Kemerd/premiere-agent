@@ -2,16 +2,27 @@
 
 This is the script the SKILL calls. Difference vs preprocess.py:
 
-  - Takes a DIRECTORY of source videos (not an explicit file list)
-  - Auto-discovers .mp4/.mov/.mkv/.m4v files in that directory
+  - Takes a DIRECTORY of source media (not an explicit file list)
+  - Auto-discovers video AND audio-only files in that directory
   - Skips files whose lane outputs are already cache-fresh
   - Defaults edit-dir to <videos>/edit
 
 Everything else delegates to preprocess.run_preprocess() so the schedule
 selection, progress display, and lane dispatch stay in one place.
 
+Mixed batches (video + audio-only)
+----------------------------------
+Audio-only sources (e.g. a recorded voiceover .wav, a music bed, a
+podcast .mp3) are first-class citizens in the pipeline. They get the
+speech lane (Parakeet ONNX runs on the same 16kHz mono WAV cache, no
+matter whether the source was video or audio) and the optional CLAP
+audio lane. They are EXCLUDED from the visual lane — Florence-2 needs
+frames, so audio-only sources are filtered out of the visual job by
+run_preprocess(). A typical mixed batch is "12 video clips + 1
+voiceover.wav for a scripted assembly".
+
 CLI:
-    python helpers/preprocess_batch.py <videos_dir> \\
+    python helpers/preprocess_batch.py <sources_dir> \\
         [--edit-dir <dir>] [--wealthy] [--diarize] [--language en]
         [--force] [--force-schedule {parallel,mixed,sequential,cpu}]
 """
@@ -27,34 +38,61 @@ from preprocess import run_preprocess
 from vram import Schedule, parse_force_schedule
 
 
-# Recognised source extensions. We DON'T include audio-only (.wav, .mp3,
-# .m4a) here because the visual lane needs frames; mixed batches would
-# fail mid-run. If a future "speech-only" mode lands, add a flag.
+# ---------------------------------------------------------------------------
+# Recognised source extensions
+# ---------------------------------------------------------------------------
+#
+# Two buckets — video containers (frames + audio, all three lanes apply)
+# and audio-only containers (just speech / optional CLAP, NO visual).
+# The classification is by suffix only; that's enough for ffmpeg's input
+# probe to do the right thing downstream. If someone has an audio-only
+# .mp4 (rare, but legal) it'll still be sent to the visual lane and the
+# Florence prefetch will fail loudly — that's the user's bug, not ours.
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v", ".avi", ".webm"}
+AUDIO_ONLY_EXTS = {
+    ".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma",
+}
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_ONLY_EXTS
 
 
-def _discover_videos(videos_dir: Path) -> list[Path]:
-    """Return sorted source videos under videos_dir (non-recursive).
+def _discover_sources(sources_dir: Path) -> tuple[list[Path], list[Path]]:
+    """Return (videos, audio_only) sorted lists under sources_dir.
 
     Non-recursive on purpose — recursion picks up B-roll and proxy
     folders the user may not want preprocessed. Users with a tree can
     pass `python preprocess.py file1 file2 ...` directly.
+
+    Returns a 2-tuple so the caller can print a clean summary and pass
+    them as a single combined list to run_preprocess() (which then
+    re-classifies internally to scope each lane). We don't return one
+    flat list because the summary line is genuinely useful — "12
+    videos + 1 voiceover.wav" tells the user immediately whether they
+    forgot to drop their VO file in.
     """
-    out: list[Path] = []
-    for p in videos_dir.iterdir():
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
-            out.append(p.resolve())
-    out.sort()
-    return out
+    videos: list[Path] = []
+    audio: list[Path] = []
+    for p in sources_dir.iterdir():
+        if not p.is_file():
+            continue
+        sfx = p.suffix.lower()
+        if sfx in VIDEO_EXTS:
+            videos.append(p.resolve())
+        elif sfx in AUDIO_ONLY_EXTS:
+            audio.append(p.resolve())
+    videos.sort()
+    audio.sort()
+    return videos, audio
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Discover & preprocess all videos in a directory "
-                    "(speech / audio / visual lanes).",
+        description="Discover & preprocess all media in a directory "
+                    "(speech / audio / visual lanes; audio-only sources "
+                    "are auto-detected and routed to speech-only lanes).",
     )
     ap.add_argument("videos_dir", type=Path,
-                    help="Directory containing source video files")
+                    help="Directory containing source media (video files "
+                         "and/or audio-only files like voiceover .wav)")
     ap.add_argument("--edit-dir", type=Path, default=None,
                     help="Edit output dir (default: <videos_dir>/edit)")
     ap.add_argument("--force-schedule",
@@ -91,22 +129,40 @@ def main() -> None:
     if not videos_dir.is_dir():
         sys.exit(f"[preprocess_batch] FATAL: not a directory: {videos_dir}")
 
-    videos = _discover_videos(videos_dir)
-    if not videos:
-        sys.exit(f"[preprocess_batch] no source videos in {videos_dir} "
-                 f"(extensions: {sorted(VIDEO_EXTS)})")
+    videos, audio_only = _discover_sources(videos_dir)
+    if not videos and not audio_only:
+        sys.exit(
+            f"[preprocess_batch] no source media in {videos_dir}\n"
+            f"  recognised video extensions: {sorted(VIDEO_EXTS)}\n"
+            f"  recognised audio extensions: {sorted(AUDIO_ONLY_EXTS)}"
+        )
 
-    print(f"[preprocess_batch] discovered {len(videos)} source video(s) "
-          f"in {videos_dir}")
+    # ── Discovery summary ──
+    # Print video and audio-only counts separately so the user can spot
+    # at a glance whether ffmpeg picked up their voiceover.wav. The
+    # combined list is what we pass downstream — run_preprocess()
+    # re-classifies it internally to scope the visual lane.
+    print(
+        f"[preprocess_batch] discovered {len(videos)} video(s) + "
+        f"{len(audio_only)} audio-only source(s) in {videos_dir}"
+    )
     for v in videos:
         size_mb = v.stat().st_size / (1024 * 1024)
-        print(f"  - {v.name}  ({size_mb:.0f} MB)")
+        print(f"  - [video] {v.name}  ({size_mb:.0f} MB)")
+    for a in audio_only:
+        size_mb = a.stat().st_size / (1024 * 1024)
+        print(f"  - [audio] {a.name}  ({size_mb:.0f} MB)  [speech-only, no visual lane]")
 
     edit_dir = (args.edit_dir or (videos_dir / "edit")).resolve()
     schedule = parse_force_schedule(args.force_schedule)
 
+    # The orchestrator accepts a single flat list and re-classifies by
+    # extension to scope the visual lane. Concatenating here keeps the
+    # public API of run_preprocess() unchanged (still `videos=`).
+    all_sources = videos + audio_only
+
     jobs = run_preprocess(
-        videos=videos,
+        videos=all_sources,
         edit_dir=edit_dir,
         schedule=schedule,
         skip_speech=args.skip_speech,

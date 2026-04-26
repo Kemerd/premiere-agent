@@ -55,6 +55,36 @@ PYTHON = sys.executable
 
 
 # ---------------------------------------------------------------------------
+# Audio-only source classification
+# ---------------------------------------------------------------------------
+#
+# The pipeline is happy to accept audio-only sources (e.g. a voiceover
+# .wav recorded after the fact, a podcast .mp3, a music bed) alongside
+# the usual video files. Speech (Parakeet ONNX) and the optional CLAP
+# audio lane both consume only the 16kHz mono WAV cache produced by
+# extract_audio.py — they don't care whether the source had video. The
+# visual lane (Florence-2) does need frames, so audio-only sources are
+# filtered out of the visual job below before dispatch.
+#
+# Keep this list in sync with preprocess_batch.AUDIO_ONLY_EXTS. We
+# duplicate it here (instead of importing) because preprocess.py is the
+# more upstream module — preprocess_batch imports it, not the other
+# way round, and pulling the constant from a sibling would create a
+# circular-feeling dependency for a 8-element set.
+AUDIO_ONLY_EXTS = frozenset({
+    ".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma",
+})
+
+
+def _is_audio_only(path: Path) -> bool:
+    """True if `path` is an audio-only container (no video stream by
+    convention). Classification is suffix-only — see the AUDIO_ONLY_EXTS
+    docstring for rationale.
+    """
+    return path.suffix.lower() in AUDIO_ONLY_EXTS
+
+
+# ---------------------------------------------------------------------------
 # Lane launch staggering
 # ---------------------------------------------------------------------------
 #
@@ -449,12 +479,29 @@ def run_preprocess(
 ) -> list[LaneJob]:
     """Top-level orchestration. Returns finished LaneJob list.
 
+    Args:
+        videos: All sources to preprocess. Despite the legacy name,
+            this list may MIX video files (.mp4, .mov, ...) and
+            audio-only files (.wav, .mp3, ...). Audio-only sources
+            are auto-detected by extension (see AUDIO_ONLY_EXTS) and
+            routed to the speech / CLAP lanes only — they are filtered
+            out of the visual lane because Florence-2 needs frames.
+            Use cases for audio-only sources: voiceover .wav recorded
+            after the shoot, music bed, podcast .mp3 being repurposed,
+            etc.
+        edit_dir: Output directory for caches + lane outputs.
+
     Lanes:
-        speech  (Parakeet ONNX)  - ON by default
-        visual  (Florence-2)     - ON by default
+        speech  (Parakeet ONNX)  - ON by default. Runs on ALL sources
+                                   (video and audio-only).
+        visual  (Florence-2)     - ON by default. Runs on VIDEO sources
+                                   only; if the batch is entirely
+                                   audio-only the lane is skipped
+                                   gracefully with a log line.
         audio   (CLAP zero-shot) - OFF by default; opt in with
                                    `include_audio=True` to run the
                                    baseline-vocab Phase A path inline.
+                                   Runs on ALL sources when enabled.
                                    The agent-curated Phase B path is
                                    the recommended workflow and runs
                                    as a separate audio_lane.py
@@ -462,9 +509,23 @@ def run_preprocess(
                                    completes.
     """
     if not videos:
-        raise ValueError("no videos given")
+        raise ValueError("no sources given")
     edit_dir = edit_dir.resolve()
     edit_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Classify sources: video vs audio-only ──
+    # The `videos` parameter is a misnomer kept for backward-compat —
+    # in practice it's "all sources, video and audio-only mixed". We
+    # split them here so each lane gets the right scope:
+    #   speech / audio (CLAP) lanes  -> all sources (they read the
+    #                                   16kHz mono WAV cache, which
+    #                                   extract_audio_for() builds for
+    #                                   any media file ffmpeg can read)
+    #   visual (Florence-2)  lane    -> video sources ONLY (it needs
+    #                                   frames; audio-only sources
+    #                                   would crash the prefetch)
+    video_sources = [v for v in videos if not _is_audio_only(v)]
+    audio_only_sources = [v for v in videos if _is_audio_only(v)]
 
     # Wealthy mode is global: propagate to env so child lanes see it
     # without us having to add --wealthy to every shim invocation.
@@ -495,7 +556,11 @@ def run_preprocess(
             "to opt in; sequential is the safer default on single-GPU rigs)"
         )
     print(f"[orchestrator] Wealthy  : {is_wealthy(False)}")
-    print(f"[orchestrator] Videos   : {len(videos)}")
+    print(
+        f"[orchestrator] Sources  : {len(video_sources)} video, "
+        f"{len(audio_only_sources)} audio-only "
+        f"({len(videos)} total)"
+    )
 
     # 2) Shared audio extraction (cheap, single-threaded ffmpeg)
     _shared_audio_extraction(videos, edit_dir)
@@ -535,7 +600,13 @@ def run_preprocess(
             aargs += ["--force"]
         jobs.append(LaneJob("audio", "audio_lane.py", videos, edit_dir, aargs))
 
-    if not skip_visual:
+    # ── Visual lane scoping ───────────────────────────────────────────
+    # Florence-2 needs frames, so we hand it ONLY the video sources.
+    # If the entire batch is audio-only (e.g. user is running through
+    # a folder of voiceover .wav files for a scripted assembly), we
+    # skip the visual lane entirely — appending an empty-videos
+    # LaneJob would just print "0 cache hits" and waste a model load.
+    if not skip_visual and video_sources:
         vargs = ["--device", device_arg]
         if force:
             vargs += ["--force"]
@@ -553,7 +624,15 @@ def run_preprocess(
         # path was fine). Forwarding --batch-size here closes the gap.
         if is_wealthy(wealthy):
             vargs += ["--batch-size", str(FLORENCE_BATCH)]
-        jobs.append(LaneJob("visual", "visual_lane.py", videos, edit_dir, vargs))
+        jobs.append(LaneJob("visual", "visual_lane.py", video_sources, edit_dir, vargs))
+    elif not skip_visual and not video_sources:
+        # Audio-only batch — surface this so the user isn't confused
+        # by the missing visual_caps/ output and the absence of any
+        # visual_lane log lines.
+        print(
+            "[orchestrator] visual lane skipped — no video sources "
+            "in this batch (all inputs are audio-only)"
+        )
 
     if not jobs:
         print("[orchestrator] no lanes selected — nothing to do.")
@@ -590,7 +669,9 @@ def main() -> None:
         description="Three-lane preprocessor (speech / audio / visual)",
     )
     ap.add_argument("videos", nargs="+", type=Path,
-                    help="Source video files (one or many)")
+                    help="Source media files (one or many). Video files "
+                         "and/or audio-only files (.wav/.mp3/...) — "
+                         "audio-only sources auto-skip the visual lane.")
     ap.add_argument("--edit-dir", type=Path, default=None,
                     help="Edit output dir (default: <first video parent>/edit)")
     ap.add_argument("--force-schedule",

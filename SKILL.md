@@ -63,6 +63,15 @@ You point spawned sub-agents at these via their briefs (templates in
   One sub-agent spawned per animation slot, all in parallel
   (Hard Rule 10).
 
+- **`references/subagent_broll_scout_rules.md`** — b-roll scout
+  sub-agent's manual. **Spawned by the editor sub-agent**, not by
+  you (the parent). Sub-sub-agents — they read
+  `<edit>/visual_timeline.md` for in-scope sources only and return
+  ranked b-roll candidate shortlists. The editor decides whether
+  to delegate per-beat shortlisting based on library size,
+  `user_profile`, and beat count. Architectural ceiling stays at
+  two levels below parent: `parent -> editor -> scout`.
+
 ## Cold-path features (load on demand when the user asks for them)
 
 - **`references/subtitles.md`** — chunking / case / placement
@@ -85,11 +94,21 @@ You point spawned sub-agents at these via their briefs (templates in
   `b_roll_mode = true`. Common combo: scripted assembly triggers
   both.
 
-The parent collects these flags + a `user_profile` field
-(`personal | creator | professional` — sets the editor's
-verification bar) in step 4 of the 9-step process and persists
-them in `<edit>/project.md` so subsequent sessions inherit
-defaults. See `parent_rules.md` for the exact question templates.
+The parent collects four flags in step 4: `script_mode`,
+`b_roll_mode`, `timelapse_mode` (default `false` — explicit opt-in
+to retime / time-squeeze, otherwise the editor stays at 1x), and
+`user_profile` (`personal | creator | professional` — sets the
+editor's verification bar). All four are persisted in
+`<edit>/project.md` so subsequent sessions inherit defaults.
+
+The parent also runs a **folder convention auto-detection** in
+step 1: case-insensitive subfolders like `b_roll/`, `timelapse/`,
+`voiceover/`, `a_roll/` pre-fill the step-4 mode-gating defaults
+and write `<edit>/source_tags.json` mapping clip stems to
+categories. Sub-agents respect these tags when shortlisting.
+
+See `parent_rules.md` for the exact question templates and the
+folder-convention table.
 
 ## What this architecture buys you
 

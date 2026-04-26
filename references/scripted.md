@@ -36,6 +36,29 @@ sit underneath a single continuous voiceover audio bed. This is the
 common shape for product launches, sponsorship reads, recaps,
 explainers, branded content, sizzle reels, and event recaps.
 
+### Voiceover container format
+
+The voiceover source can be either:
+
+- **An audio-only file** (`.wav`, `.mp3`, `.m4a`, `.flac`, ...) — the
+  common case when the user recorded VO at a desk after the shoot.
+  The parent runs `preprocess.py <voiceover.wav>` (or it goes through
+  `preprocess_batch.py` mixed in with the video sources) and the
+  speech lane produces `<edit>/transcripts/<voiceover_stem>.json` the
+  same way it would for any other source. The visual lane is
+  auto-skipped for audio-only sources.
+- **A video file with the VO baked into the audio track** — e.g. the
+  user re-recorded VO inside their NLE and exported a `.mov` reference.
+  Treated like any other video; the speech lane transcribes the audio
+  and you ignore the visual lane output for the VO clip itself
+  (Florence-2 captions of a black-screen VO are useless).
+
+You don't need to do anything different in either case. The transcript
+shape is identical; the path is `<edit>/transcripts/<voiceover_stem>
+.json`. Verify the file you're using by checking the `source_tags.json`
+(if present) for clips tagged `voiceover` — that's the parent's
+declaration of which file is the timing spine.
+
 Because the script is fixed and the voiceover is fixed, **the cut
 problem inverts**: instead of "find the best take in this footage,"
 the question becomes "for each named beat in the script, which clip
@@ -167,23 +190,42 @@ end-to-end (per the ABSOLUTE READ MANDATE in
 `subagent_editor_rules.md`) before this step. The visual lane lines
 (`visual:`) are your search target.
 
-For each beat, build a shortlist of 3-8 candidate clips by:
+**Three shortlisting paths**, pick whichever fits the library size
+and the user_profile bar:
 
-- Scanning `visual:` lines whose captions contain the beat's named
-  subject ("Riot Games sign" → captions mentioning Riot, sign, banner,
-  booth signage, logo).
-- Cross-checking the speech lane on the same source — if a clip's
-  speaker is *talking about* the subject, that doesn't help; you want
-  the clip *showing* the subject.
-- Preferring clips with multiple consecutive matching `visual:` lines
-  (>= 3 seconds of stable visual evidence) over a single one-frame
-  hit (which might be a fast pan-through).
+1. **In-context scan (default for small libraries).** Walk
+   `visual:` lines per beat looking for matches. Build a shortlist
+   of 3-8 candidate clips per beat by:
+   - Captions containing the beat's named subject ("Riot Games sign"
+     → captions mentioning Riot, sign, banner, booth signage, logo).
+   - Cross-checking the speech lane on the same source — if a clip's
+     speaker is *talking about* the subject, that doesn't help; you
+     want the clip *showing* the subject.
+   - Preferring clips with multiple consecutive matching `visual:`
+     lines (>= 3 seconds of stable visual evidence) over a single
+     one-frame hit (which might be a fast pan-through).
 
-If your library is small (≤ 50 clips and `merged_timeline.md` fits
-comfortably in your context), this scan is just careful reading. If
-the library is large enough that the merged file is too big to scan
-per-beat efficiently, the parent has the option to build a clip
-index — see "Optimized matching" below.
+2. **Spawn b-roll scout sub-agents (recommended for large libraries
+   or `professional` bar).** Per `subagent_editor_rules.md` "B-roll
+   scout spawn protocol", you may delegate per-beat shortlisting to
+   parallel scout sub-agents. Pass them `source_tags.json` (when
+   present) so they only consider b-roll-tagged clips. They return
+   ranked shortlists with evidence; you pick / verify / write the
+   EDL range. This keeps your context budget for cut decisions
+   instead of caption re-scans.
+
+3. **Use a clip index (when available, as a shortlist aid).** If
+   the parent's brief mentions `<edit>/clip_index/index.json`, you
+   may text-search it for fast shortlisting. Whether you use it
+   in-context or hand it to a scout, **verification still binds in
+   step 5** — the index suggests; the visual-lane drill-down decides.
+
+When `source_tags.json` is present in the brief, restrict candidate
+searches (whether in-context, scout-delegated, or index-queried) to
+clips tagged `b_roll` / `cutaway` / `unknown`. A-roll-tagged clips
+are the speech bed in talking-head mode; in scripted assembly the
+A-roll tag is rare since the VO carries audio — but if it appears,
+respect the user's organization.
 
 ### 5. Verify the top candidate against the visual evidence
 
@@ -361,29 +403,33 @@ against.
 
 ---
 
-## Optional: clip index for very large libraries
+## Scaling shortlisting — scouts, indexes, in-context
 
-When the project's clip library is large enough that
-`merged_timeline.md` no longer fits comfortably (>~ 1.5 MB or many
-hundreds of clips), the merged-read approach gets expensive per
-beat — you'd be re-scanning the same captions hundreds of times.
+Three escalation tiers as your library grows:
 
-A **clip index** solves this: a per-clip JSON record built from the
-already-cached visual captions + speech transcripts, queryable by
-short keyword, returning a ranked shortlist. The matching procedure
-in step 4 above becomes:
+- **Tier 1 — in-context scan (small libraries).** Read
+  `merged_timeline.md` end-to-end once, then scan `visual:` lines
+  per beat. Cheap when the library fits in your read budget and the
+  number of beats is small (<= 8).
+- **Tier 2 — clip index (medium-large libraries, no scouts yet).**
+  When the parent has built `<edit>/clip_index/index.json` (a
+  per-clip text-searchable record from cached captions + speech),
+  query the index per beat for fast shortlisting, then verify the
+  top candidate(s) against `merged_timeline.md` /
+  `visual_timeline.md`. The index is a parent-managed helper
+  (`helpers/clip_index.py`-style); it's optional. The index
+  accelerates step 4; it doesn't replace verification in step 5.
+- **Tier 3 — b-roll scout sub-agents (large libraries OR
+  professional bar OR many beats).** Per `subagent_editor_rules.md`
+  "B-roll scout spawn protocol", spawn parallel scout sub-agents
+  (Hard Rule 10) — one per beat or one per cluster of beats.
+  Scouts read `<edit>/visual_timeline.md` for in-scope sources in
+  their own fresh context windows, return ranked shortlists with
+  evidence, and you pick / verify / write the EDL range. This keeps
+  your context for editorial decisions instead of caption-re-
+  scanning, and it stacks with the index when both are available
+  (you can pass the index path to scouts so they shortlist faster).
 
-1. Query the index with the beat's named subject → get top-N shortlist.
-2. Verify the top candidate(s) against `merged_timeline.md` /
-   `visual_timeline.md` as before.
-
-The index is a parent-managed helper (a `helpers/clip_index.py`
-script that the parent runs once per library, then refreshes only
-when clips / captions change). If the parent's brief mentions
-`<edit>/clip_index/index.json` exists, you can use it as a
-shortlisting aid in step 4 — but the merged_timeline read in
-pre-flight is still mandatory, and verification in step 5 still
-binds. The index speeds shortlisting; it doesn't replace verification.
-
-If no clip index exists, scan `merged_timeline.md` per beat as
-described in step 4 — it's slower but still correct.
+For ALL tiers: the merged_timeline read in pre-flight is still
+mandatory; the verification step (step 5) still binds; and source
+in-points (step 6) are computed by you, not by scouts or the index.

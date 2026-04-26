@@ -188,6 +188,108 @@ codec / framerate / channels. That is parent-allowable. Anything that
 returns content (frames, transcript text, captions) is sub-agent
 territory.
 
+#### Audio-only sources are first-class
+
+The pipeline accepts video files **and** standalone audio files in the
+same `videos_dir`. Common case: the user shot footage and recorded a
+separate voiceover.wav after the fact, or dropped an .mp3 podcast bed
+into the project. The orchestrator (`helpers/preprocess.py`) auto-
+classifies sources by extension:
+
+| Extension bucket | Lanes that run | Notes |
+|---|---|---|
+| Video — `.mp4` `.mov` `.mkv` `.m4v` `.avi` `.webm` | speech, visual, (optional) CLAP audio | Standard path. |
+| Audio-only — `.wav` `.mp3` `.m4a` `.aac` `.flac` `.ogg` `.opus` `.wma` | speech, (optional) CLAP audio | Visual lane filtered out automatically. |
+
+What this means in practice:
+
+- `helpers/preprocess_batch.py` discovers BOTH buckets in the source
+  directory and prints a summary line like `discovered 12 video(s) +
+  1 audio-only source(s) in <videos_dir>` so the user immediately
+  knows whether their voiceover.wav was picked up.
+- `<edit>/audio_16k/<stem>.wav` is produced for every source by the
+  same ffmpeg `-vn` resample, so the speech lane and CLAP audio lane
+  see audio-only sources exactly the same as video sources.
+- `<edit>/transcripts/<stem>.json` ships for every source, including
+  audio-only ones — Parakeet doesn't care whether the WAV came from
+  a `.mov` or a `.wav`.
+- `<edit>/visual_caps/<stem>.json` is **not** produced for audio-only
+  stems; the visual lane is scoped out of them. `pack_timelines.py`
+  handles missing visual_caps gracefully (the merged timeline simply
+  shows no visual captions for those stems).
+- If the entire batch is audio-only (e.g. user is rendering a
+  scripted podcast assembly with no footage at all), the visual lane
+  is skipped entirely and the orchestrator logs `visual lane skipped
+  — no video sources in this batch`.
+
+You don't have to do anything special — just confirm in the inventory
+recap that you noticed any audio-only files (`"I see your shoot has
+12 .mp4 clips plus voiceover_final.wav as an audio-only source —
+that'll get transcribed alongside the footage."`) so the user knows
+they weren't dropped.
+
+#### Folder convention auto-detection (optional)
+
+Before preprocessing, look at the videos_dir directory tree for
+**optional convention subfolders**. Users who organize their
+material this way pre-fill the step-4 mode-gating defaults; users
+who don't get asked fresh in step 4. Detection is case-insensitive
+and treats hyphens / underscores as equivalent.
+
+| Folder pattern (any of) | Maps to category | Pre-sets |
+|---|---|---|
+| `b_roll/` `b-roll/` `broll/` `cutaway/` `cutaways/` `inserts/` | `b_roll` | `b_roll_mode = true` |
+| `timelapse/` `timelapses/` `time_lapse/` `tl/` | `timelapse` | `timelapse_mode = true` |
+| `voiceover/` `voiceovers/` `vo/` `narration/` | `voiceover` | `script_mode = true` (then ask for script path). Files in this folder are commonly audio-only (`.wav`, `.mp3`) — the pipeline transcribes them via Parakeet without needing a video container. |
+| `a_roll/` `a-roll/` `aroll/` `main/` `interview/` `interviews/` `takes/` | `a_roll` | (informational tag only) |
+| `script/` `scripts/` (or any `*.txt` / `*.md` named like `script*`) | `script` | `script_mode = true` (script path identified) |
+
+If a convention folder is detected, **write a small JSON tag map**
+at `<edit>/source_tags.json` mapping every clip's stem to its
+category:
+
+```json
+{
+  "version": 1,
+  "tags": {
+    "C0103": "a_roll",
+    "C0312": "b_roll",
+    "booth_signage_riot": "b_roll",
+    "workshop_build_03": "timelapse",
+    "vo_final": "voiceover"
+  },
+  "categories_seen": ["a_roll", "b_roll", "timelapse", "voiceover"],
+  "convention_detected": true
+}
+```
+
+Sources that don't fall under any convention folder go in as
+`unknown` — the user can clarify at step 4 ("are these b-roll or
+A-roll?") or leave them untyped (the editor scopes its candidate
+search across all sources when nothing's tagged).
+
+**Confirm detection with the user** before locking the modes — the
+parent's question shape:
+
+> "I see a `b_roll/` and a `timelapse/` subfolder under your videos_dir.
+> Defaulting `b_roll_mode = true` and `timelapse_mode = true` for this
+> session. The `b_roll/` clips become the cutaway library; the
+> `timelapse/` clips become candidates for the editor's time-squeeze
+> rules. Sound right?"
+
+If the user says no (e.g. they named a folder `b_roll/` for
+historical reasons but those clips are actually A-roll for THIS
+project), drop the auto-tag and ask the step-4 question fresh.
+
+**No convention folders detected → no `source_tags.json`** is
+written, and the parent asks all four mode-gating questions fresh
+in step 4.
+
+This is **optional convention** — the skill works fine without any
+folder organization. The auto-detection is a UX nicety, not a
+requirement. Don't insist; don't lecture the user about
+organization.
+
 Then run Phase A preprocessing — speech (Parakeet ONNX) + visual
 (Florence-2):
 
@@ -277,10 +379,12 @@ questions *shaped by what they said*. Collect:
 - Delivery dialect (`cut.fcpxml` for Resolve / FCP X, `cut.xml` for
   Premiere Pro, or both — default is both)
 - **Pacing preset** — MANDATORY. See table below. Default Paced.
-- **Three feature-gating questions** — see "Mode-gating questions"
-  below. These set `script_mode`, `b_roll_mode`, and `user_profile`
-  on the Conversation Context bundle and decide which cold-path
-  references the editor sub-agent loads on spawn.
+- **Four feature-gating questions** — see "Mode-gating questions"
+  below. These set `script_mode`, `b_roll_mode`, `timelapse_mode`,
+  and `user_profile` on the Conversation Context bundle and decide
+  which cold-path references the editor sub-agent loads on spawn,
+  whether time-squeezing is permitted, and what verification bar
+  the editor uses.
 
 While conversing, build the **Conversation Context bundle** in your
 working memory (see `shared_rules.md` Agent roles for the structure).
@@ -288,14 +392,18 @@ You will forward this bundle into every sub-agent brief.
 
 #### Mode-gating questions
 
-Three short questions — ask once per session, persist the answers in
+Four short questions — ask once per session, persist the answers in
 `project.md` so subsequent sessions inherit defaults. Always still
 confirm; users change modes between sessions on the same project.
 
 If `<edit>/project.md` already records a value, default to it and
 ask the user to confirm or change ("Last session you were in scripted
-mode — sticking with that?"). If no project.md exists, ask all three
-fresh.
+mode — sticking with that?"). If no project.md exists, ask all four
+fresh — UNLESS step 1's folder convention auto-detection
+pre-filled some of them, in which case treat the auto-detected
+values as the defaults and confirm rather than re-ask blank
+("I detected a `b_roll/` folder — going with `b_roll_mode = true`,
+sound right?").
 
 **1. "Are you using a script?"** → sets `script_mode`
 
@@ -325,7 +433,27 @@ fresh.
   automatically and confirm with the user that's right ("So we'll
   also have b-roll under the voiceover?").
 
-**3. "Is this personal, a creator project, or a professional /
+**3. "Does this project use timelapses?"** → sets `timelapse_mode`
+
+- `false` (default for safety) — the editor will NOT emit any
+  `speed > 1.0` ranges. Even visually-continuous activity stays
+  1x or gets cut. This protects b-roll-heavy projects from the
+  editor accidentally retiming a stretch the user wanted at
+  normal speed.
+- `true` — the editor's time-squeezing rules in
+  `subagent_editor_rules.md` apply normally. Long visually-
+  continuous activity stretches (workshop builds, packing,
+  cooking, painting, prep, walking, driving) become candidates
+  for 5-30s output timelapses. Hard ceiling stays `speed = 10.0`
+  (Hard Rule on retime clamp).
+- If step 1 detected a `timelapse/` folder, default this to `true`
+  and confirm with the user (they organized for a reason).
+- The user can also use this on a per-project basis — many
+  scripted assemblies want zero timelapses (the b-roll IS the
+  visual track at 1x); workshop / build vlogs want explicit
+  timelapse permission.
+
+**4. "Is this personal, a creator project, or a professional /
 client deliverable?"** → sets `user_profile`
 
 - `personal` — own use, family, hobby. Default verification bar.
@@ -340,11 +468,14 @@ client deliverable?"** → sets `user_profile`
   exact game, used closest verifiable match) is explicitly flagged
   so the parent surfaces it.
 
-These three flags travel together with the Conversation Context
-bundle into every sub-agent brief. The editor uses `script_mode` and
-`b_roll_mode` to decide which cold-path references to read; the
-editor uses `user_profile` to set the verification / QA-note
-discipline.
+These four flags + `<edit>/source_tags.json` (when present) travel
+together with the Conversation Context bundle into every sub-agent
+brief. The editor uses `script_mode` and `b_roll_mode` to decide
+which cold-path references to read; `timelapse_mode` to decide
+whether to even consider time-squeezing; `user_profile` to set the
+verification / QA-note discipline. The b-roll scout sub-agent (when
+spawned by the editor) uses `source_tags.json` to scope which clips
+are eligible candidates.
 
 ### 5. Propose strategy
 
@@ -550,10 +681,18 @@ STEP 0 (mandatory before anything else):
 
   Mode-gated cold-path reads (read each file IN FULL only if the
   matching flag below is true; skip silently if false):
-    - script_mode   = <true | false>   -> references/scripted.md
-    - b_roll_mode   = <true | false>   -> references/b_roll_selection.md
+    - script_mode    = <true | false>   -> references/scripted.md
+    - b_roll_mode    = <true | false>   -> references/b_roll_selection.md
   These bind in addition to your default rules; they do not replace
   the merged-view spine read in STEP 1.
+
+  Time-squeeze permission flag (binds the time-squeezing section of
+  your operating manual):
+    - timelapse_mode = <true | false>
+      false  -> emit NO ranges with speed > 1.0; no timelapses.
+      true   -> the time-squeezing rules in your operating manual
+                apply normally (5-30s output, speed <= 10.0,
+                visually-continuous stretches only).
 
 STEP 1:
   Read <edit>/merged_timeline.md END-TO-END. EVERY LINE. (Per the
@@ -584,9 +723,17 @@ CONVERSATION CONTEXT (from parent):
     - "<quote>" (context: ...)
 
   Feature mode flags (asked & confirmed in step 4):
-    script_mode   = <true | false>
-    b_roll_mode   = <true | false>
-    user_profile  = <personal | creator | professional>
+    script_mode    = <true | false>
+    b_roll_mode    = <true | false>
+    timelapse_mode = <true | false>
+    user_profile   = <personal | creator | professional>
+
+  Source tags (from step 1 folder convention auto-detection, if any):
+    Source tags JSON: <edit>/source_tags.json (or "(not present)")
+    Categories seen:  [<a_roll, b_roll, timelapse, voiceover, ...>]
+    When tags exist, restrict b-roll candidate searches to clips
+    tagged b_roll / cutaway. A-roll-tagged clips are the primary
+    audio bed for talking-head sessions.
 
   When script_mode = true:
     Script path:    <edit>/script.md (or absolute path)
@@ -594,6 +741,11 @@ CONVERSATION CONTEXT (from parent):
     Voiceover transcript (cached): <edit>/transcripts/<vo_stem>.json
   When b_roll_mode = true and a clip index exists:
     Clip index path: <edit>/clip_index/index.json (shortlisting aid only)
+  When b_roll_mode = true and you choose to spawn b-roll scout
+  sub-agents:
+    See references/subagent_editor_rules.md "B-roll scout spawn
+    protocol" for when and how. Brief template at
+    references/subagent_broll_scout_rules.md.
 
 STRATEGY (parent locked in):
   Beats / structure: <archetype + beat list>
@@ -700,9 +852,11 @@ Append one section per session at `<edit>/project.md`:
 **Strategy:** one paragraph describing the approach.
 **Pacing:** preset name + the four expanded ms values.
 **Mode flags:**
-  script_mode  = <true | false>
-  b_roll_mode  = <true | false>
-  user_profile = <personal | creator | professional>
+  script_mode    = <true | false>
+  b_roll_mode    = <true | false>
+  timelapse_mode = <true | false>
+  user_profile   = <personal | creator | professional>
+**Source tags:** present | not present (e.g. categories = a_roll, b_roll, timelapse)
 **Decisions:** take choices, cuts, grades, animations + why.
 **Reasoning log:** one-line rationale for non-obvious decisions.
 **Outstanding:** deferred items.
@@ -894,6 +1048,19 @@ proposing strategy for that feature; do not read pre-emptively.
   reads when `b_roll_mode = true`. Common combo: scripted assembly
   triggers both.
 
+**Sub-sub-agent role spawned by the editor (not by you):**
+
+- `references/subagent_broll_scout_rules.md` — b-roll scout
+  sub-agent's operating manual. Spawned by the **editor sub-agent**
+  (not by the parent) on demand, one per beat or one per cluster
+  of beats, in parallel per Hard Rule 10. Reads
+  `<edit>/visual_timeline.md` for in-scope sources and returns
+  ranked candidate shortlists. Editor picks / verifies / writes the
+  EDL range. The parent never spawns scouts directly — but the
+  parent's editor brief mentions `source_tags.json` so the editor
+  can pass the in-scope source list down to scouts when it spawns
+  them.
+
 **Parent-side cold-path (read when the feature is in scope):**
 
 - `references/subtitles.md` — chunking / case / placement,
@@ -920,14 +1087,23 @@ in the NLE.
 - **Editing `edl.json` by hand for "trivial" tweaks.** Always re-spawn.
 - **Curating `audio_vocab.txt` by hand.** Always re-spawn.
 - **Skipping the pacing prompt.** Hard Rule 13.
-- **Skipping the three mode-gating questions in step 4.** They set
-  `script_mode`, `b_roll_mode`, `user_profile` — the editor sub-
-  agent's cold-path reads + verification bar all depend on them.
-  Default-guessing the flags ships the wrong cut.
-- **Forgetting to forward the mode flags into the editor brief.**
-  Without them the editor falls back to non-scripted, non-b-roll,
-  default-bar behaviour even if the user is on a scripted client
-  deliverable.
+- **Skipping the four mode-gating questions in step 4.** They set
+  `script_mode`, `b_roll_mode`, `timelapse_mode`, `user_profile` —
+  the editor sub-agent's cold-path reads, retime permission, and
+  verification bar all depend on them. Default-guessing the flags
+  ships the wrong cut.
+- **Forgetting to forward the mode flags or `source_tags.json`
+  into the editor brief.** Without them the editor falls back to
+  non-scripted, non-b-roll, no-tags, default-bar behaviour even
+  if the user is on a scripted client deliverable with organized
+  folders.
+- **Skipping the step-1 folder convention scan.** Even when the
+  user only mentions "I have a script and some b-roll" in passing,
+  scan the videos_dir for convention folders before asking — the
+  user organized for a reason; pre-filling beats re-asking.
+- **Forcing folder convention.** Auto-detection is opt-in
+  organization. Don't lecture users who use a flat folder layout;
+  ask the four questions fresh and move on.
 - **Inventing ad-hoc cut-padding numbers.** Pacing preset is the
   contract.
 - **Paraphrasing user quotes in the brief.** Quote verbatim. Vibes

@@ -215,6 +215,15 @@ The reusable model:
 - **`pack_timelines.py`** rolls those lane files into the merged
   view + per-lane drill-down files. Re-runs are fast on cached
   inputs.
+- **Folder convention auto-detection** (parent's step 1) writes
+  `<edit>/source_tags.json` mapping clip stems → categories
+  (`a_roll`, `b_roll`, `timelapse`, `voiceover`, `unknown`) when
+  the user organizes by convention folder. **Respect these tags**
+  for candidate searches: only `b_roll` / `cutaway` / `unknown`
+  clips are eligible cutaway candidates; A-roll is the speech bed
+  in talking-head mode; `timelapse` clips are pre-organized retime
+  source material (still gated by `timelapse_mode` — see below).
+  When tags are absent, all sources are eligible.
 - **(Optional) clip index** is a parent-managed helper that walks
   `transcripts/` + `visual_caps/` and builds a per-clip
   searchable record. The editor doesn't build it; the parent runs
@@ -226,6 +235,27 @@ If the parent's brief says `clip_index_available = true` and points
 at `<edit>/clip_index/index.json`, treat it as a shortlisting aid
 only — the merged-timeline pre-flight (ABSOLUTE READ MANDATE) still
 binds before any beat-level matching.
+
+### 1b. Delegate shortlisting to b-roll scout sub-agents (large libraries / professional bar)
+
+For large libraries (`>50` b-roll-eligible clips) OR `user_profile
+= professional` with many named-subject beats OR ambiguous beats
+where the merged view didn't decide it: delegate per-beat
+shortlisting to **b-roll scout sub-agents** per
+`subagent_editor_rules.md` "B-roll scout spawn protocol". Spawn N
+scouts in parallel (Hard Rule 10), one per beat or one per
+cluster, pass them the in-scope source list from
+`source_tags.json`, and consume their ranked shortlists.
+
+Scouts read `<edit>/visual_timeline.md` in their own fresh context
+window for the in-scope sources only — they don't re-read your
+merged_timeline. Their job is shortlisting; your job is
+verification + selection + EDL writing. See
+`references/subagent_broll_scout_rules.md` for what scouts do.
+
+For small libraries (`<= 30` clips) and `personal` / `creator`
+bar, do shortlisting in your own context — spawn overhead isn't
+worth it.
 
 ### 2. Two-stage matching — shortlist first, verify second
 
@@ -289,6 +319,34 @@ cached?
 
 ---
 
+## How `timelapse_mode` interacts with b-roll selection
+
+The parent's brief carries `timelapse_mode`. It binds the
+time-squeezing section in `subagent_editor_rules.md`, but it also
+shapes b-roll selection in two ways:
+
+- **`timelapse_mode = false` (default).** Any visually-continuous
+  long-stretch clip in the b-roll library — workshop builds,
+  packing montages, walking shots — is treated as 1x source
+  material. You **may** select short ranges from those clips (a
+  4-second cut from a 10-minute build sequence is fine) but you
+  **may not** retime any range. If the only candidate for a beat
+  is a long stretch that would only "work" as a timelapse, drop
+  the beat or pick a different shorter clip; do not retime to fit.
+- **`timelapse_mode = true`.** Long-stretch clips in the b-roll
+  library are also valid timelapse retime candidates per the
+  time-squeezing rules. If `source_tags.json` tagged a clip as
+  `timelapse`, prefer it for retime over discovering retime
+  stretches in arbitrary footage — the user pre-organized the
+  retime source.
+
+This matters most for workshop / build / travel / vlog projects
+where the user has long-running source material that could go
+either way. Asking the timelapse question explicitly in step 4 is
+how the parent disambiguates; your job is to honour the answer.
+
+---
+
 ## How `user_profile` shapes the bar
 
 The parent's brief includes `user_profile` (one of `personal`,
@@ -348,3 +406,15 @@ QA / verification dial.
 - **Skipping QA notes on named-subject beats.** Revisions need them.
 - **Re-running preprocessing with `--force` to "refresh" matching.**
   The cache is correct; bypass only on real input change.
+- **Ignoring `source_tags.json` and proposing A-roll clips as
+  cutaways.** The user organized their footage; respect the tags.
+  A-roll-tagged clips are the speech bed, not the cutaway library.
+- **Retiming a b-roll candidate to fit a beat when
+  `timelapse_mode = false`.** The user opted out of timelapses for
+  this session. Pick a different clip or shorter range; never
+  silently retime.
+- **Skipping the b-roll scout protocol on a 100-clip professional
+  brief.** That's where scouts pay off most. The verification +
+  detailed QA notes the professional bar requires are easier to
+  write when scouts have done the shortlisting in their own
+  fresh-context windows.

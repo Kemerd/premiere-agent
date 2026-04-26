@@ -13,9 +13,12 @@ After reading this file, continue to your role-specific rules:
 - Editor sub-agent: `references/subagent_editor_rules.md`
 - Vocab sub-agent: `references/subagent_vocab_rules.md`
 - Animation sub-agent: `references/animations.md`
+- B-roll scout sub-sub-agent: `references/subagent_broll_scout_rules.md`
+  (spawned by the editor sub-agent, not by the parent)
 
 If you do not know which role you are, you are the parent. Sub-agents are
-told their role explicitly by the parent in their spawn brief.
+told their role explicitly by the parent (or, for scouts, by the
+editor) in their spawn brief.
 
 **Cold-path references** — feature-specific rules loaded on demand,
 not at session start:
@@ -29,11 +32,16 @@ not at session start:
 - `references/b_roll_selection.md` — b-roll selection rules +
   optimized matching philosophy (editor reads when the parent's
   brief says `b_roll_mode = true`).
+- `references/subagent_broll_scout_rules.md` — b-roll scout
+  sub-agent's full operating manual (read by scouts at spawn time;
+  the editor reads it once when it needs to write a scout brief).
 
 The two editor cold-path files are gated by mode flags the parent
 collects in step 4 of the 9-step process — see `parent_rules.md`
 for the question templates and `subagent_editor_rules.md` for the
-conditional-read mandate.
+conditional-read mandate. The scout role file is read by scouts on
+spawn (their own STEP 0) and consulted by the editor when it writes
+scout briefs.
 
 ---
 
@@ -183,6 +191,28 @@ sub-agent must never assume facts the parent didn't put in its brief.
 
 - Spawned by the parent in step 6 alongside the editor sub-agent.
 - See `references/animations.md` for the full brief template.
+
+### B-roll scout sub-agents — spawned by the EDITOR (sub-sub-agents)
+
+- Spawned by the **editor sub-agent**, not by the parent. The
+  editor decides whether to delegate per-beat shortlisting based
+  on library size, `user_profile`, and beat count — see
+  `subagent_editor_rules.md` "B-roll scout spawn protocol".
+- One scout per beat (or one per cluster of beats), all spawned
+  in parallel per Hard Rule 10.
+- Reads `<edit>/visual_timeline.md` for in-scope sources only,
+  in its own fresh context window. Returns ranked candidate
+  shortlists with evidence; the editor picks / verifies / writes
+  the EDL range.
+- See `references/subagent_broll_scout_rules.md` for the full
+  brief template + return format.
+
+### Architectural ceiling — two levels of sub-agents below the parent
+
+`parent → editor → b-roll scout` is the deepest the hierarchy goes.
+Scouts do not spawn sub-sub-sub-agents. If a scout exhausts its
+context, it returns BUDGET_EXHAUSTED and the editor re-shapes the
+brief — never deeper recursion.
 
 ### What this means in practice
 
