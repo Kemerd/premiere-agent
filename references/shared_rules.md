@@ -46,10 +46,11 @@ The two editor cold-path files are gated by mode flags the parent collects in st
 
 Three kinds of agent make this skill work. **They are not interchangeable.** Token economy AND quality of output both depend on the boundary holding. The parent agent must NEVER do a sub-agent's job, and a sub-agent must never assume facts the parent didn't put in its brief.
 
-### Parent agent — pure conversation manager, knows nothing about the video itself
+### Parent agent — conversation manager, content awareness via speech only
 
 - **Talks to the user.** Asks questions, confirms strategy, presents previews, takes feedback. This is the parent's only persistent state.
-- **Reads `project.md`** at session start (compressed memory from prior sessions). That's the only timeline-adjacent file it ever opens directly.
+- **Reads `project.md`** at session start (compressed memory from prior sessions). The parent's most-frequent direct read.
+- **MAY read `speech_timeline.md` directly** to ground itself in what was actually said. This is the only timeline file the parent is allowed to open. Speech is pure text (Parakeet phrase-level transcripts with timestamps) — token-cheap, conversationally useful, and lets the parent quote-match the user's must-keeps / must-cuts against real transcript moments without a scout spawn. Read it once after step 1's first pack to seed the Conversation Context bundle, and again on demand when a user message references something specific the speakers said. Do not loop over it constantly — it is context, not the cut.
 - **Maintains a Conversation Context bundle** in its own working memory throughout the session:
     - A *complete* summary of the project in the parent's own words — what kind of video, who's in it, what it's for, target deliverable, aesthetic direction, must-keeps, must-cuts. **Comprehensive. No artificial word cap.** Length is whatever it needs to be.
     - A *list of verbatim user quotes*, chronological, capturing the original wording of every meaningful request, rejection, or preference. Direct quotes preserve nuance the parent cannot reliably paraphrase ("make it punchy" != "make it tight" != "cut it shorter"). When in doubt, quote. Tag each quote with a short context note (when in the session, what it responded to).
@@ -57,7 +58,7 @@ Three kinds of agent make this skill work. **They are not interchangeable.** Tok
     - Things the user *explicitly asked to keep* — also as quotes with context.
 - **Writes briefs. Spawns subagents.** The Conversation Context bundle is forwarded verbatim into every sub-agent brief — so iterative subagents have memory across spawns.
 - **Reads sub-agent return values** (EDL JSON, vocab.txt, animation slot reports) and translates them to the user in plain English.
-- **NEVER reads `merged_timeline.md`, `speech_timeline.md`, `visual_timeline.md`, or `audio_timeline.md` directly.** The parent has no opinion on what the video shows. If the user asks "what's in clip C0103?", the parent answers "I don't know — let me ask the editor sub-agent" or spawns a tiny scout sub-agent. The parent never opens the timeline files.
+- **NEVER reads `merged_timeline.md`, `visual_timeline.md`, or `audio_timeline.md` directly.** Those are the token-heavy lanes — Florence-2 visual captions at 1fps, CLAP audio events per ~10s window, and the merged view that interleaves everything. They exist for sub-agents to read in fresh context windows so the parent's accumulating context never bloats with caption density. If the user asks "what's actually on screen in C0103?" or "what does the audio sound like at 0:42?", the parent spawns a scout or asks the editor sub-agent — never opens `merged_timeline.md` / `visual_timeline.md` / `audio_timeline.md` itself. (Speech is the exception per the bullet above — text transcripts only, parent-readable.)
 - **NEVER edits `edl.json` by hand**, even for a "trivial" tweak the user asks for. Every change request, no matter how small, re-spawns the editor sub-agent with an updated brief. Hand-edits skip the word-boundary / pacing / filler discipline the editor's role rules enforce.
 - **NEVER curates `audio_vocab.txt` by hand.** Vocab work belongs to the vocab sub-agent.
 - **NEVER opens the source video files.** Not even with `ffprobe`-via-eyeball-of-a-frame. That is a sub-agent's job if needed at all.
@@ -159,4 +160,4 @@ These fail regardless of role:
 - **Assuming what kind of video it is.** Look first, ask second, edit last.
 - **Sub-agent reading from a single lane in isolation when the merged view exists.** The merged view IS the default reading surface for both the editor and the vocab sub-agents (Hard Rule 15). Per-lane files are drill-down only.
 - **Skipping the second `pack_timelines.py` run after `audio_lane.py`.** Hard Rule 16. The pack runs twice by design; the second pass is the only way audio events reach the merged view the editor reads.
-- **Parent agent reading any timeline file.** See "Agent roles" above — the architecture's whole point is timeline reads happen in fresh sub-agent windows, not the parent's accumulating one.
+- **Parent agent reading `merged_timeline.md`, `visual_timeline.md`, or `audio_timeline.md`.** See "Agent roles" above — the heavy timeline reads happen in fresh sub-agent windows, not the parent's accumulating one. Reading `speech_timeline.md` for conversation-side content awareness is fine (speech is text-only and token-cheap); reading the visual / audio / merged views is not.
