@@ -1,4 +1,4 @@
-"""Visual lane: Florence-2-base captions at 1 fps for the entire timeline.
+"""Visual lane: Florence-2-base captions at N fps for the entire timeline.
 
 For an LLM editor to spot match cuts, identify shots, find B-roll
 candidates, or react to "show the part where they're using the drill",
@@ -8,8 +8,19 @@ it needs *describable* visual context — not raw frames. Florence-2-base
     RTX 4090: 50–100 fps with batching, ~5 minutes for 10k frames
     RTX 3060: ~20 fps, ~10 minutes for 10k frames
 
-Sampling at 1 fps means a 3-hour shoot is ~10,800 frames. That's a 5-15
-min preprocess on consumer hardware which is the right ballpark.
+Default sampling is 1 fps. A 3-hour shoot at 1 fps is ~10,800 frames —
+a 5-15 min preprocess on consumer hardware which is the right ballpark
+for typical talking-head / interview / tutorial work. For long, slow,
+or static-pacing content (lecture, ambient B-roll, locked-off camera)
+1 fps is overkill — every second emits a 5-7 sentence paragraph that
+the dedup pass collapses to `(same)` 90% of the time, and the editor
+sub-agent still has to scan past every line. Lower rates (0.5 = one
+frame every 2 s, 0.25 = every 4 s, 0.1 = every 10 s) cut both
+preprocess time AND merged-timeline token cost roughly in proportion.
+Cost scales linearly with fps. Override via the `--fps` flag on this
+CLI or `--visual-fps N` on `preprocess.py` / `preprocess_batch.py`.
+Fractional values are accepted (ffmpeg's `fps=` filter handles them
+natively).
 
 We use the `<MORE_DETAILED_CAPTION>` task — Florence-2's most descriptive
 mode. Sample output:
@@ -20,12 +31,15 @@ mode. Sample output:
 JSON shape:
     {
       "model": "microsoft/Florence-2-base",
-      "fps": 1,
+      "fps": <float — actual sample rate this clip was captioned at>,
       "duration": 43.0,
       "captions": [
-        {"t": 12, "text": "a person holding a cordless drill ..."},
-        {"t": 13, "text": "close-up of a drill bit entering metal, sparks"},
-        {"t": 14, "text": "(same)"},      # dedup marker, see _dedup_consecutive
+        # `t` is float seconds-from-start (idx / fps). At fps=1.0 it
+        # coincides with the integer second; at fractional fps it
+        # spaces out by `1/fps` seconds (fps=0.5 → t=0, 2, 4, ...).
+        {"t": 12.0, "text": "a person holding a cordless drill ..."},
+        {"t": 13.0, "text": "close-up of a drill bit entering metal, sparks"},
+        {"t": 14.0, "text": "(same)"},      # dedup marker, see _dedup_consecutive
         ...
       ]
     }
@@ -79,7 +93,11 @@ from wealthy import FLORENCE_BATCH, is_wealthy
 # now point users at this checkpoint as the canonical replacement —
 # see https://github.com/huggingface/transformers/issues/41622.
 DEFAULT_MODEL_ID = "florence-community/Florence-2-base"
-DEFAULT_FPS = 1
+# Default sample rate. Float so callers can pass fractional values like
+# 0.5 (one frame every 2 seconds) or 0.25 (every 4 seconds) for slow /
+# long / static-pacing content where 1 fps over-samples and bloats the
+# merged timeline. ffmpeg's `fps=` filter accepts arbitrary floats.
+DEFAULT_FPS: float = 1.0
 DEFAULT_BATCH_SIZE = 8           # safe on 4 GB; orchestrator can override
 DEFAULT_TASK_PROMPT = "<MORE_DETAILED_CAPTION>"
 VISUAL_CAPS_SUBDIR = "visual_caps"
@@ -104,7 +122,7 @@ def _video_duration_s(video_path: Path) -> float:
         return 0.0
 
 
-def _iter_frames_at_fps(video_path: Path, fps: int):
+def _iter_frames_at_fps(video_path: Path, fps: float):
     """Yield (timestamp_s, PIL.Image) for each sampled frame.
 
     Uses imageio_ffmpeg to stream raw RGB out of ffmpeg without writing
@@ -198,7 +216,10 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
     # post-crop, post-scale. Misreading this would mis-frame every
     # chunk and yield garbage / a hang on the final partial chunk.
     frame_size = target_dim * target_dim * 3
-    t = 0
+    # Frame index counted in produced frames; the actual timestamp in
+    # seconds is `idx / fps`. Computed as float so fps>1 carries
+    # sub-second precision through to the JSON cache.
+    idx = 0
     try:
         while True:
             buf = proc.stdout.read(frame_size)
@@ -208,8 +229,8 @@ def _iter_frames_at_fps(video_path: Path, fps: int):
                 target_dim, target_dim, 3
             )
             # Florence-2 takes PIL images. Conversion is cheap (no copy).
-            yield t, Image.fromarray(arr, mode="RGB")
-            t += 1
+            yield (idx / float(fps)), Image.fromarray(arr, mode="RGB")
+            idx += 1
     finally:
         try:
             proc.stdout.close()
@@ -348,7 +369,7 @@ def _build_extract_cmd(
     video_path: Path,
     out_dir: Path,
     target_dim: int,
-    fps: int,
+    fps: float,
     meta: dict,
     *,
     use_nvdec: bool,
@@ -357,9 +378,13 @@ def _build_extract_cmd(
 
     Filter chain order, picked for performance:
 
-        fps=N        : decimate to 1 fps FIRST so every downstream filter
-                       only touches 1 frame per second of source instead
-                       of all 60. By far the biggest CPU saving on 4K60.
+        fps=N        : decimate to N fps FIRST so every downstream filter
+                       only touches our target sample rate instead of
+                       all 60. By far the biggest CPU saving on 4K60.
+                       N is float — fractional values like 0.5 (one
+                       frame every 2 s) or 0.25 (every 4 s) are valid
+                       and ffmpeg picks the nearest source frame for
+                       each output time bucket.
 
         [tonemap]    : HDR → SDR if needed. CPU-side (no NVENC tonemap
                        in mainline ffmpeg). The chain is the canonical
@@ -434,7 +459,7 @@ def _build_extract_cmd(
 def _extract_frames_to_disk(
     video_path: Path,
     cache_dir: Path,
-    fps: int,
+    fps: float,
     target_dim: int = 768,
 ) -> Path:
     """Extract all frames-of-interest for one clip into cache_dir.
@@ -508,22 +533,38 @@ def _extract_frames_to_disk(
     return cache_dir
 
 
-def _iter_frames_from_dir(cache_dir: Path):
+def _iter_frames_from_dir(cache_dir: Path, fps: float):
     """Yield (timestamp_s, PIL.Image) for each pre-extracted JPEG.
 
     Drop-in replacement for `_iter_frames_at_fps` — same yield shape so
     the producer thread + batching loop don't need to know which source
     they're being fed from. Loads frames in filename order; ffmpeg's
-    `%06d.jpg` template gives 1-indexed sequential numbering, which we
-    convert back to 0-indexed timestamp seconds (for fps=1; multi-fps
-    callers would need to scale, but the visual lane is fps=1 only).
+    `%06d.jpg` template gives 1-indexed sequential numbering. We
+    convert that frame index back to a float timestamp in seconds via
+    `(idx - 1) / fps`, so:
+
+        fps = 1.0   →  ts = 0, 1, 2, 3, ...   (one frame per second)
+        fps = 0.5   →  ts = 0, 2, 4, 6, ...   (one frame every 2 s)
+        fps = 0.25  →  ts = 0, 4, 8, 12, ...  (one frame every 4 s)
+        fps = 2.0   →  ts = 0, 0.5, 1.0, ...  (sub-second precision)
+
+    The float timestamp is preserved through the JSON cache so any
+    downstream consumer (pack_timelines, build_srt, editor sub-agents)
+    can render or align against the true sample time.
     """
     from PIL import Image
+    # Guard against accidental fps=0 (would zero-divide); fall back to
+    # 1.0 with a warning rather than crashing the entire batch.
+    if not fps or fps <= 0:
+        print(f"  visual_lane: invalid fps={fps!r} for {cache_dir.name}, "
+              f"falling back to 1.0 for timestamp math")
+        fps = 1.0
     for jpg in sorted(cache_dir.glob("*.jpg")):
         try:
-            ts = int(jpg.stem) - 1  # ffmpeg's %06d is 1-indexed
+            idx = int(jpg.stem)  # ffmpeg's %06d is 1-indexed
         except ValueError:
             continue
+        ts = (idx - 1) / float(fps)
         # `with` + `.load()` forces the JPEG to fully decode now so we
         # can release the file handle before yielding. Otherwise PIL
         # keeps the file open lazily and we leak descriptors at scale.
@@ -939,6 +980,7 @@ _FRAME_ERROR_TAG = "__frame_producer_error__"
 
 def _frame_producer(
     cache_dir: Path,
+    fps: float,
     out_q: "queue.Queue",
     stop_event: threading.Event,
 ) -> None:
@@ -951,7 +993,7 @@ def _frame_producer(
     thread so the surrounding `lane_progress` context unwinds cleanly.
     """
     try:
-        for ts, img in _iter_frames_from_dir(cache_dir):
+        for ts, img in _iter_frames_from_dir(cache_dir, fps):
             # Cooperative cancellation. Polled between every produced
             # frame; in the worst case the consumer waits one JPEG
             # decode (~5-10 ms) for the producer to exit.
@@ -993,7 +1035,7 @@ def _process_one(
     *,
     cache_dir: Path,
     model_id: str,
-    fps: int,
+    fps: float,
     batch_size: int,
     device: str,
     task: str,
@@ -1025,8 +1067,11 @@ def _process_one(
 
     duration = _video_duration_s(video_path)
     expected_frames = max(1, int(math.ceil(duration * fps)))
+    # `:g` is the right format for fps because it prints `1` instead of
+    # `1.0` for integer values and `0.5` / `0.25` for fractional ones —
+    # log lines stay clean across the full default-and-fractional range.
     print(f"  florence: {video_path.name}  duration={duration:.1f}s  "
-          f"frames~{expected_frames} @ {fps}fps  batch={batch_size}")
+          f"frames~{expected_frames} @ {fps:g}fps  batch={batch_size}")
 
     captions: list[dict] = []
     batch_imgs: list = []
@@ -1045,7 +1090,7 @@ def _process_one(
     stop_event = threading.Event()
     producer = threading.Thread(
         target=_frame_producer,
-        args=(cache_dir, frame_q, stop_event),
+        args=(cache_dir, fps, frame_q, stop_event),
         name=f"florence-producer-{video_path.stem}",
         daemon=True,
     )
@@ -1252,14 +1297,20 @@ def run_visual_lane_batch(
     edit_dir: Path,
     *,
     model_id: str = DEFAULT_MODEL_ID,
-    fps: int = DEFAULT_FPS,
+    fps: float = DEFAULT_FPS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     device: str = "cuda:0",
     dtype_name: str = "auto",
     task: str = DEFAULT_TASK_PROMPT,
     force: bool = False,
 ) -> list[Path]:
-    """Run the visual lane on N videos with Florence-2 loaded ONCE."""
+    """Run the visual lane on N videos with Florence-2 loaded ONCE.
+
+    `fps` is float so callers can pass fractional values (e.g. 0.5 for
+    one frame every 2 s) for slow / static content where 1 fps is
+    over-sampling. Both the on-disk extract step and the JSON
+    timestamps honour the fractional value.
+    """
     out_dir = (edit_dir / VISUAL_CAPS_SUBDIR).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     if not force:
@@ -1448,8 +1499,17 @@ def main() -> None:
     )
     ap.add_argument("--model", default=DEFAULT_MODEL_ID,
                     help=f"HF model id (default: {DEFAULT_MODEL_ID})")
-    ap.add_argument("--fps", type=int, default=DEFAULT_FPS,
-                    help=f"Sample rate in frames/sec (default: {DEFAULT_FPS})")
+    ap.add_argument(
+        "--fps", type=float, default=DEFAULT_FPS,
+        help=(
+            f"Sample rate in frames/sec (default: {DEFAULT_FPS:g}). "
+            "Fractional values are accepted: 0.5 = one frame every 2 s, "
+            "0.25 = one frame every 4 s, etc. Lower fps means a faster "
+            "preprocess and a leaner merged_timeline.md, at the cost of "
+            "coarser temporal resolution. Linear cost — halving fps "
+            "roughly halves preprocess wall time."
+        ),
+    )
     ap.add_argument("--batch-size", type=int, default=None,
                     help=f"Inference batch size (default: {DEFAULT_BATCH_SIZE}, "
                          f"or {FLORENCE_BATCH} with --wealthy)")

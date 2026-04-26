@@ -343,6 +343,14 @@ def main() -> None:
                          "vocab derived from the speech + visual timelines.")
     ap.add_argument("--skip-visual", action="store_true",
                     help="Skip the Florence-2 visual lane")
+    ap.add_argument(
+        "--visual-fps", type=float, default=None,
+        help="Sample rate for the visual lane in frames/sec "
+             "(default: 1.0). Fractional values are accepted: 0.5 = "
+             "one frame every 2 s, 0.25 = every 4 s. Useful for slow / "
+             "static / long-form content where 1 fps over-samples and "
+             "bloats merged_timeline.md. Cost scales linearly.",
+    )
     ap.add_argument("--wealthy", action="store_true",
                     help="Speed knob for 24GB+ GPUs. Bigger batches, same "
                          "models, same outputs. Also reads VIDEO_USE_WEALTHY=1.")
@@ -520,6 +528,7 @@ def main() -> None:
         diarize=args.diarize,
         language=args.language,
         force=args.force,
+        visual_fps=args.visual_fps,
     )
     sys.exit(0 if all(j.returncode == 0 for j in jobs) else 1)
 

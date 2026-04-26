@@ -476,6 +476,7 @@ def run_preprocess(
     diarize: bool = False,
     language: str | None = None,
     force: bool = False,
+    visual_fps: float | None = None,
 ) -> list[LaneJob]:
     """Top-level orchestration. Returns finished LaneJob list.
 
@@ -624,6 +625,13 @@ def run_preprocess(
         # path was fine). Forwarding --batch-size here closes the gap.
         if is_wealthy(wealthy):
             vargs += ["--batch-size", str(FLORENCE_BATCH)]
+        # ── Visual fps override ─────────────────────────────────────
+        # Forwarded only when the caller asked for a non-default value;
+        # leaving it absent lets visual_lane.py's argparse default
+        # (DEFAULT_FPS = 1.0) apply. `:g` keeps "1" / "0.5" / "0.25"
+        # clean on the wire instead of "1.0" / "0.50".
+        if visual_fps is not None:
+            vargs += ["--fps", f"{float(visual_fps):g}"]
         jobs.append(LaneJob("visual", "visual_lane.py", video_sources, edit_dir, vargs))
     elif not skip_visual and not video_sources:
         # Audio-only batch — surface this so the user isn't confused
@@ -687,6 +695,14 @@ def main() -> None:
                          "as a separate step with an agent-curated vocab.")
     ap.add_argument("--skip-visual", action="store_true",
                     help="Skip the Florence-2 visual lane")
+    ap.add_argument(
+        "--visual-fps", type=float, default=None,
+        help="Sample rate for the visual lane in frames/sec "
+             "(default: 1.0). Fractional values are accepted: 0.5 = "
+             "one frame every 2 s, 0.25 = every 4 s. Useful for slow / "
+             "static / long-form content where 1 fps over-samples and "
+             "bloats merged_timeline.md. Cost scales linearly.",
+    )
     ap.add_argument("--wealthy", action="store_true",
                     help="Speed knob for 24GB+ GPUs. Bigger batches in all "
                          "lanes; same models, same outputs. Also reads "
@@ -727,6 +743,7 @@ def main() -> None:
         diarize=args.diarize,
         language=args.language,
         force=args.force,
+        visual_fps=args.visual_fps,
     )
     sys.exit(0 if all(j.returncode == 0 for j in jobs) else 1)
 
