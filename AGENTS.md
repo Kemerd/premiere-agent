@@ -103,8 +103,20 @@ step 1: case-insensitive subfolders like `b_roll/`, `timelapse/`,
 and write `<edit>/source_tags.json` mapping clip stems to
 categories. Sub-agents respect these tags when shortlisting.
 
+Step 1 also runs **paired-audio detection** for dual-mic rigs — a
+video and audio file with the same stem (`SHOT_0042.mp4` +
+`SHOT_0042.wav`, the universal Sony / Zoom / DJI / Tascam camera +
+recorder convention). When pairs are detected the parent ASKS the
+user whether the .wav is a second-mic recording (`dual_mic`, both
+transcribed, editor picks the cleaner per cut) or a backup file
+(`ignore`, the .wav is filtered out). The decision is recorded in
+`<edit>/source_pairs.json` and travels into every editor brief.
+The pipeline also accepts standalone audio-only files (e.g.
+voiceover .wav with no video sibling) as first-class sources —
+they get the speech lane, skip the visual lane.
+
 See `parent_rules.md` for the exact question templates and the
-folder-convention table.
+folder-convention / pair-mode tables.
 
 ## What this architecture buys you
 
