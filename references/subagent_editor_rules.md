@@ -79,6 +79,44 @@ If `source_tags.json` is absent from the brief, all sources are
 treated as eligible across all roles (the user didn't organize, so
 you don't pre-filter).
 
+`source_pairs.json` (path may be present in the brief) records the
+parent's resolution of dual-mic / paired-audio detection from step 1.
+Schema:
+
+```json
+{
+  "mode": "dual_mic" | "ignore",
+  "pairs": [
+    {
+      "stem": "SHOT_0042",
+      "video": "...SHOT_0042.mp4",
+      "audio": "...SHOT_0042.wav",
+      "audio_alias_stem": "SHOT_0042.audio",
+      "audio_alias_path": ".../edit/.paired_audio/SHOT_0042.audio.wav"
+    }
+  ]
+}
+```
+
+When `mode = dual_mic`, two transcripts exist for the same shot:
+`transcripts/<stem>.json` (camera audio) and
+`transcripts/<stem>.audio.json` (the lav / external recorder). Both
+appear as separate entries in `merged_timeline.md` with the suffixed
+stem visible in the source label. **Treat them as the same shot for
+cut purposes** — do not place the same beat twice. The full handling
+procedure is below in "Dual-mic pair handling"; that section is
+mandatory reading whenever `source_pairs.json` is present with
+`mode = dual_mic` in your brief.
+
+When `mode = ignore`, the paired `.wav` was filtered out of
+preprocessing; only the camera-audio transcript exists. No special
+handling — proceed normally. The file is still recorded so a future
+session knows the user explicitly declined dual-mic on this project.
+
+If `source_pairs.json` is absent from the brief, no stem pairs were
+detected (or the entire batch predates pair detection). Proceed
+normally.
+
 These cold-path files are **additive** to your default rules — they
 do not replace the merged-view spine read below, the pacing-preset
 algorithm, the word-boundary discipline, or any Hard Rule. When
@@ -237,6 +275,13 @@ The bundle includes:
 - **Mode flags** — `script_mode`, `b_roll_mode`, `user_profile`.
   These gate the cold-path file reads above and set the
   verification bar; they travel in every brief.
+- **Source tags** (when `<edit>/source_tags.json` exists) — folder-
+  convention categorization of clips. Constrains b-roll candidate
+  searches per the rules in the cold-path read section.
+- **Source pairs** (when `<edit>/source_pairs.json` exists) — the
+  parent's resolution of dual-mic / paired-audio detection. When
+  `mode = dual_mic`, two transcripts exist per paired shot; follow
+  the "Dual-mic pair handling" procedure below.
 - **Verbal slips to avoid** — list the parent compiled.
 - **Change-request history** (on revisions) — chronological list of
   every prior revision + diff. Read this so revision N is informed by
@@ -766,6 +811,130 @@ Stay inside Hard Rule 7's 30-200ms working window. Never go below
 
 ---
 
+## Dual-mic pair handling (when `source_pairs.json` mode = `dual_mic`)
+
+When the parent's brief lists `source_pairs.json` with `mode =
+dual_mic`, you have **two transcripts per paired shot** and they are
+the same speech captured by two different microphones. Your job is to
+treat the pair as one shot for cut purposes, pick the better
+transcript per cut, and record which one you used so the parent can
+surface it in the user-facing summary.
+
+### What appears in `merged_timeline.md`
+
+For a pair with stem `SHOT_0042`, the merged view contains TWO source
+sections:
+
+```
+=== SHOT_0042 (00:01:23 — 00:01:48) ===
+  00:01:24.10  "we're walking past the Riot booth now"
+  ...
+  visual: ...
+
+=== SHOT_0042.audio (00:01:23 — 00:01:48) ===
+  00:01:24.10  "we're walking past the Riot booth now"
+  ...
+```
+
+Both sections cover the SAME duration on the SAME wall-clock
+timeline. The `.audio` suffix tells you which one came from the lav /
+external recorder. The video sibling has visual captions; the
+`.audio` sibling does not (no visual lane).
+
+### Picking the better transcript
+
+For each pair, decide which transcript to trust per cut. Decision
+order:
+
+1. **Confidence** — Parakeet emits per-word confidence in
+   `transcripts/<stem>.json` (`words[].conf`). Compute a windowed
+   mean confidence across the words inside the candidate cut range
+   for both transcripts. Higher mean wins.
+
+2. **Word-error proxies** — if both confidences are similar (within
+   ~0.05), prefer the transcript with FEWER repeated single-letter
+   tokens, fewer `[UNK]` placeholders, and stable spelling on
+   technical / proper nouns mentioned elsewhere in the timeline.
+   These are typical artefacts of the noisier mic.
+
+3. **User explicit override** — if the user said in the brief
+   "always use the lav" or "the camera audio is unusable on
+   `SHOT_0042`", that quote wins regardless of confidence math.
+
+4. **Tie-breaker** — prefer the lav (`.audio` sibling). External
+   recorders are almost always cleaner than on-camera mics; this
+   matches the user's hardware intent for setting the rig up that
+   way in the first place.
+
+### What goes in the EDL
+
+The EDL range still points at the **video file** for both video and
+audio (a paired shot is still one shot at the NLE level). The
+`source` field is the video stem, NOT the `.audio` alias — the alias
+is a preprocessing fiction so the caches don't collide; the user
+never wants the alias path showing up in their NLE bin.
+
+**Do** record which transcript you trusted for each range, in a new
+EDL field:
+
+```json
+{
+  "source": "SHOT_0042.mp4",
+  "in":  82.31,
+  "out": 89.04,
+  "speech": "we're walking past the Riot booth now",
+  "preferred_transcript": "SHOT_0042.audio",
+  "preferred_transcript_reason": "lav 0.93 vs camera 0.71 mean conf"
+}
+```
+
+The `preferred_transcript` field is OPTIONAL on unpaired shots and
+MUST be present on paired shots. The parent forwards it to the user
+in the cut summary so the user knows whether to manually patch the
+audio source in their NLE for that range.
+
+### When to call out a swap-the-audio recommendation
+
+If you preferred the lav transcript on a range AND the confidence
+gap was wide (camera mean conf < 0.6 or > 0.20 below the lav), add a
+QA note recommending the user replace the audio track on that range
+with the paired `.wav` inside their NLE. Premiere / Resolve / FCPX
+all support per-clip audio source replacement; the user's
+preprocessed lav file is at `audio_alias_path` from
+`source_pairs.json`. Example QA note:
+
+```
+QA: SHOT_0042 [82.31 - 89.04] — camera audio is muddy
+    (mean conf 0.58, transcript: "wal'in past the riid booth").
+    Lav transcript is clean (mean conf 0.93). RECOMMEND: in your
+    NLE, replace audio for this range with
+    edit/.paired_audio/SHOT_0042.audio.wav.
+```
+
+Don't swap unilaterally — the EDL stays pointing at the video file,
+and you tell the user. They may have a specific reason to keep the
+camera audio (room tone match with the surrounding cuts, etc.).
+
+### Anti-patterns specific to dual-mic
+
+- **Placing both members of a pair as separate cuts.** They are the
+  same shot. If you find yourself emitting two ranges for `SHOT_0042`
+  and `SHOT_0042.audio` covering overlapping wall-clock spans, you've
+  treated the alias as a real source — go back, merge, pick one
+  transcript, write one range pointing at the video file.
+- **Pointing the EDL `source` at the `.audio` alias.** The alias
+  lives under `<edit>/.paired_audio/` and isn't a real user-facing
+  asset. Always point at the video file.
+- **Picking by transcript length / vibes.** Use the confidence math
+  first. Length proxies for confidence only weakly and you'll pick
+  the wrong one on shots where the lav had a wind hit but the
+  camera mic was fine.
+- **Forgetting `preferred_transcript` on paired shots.** It's
+  required output on those ranges; the parent's user-facing summary
+  is built from it.
+
+---
+
 ## B-roll scout spawn protocol (when `b_roll_mode = true`)
 
 You may delegate the per-beat b-roll shortlisting work to a **b-roll
@@ -1101,6 +1270,26 @@ points at an SRT the parent emits via `helpers/build_srt.py`.
 (Hard Rule 14) and must always be `0.0`. `speed` and `audio_strategy`
 are OPTIONAL and only appear on time-squeezed ranges.
 
+`preferred_transcript` and `preferred_transcript_reason` are OPTIONAL
+on unpaired shots and **REQUIRED on paired shots** (those whose
+`source` stem appears in `<edit>/source_pairs.json` with
+`mode = dual_mic`). Schema:
+
+```json
+{"source": "SHOT_0042", "start": 82.31, "end": 89.04,
+ "beat": "HOOK",
+ "preferred_transcript": "SHOT_0042" | "SHOT_0042.audio",
+ "preferred_transcript_reason": "lav 0.93 vs camera 0.71 mean conf",
+ "quote": "...", "reason": "..."}
+```
+
+The `source` always points at the video stem (never the `.audio`
+alias — that's a preprocessing fiction, not a user-facing asset).
+The `preferred_transcript` field tells the parent which mic was
+trusted so the user-facing summary can recommend an in-NLE audio
+swap when the camera audio was the loser. See "Dual-mic pair
+handling" above for the decision rules.
+
 There is **no `grade` field** — color is out of scope. The skill
 emits XML for the NLE; the colorist applies the grade there.
 
@@ -1202,3 +1391,20 @@ factual, be terse on the report, but be thorough on the EDL itself.
   The user wants to know which take landed and why; the
   `Retake decisions` block is mandatory whenever a retake call
   influenced the cut.
+- **Treating a `dual_mic` paired shot as two independent sources.**
+  `SHOT_0042` and `SHOT_0042.audio` are the same shot captured by
+  two mics; they share a wall-clock timeline and you must NOT place
+  both as separate cuts. See "Dual-mic pair handling" — read
+  `source_pairs.json` whenever its path is in the brief.
+- **Pointing the EDL `source` at a `.audio` alias.** The alias
+  exists only to keep preprocess caches separate; it lives under
+  `<edit>/.paired_audio/` and isn't a user-facing asset. EDL ranges
+  always point at the video stem.
+- **Omitting `preferred_transcript` on paired shots.** Required on
+  every range whose source stem appears in `source_pairs.json` with
+  `mode = dual_mic`. Without it the parent cannot tell the user
+  which mic landed in the cut, and the recommendation to swap audio
+  in their NLE never reaches them.
+- **Picking the dual-mic transcript by vibes / length.** Use the
+  windowed mean per-word confidence first; lean on the lav as
+  tie-breaker. Length is not a quality signal.

@@ -228,6 +228,133 @@ recap that you noticed any audio-only files (`"I see your shoot has
 that'll get transcribed alongside the footage."`) so the user knows
 they weren't dropped.
 
+#### Paired-audio detection (dual-mic recordings)
+
+Some camera + recorder combos produce a video file AND a stand-alone
+audio file with the **same stem** — the universal convention across
+Sony / Zoom / DJI / GoPro / Tascam rigs. The most common shape is:
+
+```
+SHOT_0042.mp4    ← camera body (H.264, on-camera mic)
+SHOT_0042.wav    ← Zoom F2 / Tascam DR-10L / clip-on lav recording
+```
+
+When you see a stem collision between a video and an audio file in
+the inventory, **stop and ask the user** before preprocessing —
+guessing wrong silently corrupts the cut. Two valid interpretations:
+
+1. **`dual_mic`** — the .wav is a second-mic recording of the same
+   shot, usually a lav with cleaner audio than the on-camera mic.
+   Both files get transcribed; the editor picks the higher-quality
+   transcript per cut.
+2. **`ignore`** — the .wav is a redundant backup of the camera audio
+   (some rigs auto-mirror) or a copy the user dragged in by mistake.
+   Drop it from preprocessing entirely.
+
+##### Detection workflow
+
+1. Run the dry-run first to inventory pairs as machine-parseable JSON:
+
+   ```bash
+   python helpers/preprocess_batch.py <videos_dir> --detect-pairs
+   ```
+
+   This prints a JSON envelope like:
+
+   ```json
+   {
+     "videos_dir": "...",
+     "pair_count": 2,
+     "pairs": [
+       {"stem": "SHOT_0042", "video": "...SHOT_0042.mp4", "audio": "...SHOT_0042.wav"},
+       {"stem": "SHOT_0043", "video": "...SHOT_0043.mp4", "audio": "...SHOT_0043.wav"}
+     ]
+   }
+   ```
+
+   `pair_count: 0` means no collisions and you can preprocess
+   normally — skip the rest of this section.
+
+2. **Ask the user** before preprocessing. Standard wording:
+
+   > "Heads up — I see N file(s) where you have both a `.mp4` and a
+   > `.wav` with the same name (e.g. `SHOT_0042.mp4` + `SHOT_0042.wav`).
+   > Did you record a second mic on these (lav / Zoom recorder / etc.)
+   > and want me to transcribe both — or is the `.wav` just a backup
+   > file we should ignore?
+   >
+   > A) **Second mic** — both transcribed, I'll pick the cleaner one
+   >    per cut.
+   > B) **Backup, ignore** — drop the `.wav`s, only the camera audio
+   >    is used.
+   > C) **Mixed** — pause and we'll go file-by-file."
+
+   Quote their answer back when you confirm. If they pick C, ask
+   them to either separate the dual-mic recordings into a `dual_mic/`
+   subfolder (and re-run detection), or hand-list which stems are
+   which — then re-run detection.
+
+3. **Run preprocess with the chosen mode** — no other valid path:
+
+   ```bash
+   python helpers/preprocess_batch.py <videos_dir> --paired-audio-mode dual_mic
+   # OR
+   python helpers/preprocess_batch.py <videos_dir> --paired-audio-mode ignore
+   ```
+
+   The script REFUSES to proceed (rc=2) if pairs are detected and
+   `--paired-audio-mode` is missing — that's the safety net. Don't
+   try to work around it; the gate exists because silent defaults
+   here corrupt the cut.
+
+##### What `dual_mic` does on disk
+
+The paired `.wav` is hardlinked to
+`<edit>/.paired_audio/<stem>.audio.<ext>` (zero-cost on NTFS / ext4 /
+APFS; falls back to a copy on cross-volume rigs). The lane scripts
+see two files with unique stems, so cache outputs land in:
+
+- `<edit>/audio_16k/SHOT_0042.wav`     ← from the video
+- `<edit>/audio_16k/SHOT_0042.audio.wav` ← from the paired .wav (alias)
+- `<edit>/transcripts/SHOT_0042.json`
+- `<edit>/transcripts/SHOT_0042.audio.json`
+- `<edit>/visual_caps/SHOT_0042.json`  ← only for the video
+
+The mapping is recorded in `<edit>/source_pairs.json`:
+
+```json
+{
+  "mode": "dual_mic",
+  "pairs": [
+    {
+      "stem": "SHOT_0042",
+      "video": "...SHOT_0042.mp4",
+      "audio": "...SHOT_0042.wav",
+      "audio_alias_stem": "SHOT_0042.audio",
+      "audio_alias_path": "...edit/.paired_audio/SHOT_0042.audio.wav"
+    }
+  ]
+}
+```
+
+This file is **forwarded into every editor brief** (see step 4).
+The editor sub-agent uses it to know that
+`transcripts/SHOT_0042.json` and `transcripts/SHOT_0042.audio.json`
+belong to the same shot and to pick the higher-confidence one for
+cut decisions. It also lets the user later opt into "swap the audio
+track at export" inside their NLE — the EDL points at the video file
+but the editor's QA notes call out which paired alias was the
+preferred audio per cut.
+
+##### What `ignore` does
+
+The paired `.wav`s are simply filtered out of the preprocess input
+list. Unpaired audio-only files (a real voiceover.wav with NO video
+sibling) are unaffected. `<edit>/source_pairs.json` is still written
+with `"mode": "ignore"` so the editor knows the user explicitly
+declined dual-mic handling — don't surprise them later by treating
+the same stem-pair shape differently in a follow-up session.
+
 #### Folder convention auto-detection (optional)
 
 Before preprocessing, look at the videos_dir directory tree for
@@ -735,6 +862,16 @@ CONVERSATION CONTEXT (from parent):
     tagged b_roll / cutaway. A-roll-tagged clips are the primary
     audio bed for talking-head sessions.
 
+  Paired audio (from step 1 stem-pair detection, if any):
+    Source pairs JSON: <edit>/source_pairs.json (or "(not present)")
+    Pair mode:         <dual_mic | ignore | "(no pairs detected)">
+    Pair count:        <N>
+    When mode = dual_mic, transcripts/<stem>.json (camera audio) and
+    transcripts/<stem>.audio.json (paired-mic audio) BOTH exist for
+    each pair. Pick the higher-confidence transcript per cut and
+    record which one you used in QA notes — see
+    subagent_editor_rules.md "Dual-mic pair handling".
+
   When script_mode = true:
     Script path:    <edit>/script.md (or absolute path)
     Voiceover path: <abs path to VO file>
@@ -857,6 +994,7 @@ Append one section per session at `<edit>/project.md`:
   timelapse_mode = <true | false>
   user_profile   = <personal | creator | professional>
 **Source tags:** present | not present (e.g. categories = a_roll, b_roll, timelapse)
+**Paired audio:** mode = dual_mic | ignore | none (e.g. "dual_mic, 12 pairs from Sony+Zoom rig")
 **Decisions:** take choices, cuts, grades, animations + why.
 **Reasoning log:** one-line rationale for non-obvious decisions.
 **Outstanding:** deferred items.
@@ -1190,6 +1328,22 @@ user quote" priority overrides its retake heuristic.
   non-scripted, non-b-roll, no-tags, default-bar behaviour even
   if the user is on a scripted client deliverable with organized
   folders.
+- **Running `preprocess_batch.py` without `--detect-pairs` first
+  on inventories that look like camera + recorder rigs (matched
+  stems for `.mp4`/`.mov` and `.wav`).** The script will refuse
+  with rc=2 and you'll have to re-ask the user anyway — but if you
+  miss the failure on a long preprocess invocation it wastes their
+  GPU time. Detect first, ask, then run with the chosen mode.
+- **Picking the paired-audio mode for the user.** Don't assume
+  "they probably wanted second mic" — some rigs auto-mirror the
+  camera audio as a `.wav` backup and the user genuinely wants it
+  ignored. Always ask, always quote the answer back, persist the
+  choice in `project.md` so next session's default is right.
+- **Forgetting to forward `source_pairs.json` into the editor
+  brief when it exists.** Without it the editor doesn't know that
+  `transcripts/SHOT_0042.json` and `transcripts/SHOT_0042.audio.json`
+  are the same shot; it'll happily place the same beat twice with
+  different transcriptions.
 - **Skipping the step-1 folder convention scan.** Even when the
   user only mentions "I have a script and some b-roll" in passing,
   scan the videos_dir for convention folders before asking — the
@@ -1209,3 +1363,13 @@ user quote" priority overrides its retake heuristic.
   mandatory.
 - **Skipping the `project.md` append at session end.** That's how
   next session knows where this one stopped.
+- **Burying or paraphrasing an in-clip editor note the sub-agent
+  flagged.** If the editor's return rationale contains
+  `In-clip editor notes detected`, surface every APPLIED entry
+  to the user and quote the transcribed phrasing verbatim. Hiding
+  or summarizing them violates the user's expectation that their
+  recorded directives reach them.
+- **Skipping the `Retake decisions` block in the cut summary.**
+  The user wants to know which take landed. At minimum, surface
+  any decision where the editor went against the default
+  (later-take wins) or kept both takes of repeated content.

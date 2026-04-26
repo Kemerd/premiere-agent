@@ -107,6 +107,38 @@ stale ones.
 
 ---
 
+## In-clip notes + retake detection apply to the VO too
+
+The voiceover file is the editorial spine in scripted mode, but the
+user often records VO with the same human friction as A-roll:
+*"…welcome to the- ugh, let me try that again. Welcome to the
+show…"*. The two source-side detection rules from your default
+operating manual — **in-clip editor notes** (per-clip verbal
+directives) and **retake detection** (frustration markers,
+restarts, paraphrased redos) — apply to the VO transcription
+exactly as they apply to A-roll. Re-read those sections in
+`subagent_editor_rules.md` if anything is unclear.
+
+Concretely on the VO:
+
+- Trigger phrases like *"hey editor, scrap this take"* embedded in
+  the VO file → exclude the preamble from the VO audio bed, apply
+  the directive.
+- Frustration markers in the VO followed by a restart of the same
+  script line → use the cleaner take, drop the earlier one.
+- Multiple takes of the same paragraph in the same VO file → pick
+  the keeper per the retake-selection rules (default: later).
+- Cross-VO retakes (user re-recorded the entire VO into a fresh
+  file): the parent re-runs preprocess on whichever VO is
+  authoritative; cut from THAT, ignore the older.
+
+Surface every VO-side note / retake decision in the return
+rationale, same shape as A-roll. The script-beat alignment
+(steps 3-5 below) runs against the **cleaned** VO timeline — i.e.
+what's left AFTER you've excluded preambles and rejected takes.
+
+---
+
 ## The 7-step assembly procedure
 
 Run this in order on every spawn with `script_mode = true`. Do not
