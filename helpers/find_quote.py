@@ -415,6 +415,7 @@ def _assemble_match(
     start_idx: int,
     end_idx: int,
     all_words: list[dict[str, Any]],
+    duration_s: float | None,
 ) -> dict[str, Any]:
     """Render one (start_idx, end_idx) window into the public match
     dict shape. `end_idx` is INCLUSIVE.
@@ -424,6 +425,10 @@ def _assemble_match(
     `prev_word` / `next_word` are looked up in `all_words` so the
     editor's lead/trail clamp still has the bracketing words even
     when the matched span sits at the edge of the requested range.
+
+    `duration_s` is the clip's full duration from the transcript
+    header — used to compute trailing silence when the match is the
+    last spoken phrase in the clip (no `next_word` to clamp against).
     """
     run = matched_words[start_idx : end_idx + 1]
     first = run[0]
@@ -456,6 +461,69 @@ def _assemble_match(
         else None
     )
 
+    # ── Silence accounting — the cut-budget the editor needs ────
+    # `lead_silence_s` / `trail_silence_s` are the seconds of true
+    # silence framing the matched span. They tell the editor how
+    # much room there is before the in-point and after the out-point
+    # without bumping into adjacent speech, which is exactly the
+    # clamp ceiling for the pacing-preset lead/trail margins (Hard
+    # Rule 7 — 30-200ms padding window).
+    #
+    # Edge cases:
+    #   • No prev_word (match starts at the very first spoken word)
+    #     → lead_silence_s = first.start (silence from 0 to start).
+    #   • No next_word (match ends at the very last spoken word)
+    #     → trail_silence_s = duration_s - last.end if duration_s
+    #       is known, else None (we don't fabricate clip lengths).
+    #   • Negative gaps — should never happen on a healthy
+    #     transcript but Parakeet has been seen emitting sub-ms
+    #     overlap on consecutive words; clamp at 0.0.
+    #
+    # The editor reads these values directly into its trail-margin
+    # clamp formula:
+    #
+    #     trail_margin_used = min(target_trail_margin, trail_silence_s - 0.06)
+    #
+    # leaving 60ms of true silence for the 30ms `afade` pair on
+    # each boundary (per the worked example in
+    # subagent_editor_rules.md). Same on the lead side.
+    lead_silence_s: float | None
+    if prev_w is not None:
+        lead_silence_s = max(0.0, float(first["start"]) - float(prev_w["end"]))
+    else:
+        lead_silence_s = max(0.0, float(first["start"]))
+
+    trail_silence_s: float | None
+    if next_w is not None:
+        trail_silence_s = max(0.0, float(next_w["start"]) - float(last["end"]))
+    elif duration_s is not None:
+        trail_silence_s = max(0.0, float(duration_s) - float(last["end"]))
+    else:
+        # No next word AND no clip duration → we genuinely don't know
+        # how much trailing silence the source has. Returning None
+        # forces the editor to either drill into the source manually
+        # or treat the cut as "safe to extend up to the clip end."
+        trail_silence_s = None
+
+    # ── Cut-window — the absolute outer bounds for safe trimming ──
+    # `safe_in_s`  := the earliest second the in-point can land at
+    # without eating into prior speech (= prev_word.end, or 0.0 when
+    # there's no prev_word).
+    # `safe_out_s` := the latest second the out-point can land at
+    # without bleeding into next speech (= next_word.start, or the
+    # clip duration when there's no next_word).
+    # The editor uses these as clamp ceilings rather than re-deriving
+    # them from prev/next every time. Saves three lines of brittle
+    # arithmetic per range and surfaces "you can cut anywhere from
+    # X to Y" cleanly in the JSON.
+    safe_in_s = float(prev_w["end"]) if prev_w is not None else 0.0
+    if next_w is not None:
+        safe_out_s: float | None = float(next_w["start"])
+    elif duration_s is not None:
+        safe_out_s = float(duration_s)
+    else:
+        safe_out_s = None
+
     # Re-joining with single spaces is good enough for verification.
     # The original transcript text is in the top-level "text" field
     # if the editor needs the exact spacing.
@@ -466,6 +534,12 @@ def _assemble_match(
         "last_word": last,
         "prev_word": prev_w,
         "next_word": next_w,
+        "lead_silence_s": lead_silence_s,
+        "trail_silence_s": trail_silence_s,
+        "cut_window": {
+            "safe_in_s": safe_in_s,
+            "safe_out_s": safe_out_s,
+        },
         "words": run,
         "text": text,
         "speaker_id": first.get("speaker_id"),
@@ -677,6 +751,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     words = _word_rows(transcript)
+    # Lift duration once — used for trailing-silence accounting when
+    # the match runs to the very last spoken word.
+    duration_s = transcript.get("duration")
 
     # ── Apply range filter (if any) ────────────────────────────────
     # Important: the index returned by the matcher must reference the
@@ -714,14 +791,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.max_matches > 0:
             windows = windows[: args.max_matches]
         matches = [
-            _assemble_match(ranged_words, s, e, words)
+            _assemble_match(ranged_words, s, e, words, duration_s)
             for s, e in windows
         ]
     elif time_range is not None:
         if ranged_words:
             matches = [
                 _assemble_match(
-                    ranged_words, 0, len(ranged_words) - 1, words
+                    ranged_words, 0, len(ranged_words) - 1,
+                    words, duration_s,
                 )
             ]
     else:
@@ -739,7 +817,7 @@ def main(argv: list[str] | None = None) -> int:
     result = {
         "clip": clip_stem,
         "transcript": str(transcript_path),
-        "duration_s": transcript.get("duration"),
+        "duration_s": duration_s,
         "query": {
             "quote": args.quote,
             "range_s": list(time_range) if time_range is not None else None,

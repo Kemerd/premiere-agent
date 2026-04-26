@@ -428,21 +428,29 @@ Helper output (relevant fields):
 
 ```json
 {
-  "first_word": {"text": "Geared", "start": 3.12, "end": 3.45},
-  "last_word":  {"text": "in",     "start": 3.80, "end": 3.95},
-  "next_word":  {"text": "the",    "start": 4.10, "end": 4.18}
+  "first_word":     {"text": "Geared", "start": 3.12, "end": 3.45},
+  "last_word":      {"text": "in",     "start": 3.80, "end": 3.95},
+  "prev_word":      {"text": "and",    "start": 2.85, "end": 3.05},
+  "next_word":      {"text": "the",    "start": 4.10, "end": 4.18},
+  "lead_silence_s": 0.07,
+  "trail_silence_s": 0.15,
+  "cut_window":     {"safe_in_s": 3.05, "safe_out_s": 4.10}
 }
 ```
 
 - Out-point snaps to `last_word.end = 3.95` — the last word kept.
 - Naive Paced trail_margin (200ms) would give `range.end = 4.15`,
-  but the helper also returns `next_word.start = 4.10`. The
-  combined-pad clamp binds: `gap_ms = 4.10 − 3.95 = 150ms`; clamp
-  ceiling `max(0, 150 − 60) = 90ms`. Final `range.end = 3.95 +
-  0.09 = 4.04` so 60ms of true silence remains for the `afade` pair.
-- In-point uses the same procedure on the FIRST word of the kept
-  range (here `Geared.start = 3.12`, padded by lead_margin with
-  the same clamp against the prior range's tail).
+  but the helper reports `trail_silence_s = 0.15` (and equivalently
+  `cut_window.safe_out_s = 4.10`). The combined-pad clamp binds:
+  clamp ceiling `max(0, trail_silence_s × 1000 − 60) = max(0, 150
+  − 60) = 90ms`. Final `range.end = 3.95 + 0.09 = 4.04` so 60ms of
+  true silence remains for the `afade` pair.
+- In-point uses the same procedure on the FIRST word — read
+  `lead_silence_s` for the clamp ceiling on the lead side, or
+  `cut_window.safe_in_s` for the absolute earliest landing point.
+- The `cut_window` is the explicit "safe-to-cut" range; the editor
+  never has to derive `next_word.start − last_word.end` by hand
+  (which is the off-by-one footgun this helper exists to remove).
 
 The speech-timeline range `0:03-0:05` was the input to the lookup;
 the EDL number is `3.12` / `4.04`. Sub-second precision came from
