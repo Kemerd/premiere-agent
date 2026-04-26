@@ -12,7 +12,7 @@ Drop raw footage in a folder, chat with your agent ([Claude Code](https://docs.c
 - **Captions ambient sound** — knows when the drill is running, when something's being sanded, when there's applause
 - **Captions every visible second** so the LLM can find match cuts, B-roll candidates, and identify shots without watching
 - **Ships a `master.srt` captions sidecar with every export** (Premiere-friendly UTF-8 + CRLF) — Premiere / Resolve / FCP X import it via `File → Import` onto a captions track the editor restyles in their own caption panel. 2-word UPPERCASE chunks by default, fully customizable
-- **Generates animation overlays** via [Manim](https://www.manim.community/), [Remotion](https://www.remotion.dev/), or PIL — spawned in parallel sub-agents, one per animation
+- **Generates animation overlays** coming soon
 - **Self-evaluates the cut decisions** at every EDL boundary against the source clips before handing the XML over
 - **Persists session memory** in `project.md` so next week's session picks up where you left off
 
