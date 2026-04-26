@@ -485,7 +485,7 @@ def test_pack_timelines(R: Results, tmp: Path) -> None:
             ("speech_timeline.md", "Hello world."),
             ("audio_timeline.md", "drill"),
             ("visual_timeline.md", "a workshop bench"),
-            ("merged_timeline.md", "drill"),
+            ("audiovisual_timeline.md", "drill"),
         ]:
             p = edit / fname
             if not p.exists():

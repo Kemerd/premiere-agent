@@ -50,14 +50,17 @@ You point spawned sub-agents at these via their briefs (templates in
 `parent_rules.md`):
 
 - **`references/subagent_editor_rules.md`** — editor sub-agent's
-  manual. Spawned to read `merged_timeline.md` and produce
+  manual. Spawned to read `audiovisual_timeline.md` AND
+  `speech_timeline.md` (BOTH end-to-end, line by line) and produce
   `edl.json`. Re-spawned for every user-requested change.
 
 - **`references/subagent_vocab_rules.md`** — vocab sub-agent's
   manual. Spawned once after Phase A speech + visual finishes, to
-  read `merged_timeline.md` (the two-lane interleaved view step 1's
-  first `pack_timelines.py` run produced) and write a project-
-  specific `audio_vocab.txt`. Mandatory step — there is no
+  read `audiovisual_timeline.md` AND `speech_timeline.md` (both
+  produced by step 1's first `pack_timelines.py` run; at vocab time
+  the AV file carries only the visual lane since audio hasn't
+  scored yet) and write a project-specific `audio_vocab.txt`.
+  Mandatory step — there is no
   baseline-vocab shortcut in the parent's playbook.
 
 - **`references/animations.md`** — animation sub-agent's manual.
@@ -126,7 +129,7 @@ folder-convention / pair-mode tables.
 ## What this architecture buys you
 
 - **Token economy.** Token-heavy timeline reads (visual captions
-  at 1fps, audio events, the merged interleaved view) happen in
+  at 1fps, audio events, the AV interleaved view) happen in
   fresh sub-agent context windows, never in the parent's
   accumulating one. The parent reads `speech_timeline.md` for
   conversation-side content awareness — text only, token-cheap —
@@ -148,7 +151,7 @@ folder-convention / pair-mode tables.
   quote -> dispatch -> translate -> run scripts -> handle errors`.
   Conversation, orchestration, helper-script execution, error
   handling, filesystem management — all parent work. Heavy
-  timeline reading (visual captions, audio events, merged view)
+  timeline reading (visual captions, audio events, AV view)
   and cut decisions — sub-agent work. The parent's one allowed
   timeline read is `speech_timeline.md` (text-only transcripts)
   for content awareness during conversation. The boundary is
