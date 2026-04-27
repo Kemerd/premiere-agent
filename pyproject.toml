@@ -1,5 +1,5 @@
 [project]
-name = "video-use-premiere"
+name = "premiere-agent"
 version = "0.2.0"
 description = "Conversation-driven video editor skill for Claude Code — local-first, three-lane preprocessing, FCPXML export"
 requires-python = ">=3.10"
@@ -190,7 +190,7 @@ animations = ["manim"]
 # Convenience meta-extra: install everything opt-in alongside the base.
 # ---------------------------------------------------------------------------
 all = [
-    "video-use-premiere[diarize,animations,flash,parakeet]",
+    "premiere-agent[diarize,animations,flash,parakeet]",
 ]
 
 [build-system]

@@ -61,9 +61,9 @@
       "Bash(Write-Output *)",
       "Bash(mkdir *)",
       "Bash(New-Item *)",
-      "Read(./**)",
-      "Edit(./**)",
-      "Write(./**)"
+      "Read(**)",
+      "Edit(**)",
+      "Write(**)"
     ],
     "deny": [
       "Bash(rm -rf*)",
@@ -77,10 +77,10 @@
       "Bash(curl * | bash*)",
       "Bash(iwr * | iex*)",
       "Bash(Invoke-Expression*)",
-      "Read(./**/.env)",
-      "Read(./**/.env.*)",
-      "Read(./**/*secret*)",
-      "Read(./**/*credentials*)"
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/*secret*)",
+      "Read(**/*credentials*)"
     ],
     "ask": [
       "Bash(git push*)",
