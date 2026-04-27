@@ -254,7 +254,7 @@ the link).
 
 ```bash
 mkdir -p ~/.claude/skills
-ln -s "$(pwd)" ~/.claude/skills/video-use-premiere
+ln -s "$(pwd)" ~/.claude/skills/premiere-agent
 ```
 
 **Windows (PowerShell, run as Administrator** — or enable Developer
@@ -264,14 +264,14 @@ create symlinks):
 ```powershell
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude\skills" | Out-Null
 New-Item -ItemType SymbolicLink `
-  -Path   "$env:USERPROFILE\.claude\skills\video-use-premiere" `
-  -Target "C:\path\to\video-use-premiere"
+  -Path   "$env:USERPROFILE\.claude\skills\premiere-agent" `
+  -Target "C:\path\to\premiere-agent"
 ```
 
 Verify the link landed (`d----l` in the `Mode` column means symlink):
 
 ```powershell
-Get-Item "$env:USERPROFILE\.claude\skills\video-use-premiere" |
+Get-Item "$env:USERPROFILE\.claude\skills\premiere-agent" |
   Select-Object FullName, Target, LinkType
 ```
 
@@ -284,7 +284,7 @@ not `.claude`). Same symlink pattern:
 
 ```bash
 mkdir -p ~/.agents/skills
-ln -s "$(pwd)" ~/.agents/skills/video-use-premiere
+ln -s "$(pwd)" ~/.agents/skills/premiere-agent
 ```
 
 **Windows (PowerShell, Administrator or Developer Mode):**
@@ -292,14 +292,14 @@ ln -s "$(pwd)" ~/.agents/skills/video-use-premiere
 ```powershell
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.agents\skills" | Out-Null
 New-Item -ItemType SymbolicLink `
-  -Path   "$env:USERPROFILE\.agents\skills\video-use-premiere" `
-  -Target "C:\path\to\video-use-premiere"
+  -Path   "$env:USERPROFILE\.agents\skills\premiere-agent" `
+  -Target "C:\path\to\premiere-agent"
 ```
 
 Codex will pick up `AGENTS.md` via the same symlink — `name` and
 `description` come from the surrounding skill folder metadata; the
 file body is what gets concatenated into the prompt when you invoke
-the skill (explicitly via `$video-use-premiere` or implicitly when
+the skill (explicitly via `$premiere-agent` or implicitly when
 your task matches the description).
 
 > **Heads-up: Codex symlinks must be valid relative paths.** If the
@@ -324,14 +324,14 @@ SessionStart hook that clones on every boot:
 
 ```bash
 # inside your videos repo
-git submodule add https://github.com/<you>/video-use-premiere.git \
-  .claude/skills/video-use-premiere
-git commit -am "Add video-use-premiere skill"
+git submodule add https://github.com/<you>/premiere-agent.git \
+  .claude/skills/premiere-agent
+git commit -am "Add premiere-agent skill"
 git push
 ```
 
 Now every cloud session has the skill mounted at
-`.claude/skills/video-use-premiere/` — Claude Code picks it up
+`.claude/skills/premiere-agent/` — Claude Code picks it up
 automatically (the [docs page on cloud sessions](https://code.claude.com/docs/en/claude-code-on-the-web#what-claude-can-and-cant-access-in-cloud-sessions)
 lists `.claude/skills/` as one of the directories included in the
 clone).
@@ -347,7 +347,7 @@ web environment settings (Settings → Environments → your environment
 ```bash
 #!/bin/bash
 set -e
-bash .claude/skills/video-use-premiere/scripts/cloud_setup.sh
+bash .claude/skills/premiere-agent/scripts/cloud_setup.sh
 ```
 
 The setup script runs as root, installs `ffmpeg` via `apt`, pulls the
@@ -396,13 +396,13 @@ Node, Rust, Go, Swift, Ruby, PHP, Java, bun, bazel, erlang/elixir —
 [but again no `ffmpeg`](https://github.com/openai/codex-universal),
 and the skill's Python deps aren't installed.
 
-**1. Mount the skill** at `.agents/skills/video-use-premiere/` in your
+**1. Mount the skill** at `.agents/skills/premiere-agent/` in your
 videos repo — Codex CLI scans `.agents/skills/` from cwd up to the
 repo root for skills:
 
 ```bash
-git submodule add https://github.com/<you>/video-use-premiere.git \
-  .agents/skills/video-use-premiere
+git submodule add https://github.com/<you>/premiere-agent.git \
+  .agents/skills/premiere-agent
 ```
 
 **2. Configure the environment's setup script** (Codex Settings →
@@ -411,7 +411,7 @@ Environments → your env → Setup script). Same script, different path:
 ```bash
 #!/bin/bash
 set -e
-bash .agents/skills/video-use-premiere/scripts/cloud_setup.sh
+bash .agents/skills/premiere-agent/scripts/cloud_setup.sh
 ```
 
 Codex caches the resulting container after the setup script finishes,

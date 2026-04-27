@@ -1,4 +1,4 @@
-"""End-to-end smoke tests for video-use-premiere.
+"""End-to-end smoke tests for premiere-agent.
 
 Runs in two tiers:
 
@@ -944,7 +944,7 @@ def run_all(heavy: bool = False, keep_tmp: bool = False) -> Results:
     Mirrors `main()` minus the argparse/banner/exit-code wrapping. Returns
     the populated `Results` object so the caller can introspect failures.
     """
-    print("video-use-premiere :: smoke tests")
+    print("premiere-agent :: smoke tests")
     print("=" * 60)
 
     R = Results()
@@ -979,7 +979,7 @@ def run_all(heavy: bool = False, keep_tmp: bool = False) -> Results:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="video-use-premiere smoke tests",
+        description="premiere-agent smoke tests",
         epilog=(
             "TIP: For live output during long-running heavy mode, run with:\n"
             "    python -u tests.py --heavy --log run.log\n"

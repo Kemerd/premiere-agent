@@ -1,4 +1,4 @@
 interface:
   display_name: "Video Use Premiere"
   short_description: "Edit videos by conversation, export native Premiere/Resolve/FCPX XML — 100% local."
-  default_prompt: "Use $video-use-premiere to batch-preprocess footage locally (Parakeet speech + Florence-2 visuals + CLAP audio events on a curated vocab), reason over the resulting timelines to assemble cuts with native J/L cuts, dissolves, and retimes, then export an editable FCPXML / FCP7 xmeml straight into Premiere, Resolve, or Final Cut Pro X — XML-only delivery, color stays in the NLE."
+  default_prompt: "Use $premiere-agent to batch-preprocess footage locally (Parakeet speech + Florence-2 visuals + CLAP audio events on a curated vocab), reason over the resulting timelines to assemble cuts with native J/L cuts, dissolves, and retimes, then export an editable FCPXML / FCP7 xmeml straight into Premiere, Resolve, or Final Cut Pro X — XML-only delivery, color stays in the NLE."

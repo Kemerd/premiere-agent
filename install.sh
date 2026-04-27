@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# video-use-premiere bootstrap (Linux / macOS).
+# premiere-agent bootstrap (Linux / macOS).
 #
 # Idempotent. Auto-picks a sensible torch wheel index per OS/arch. Override
 # with the TORCH_INDEX env var if you want something else:
@@ -35,8 +35,8 @@ ARCH_NAME="$(uname -m)"
 
 PYTHON="${PYTHON:-$(command -v python3 || command -v python || true)}"
 
-echo "[video-use-premiere] python: ${PYTHON:-<none>}"
-echo "[video-use-premiere] os:     ${OS_NAME} (${ARCH_NAME})"
+echo "[premiere-agent] python: ${PYTHON:-<none>}"
+echo "[premiere-agent] os:     ${OS_NAME} (${ARCH_NAME})"
 
 if [ -z "$PYTHON" ]; then
   echo "ERROR: no python interpreter on PATH" >&2
@@ -47,7 +47,7 @@ fi
 # 1. Pip itself first. An old pip refuses modern wheel selectors and you'll
 #    end up downloading a years-old transformers that can't load Florence-2.
 # ---------------------------------------------------------------------------
-echo "[video-use-premiere] upgrading pip"
+echo "[premiere-agent] upgrading pip"
 "$PYTHON" -m pip install --upgrade pip
 
 # ---------------------------------------------------------------------------
@@ -89,10 +89,10 @@ if [ -z "${TORCH_INDEX:-}" ]; then
 fi
 
 if [ -n "$TORCH_INDEX" ]; then
-  echo "[video-use-premiere] installing torch from $TORCH_INDEX"
+  echo "[premiere-agent] installing torch from $TORCH_INDEX"
   "$PYTHON" -m pip install torch torchvision torchaudio --index-url "$TORCH_INDEX"
 else
-  echo "[video-use-premiere] installing torch from PyPI default (CPU/MPS wheel for this platform)"
+  echo "[premiere-agent] installing torch from PyPI default (CPU/MPS wheel for this platform)"
   "$PYTHON" -m pip install torch torchvision torchaudio
 fi
 
@@ -109,7 +109,7 @@ fi
 #      * macOS      -> onnxruntime     (CoreML + CPU EPs; no CUDA on Mac)
 #      * Linux/Win x86_64 only -> tensorrt-cu12-libs
 # ---------------------------------------------------------------------------
-echo "[video-use-premiere] installing package"
+echo "[premiere-agent] installing package"
 "$PYTHON" -m pip install -e "."
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ fi
 #      * MPS   : macOS on Apple Silicon (M1/M2/M3/M4...)
 #      * CPU   : everything else (Intel Mac, headless server, no driver)
 # ---------------------------------------------------------------------------
-echo "[video-use-premiere] accelerator smoke test:"
+echo "[premiere-agent] accelerator smoke test:"
 "$PYTHON" - <<'PY'
 import platform
 import torch
@@ -181,6 +181,6 @@ else:
 PY
 
 echo ""
-echo "[video-use-premiere] install complete."
+echo "[premiere-agent] install complete."
 echo "  next: cp .env.example .env   (only needed for --diarize)"
 echo "        $PYTHON helpers/preprocess_batch.py /path/to/your/videos"

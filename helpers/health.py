@@ -1,7 +1,7 @@
-"""Cached health check for video-use-premiere.
+"""Cached health check for premiere-agent.
 
 Runs the FAST tier of tests.py and caches the structured result to
-`~/.video-use-premiere/health.json` so subsequent invocations within a
+`~/.premiere-agent/health.json` so subsequent invocations within a
 TTL window return instantly.
 
 Designed for Claude Code skill startup:
@@ -28,8 +28,8 @@ Cache invalidates on:
   - --clear flag (deletes cache, no run)
 
 Cache location:
-  Win   : %USERPROFILE%\.video-use-premiere\health.json
-  Unix  : ~/.video-use-premiere/health.json
+  Win   : %USERPROFILE%\.premiere-agent\health.json
+  Unix  : ~/.premiere-agent/health.json
 
 CLI:
     python helpers/health.py            # human-readable summary, run if stale
@@ -70,14 +70,14 @@ DEFAULT_TTL_DAYS = 7
 
 # ---------------------------------------------------------------------------
 # Cache location — XDG-aware on Linux, ~/AppData on Windows, ~/Library on
-# macOS would be ideal but we use a single unified `~/.video-use-premiere/`
+# macOS would be ideal but we use a single unified `~/.premiere-agent/`
 # for predictability across machines.
 # ---------------------------------------------------------------------------
 
 def cache_dir() -> Path:
     """Return the per-user cache directory (created on first use)."""
     home = Path.home()
-    d = home / ".video-use-premiere"
+    d = home / ".premiere-agent"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -319,7 +319,7 @@ def print_human(payload: dict, *, from_cache: bool, why_run: str = "") -> None:
     icon = icons.get(status, "[?]")
 
     print()
-    print(f"{icon} video-use-premiere health: {status.upper()}")
+    print(f"{icon} premiere-agent health: {status.upper()}")
     print(f"  cached_at:  {payload.get('cached_at')}  "
           f"({'cache hit' if from_cache else 'just ran'})")
     if why_run and not from_cache:
@@ -382,7 +382,7 @@ def print_json(payload: dict, *, from_cache: bool, why_run: str = "") -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Cached health check for video-use-premiere",
+        description="Cached health check for premiere-agent",
     )
     ap.add_argument("--force", action="store_true",
                     help="Ignore cache, always re-run the smoke suite.")

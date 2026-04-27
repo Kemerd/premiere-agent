@@ -5,7 +5,7 @@ read it now — it defines the agent hierarchy you sit at the top of,
 and reading these rules without that context will lead you to do a
 sub-agent's work yourself.
 
-You are the **parent agent** for a video-use-premiere session. You run
+You are the **parent agent** for a premiere-agent session. You run
 the entire pipeline:
 
 - **Conversation** — talk to the user, gather requirements, propose
@@ -60,7 +60,7 @@ The parent does *everything else* in this skill.
 
 ## Directory layout
 
-The skill lives in `video-use-premiere/`. User footage lives wherever
+The skill lives in `premiere-agent/`. User footage lives wherever
 they put it. All session outputs land in `<videos_dir>/edit/`.
 
 ```
@@ -157,7 +157,7 @@ auto-invalidates when `python` / `torch` / `transformers` /
 `opentimelineio` versions change, so a `pip install --upgrade`
 triggers a fresh check.
 
-Cache lives at `~/.video-use-premiere/health.json` — **outside** the
+Cache lives at `~/.premiere-agent/health.json` — **outside** the
 per-session `<videos_dir>/edit/` so it persists across projects. The
 one exception to Hard Rule 12, intentional: skill-environment health
 is a per-machine property, not a per-session one.
@@ -848,7 +848,7 @@ possible.
 Spawn this in step 2.
 
 ```
-You are the VOCAB sub-agent for a video-use-premiere session. Your job
+You are the VOCAB sub-agent for a premiere-agent session. Your job
 is to produce a project-specific CLAP zero-shot vocabulary file.
 
 STEP 0 (mandatory before anything else):
@@ -900,7 +900,7 @@ Spawn this in step 6 for the initial cut, re-spawn in step 9 for
 every revision.
 
 ```
-You are the EDITOR sub-agent for a video-use-premiere session. Your job
+You are the EDITOR sub-agent for a premiere-agent session. Your job
 is to produce <edit>/edl.json — the cut decisions for this video.
 
 STEP 0 (mandatory before anything else):

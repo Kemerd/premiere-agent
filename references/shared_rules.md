@@ -1,6 +1,6 @@
 # Shared Rules — every agent in this skill reads this first
 
-Every agent in `video-use-premiere` — the parent conversation manager AND every sub-agent it spawns (editor, vocab, animations) — reads this file as step 0. Rules here are **universal**: they bind production correctness, the agent hierarchy, and the philosophy that keeps the skill working without silent failures.
+Every agent in `premiere-agent` — the parent conversation manager AND every sub-agent it spawns (editor, vocab, animations) — reads this file as step 0. Rules here are **universal**: they bind production correctness, the agent hierarchy, and the philosophy that keeps the skill working without silent failures.
 
 After reading this file, continue to your role-specific rules:
 
@@ -132,7 +132,7 @@ These are where deviation produces silent failures or broken output. They are no
 
 11. **Strategy confirmation before execution.** No sub-agent runs until the user has approved the plain-English plan via the parent.
 
-12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use-premiere/` project directory.
+12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `premiere-agent/` project directory.
 
 13. **Pacing preset is REQUIRED before strategy.** Every session must have a pacing preset confirmed by the user (Calm / Measured / Paced / Energetic / Jumpy — default Paced). The preset defines four numbers used by the editor sub-agent: `min_silence_to_remove`, `min_talk_to_keep`, `lead_margin`, and `trail_margin`. See `parent_rules.md` for the value table. Never skip the prompt; never invent ad-hoc values.
 

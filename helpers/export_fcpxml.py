@@ -855,7 +855,7 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
 
     Returns the otio.schema.Timeline. The retime side-channel needed by
     the post-write XML patchers is stashed on
-    `timeline.metadata['video-use-premiere']['speed_map']` — see
+    `timeline.metadata['premiere-agent']['speed_map']` — see
     `_speed_map_from_timeline()` for the read side.
     """
     otio = _import_otio()
@@ -881,7 +881,7 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
     # _patch_xmeml_sequence_format) can read width/height/colorSpace/
     # audio shape without re-resolving everything from the EDL.
     if sequence_settings:
-        timeline.metadata["video-use-premiere"] = {
+        timeline.metadata["premiere-agent"] = {
             "sequence": dict(sequence_settings),
         }
 
@@ -1265,7 +1265,7 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
             # Also stash on the canonical schema fields for any adapter
             # that introspects them — and pass through to fcpx_xml's
             # post-write step (see _patch_fcpxml_audio_shape).
-            ref.metadata["video-use-premiere"] = {
+            ref.metadata["premiere-agent"] = {
                 "audio_channels": src_meta["audio_channels"],
                 "audio_rate": src_meta["audio_rate"],
                 "has_audio": src_meta["has_audio"],
@@ -1295,7 +1295,7 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
         )
         # Stash editorial metadata so the user can see WHY this cut was
         # chosen when they hover the clip in the NLE's clip inspector.
-        v_clip.metadata["video-use-premiere"] = {
+        v_clip.metadata["premiere-agent"] = {
             "beat": r.get("beat"),
             "quote": r.get("quote"),
             "reason": r.get("reason"),
@@ -1461,10 +1461,10 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
             )
 
     # Stash the speed map on the timeline so the post-write patchers can
-    # find it. Existing 'video-use-premiere' bucket is preserved (it
+    # find it. Existing 'premiere-agent' bucket is preserved (it
     # already carries 'sequence' from the sequence-settings stash).
     if speed_map:
-        bucket = timeline.metadata.setdefault("video-use-premiere", {})
+        bucket = timeline.metadata.setdefault("premiere-agent", {})
         bucket["speed_map"] = dict(speed_map)
 
     return timeline
@@ -1787,12 +1787,12 @@ def _sequence_meta_from_timeline(timeline) -> dict | None:
     """Pull the sequence-shape dict we stashed on the Timeline (if any).
 
     build_timeline() puts the resolved settings under
-    timeline.metadata['video-use-premiere']['sequence']; both writers
+    timeline.metadata['premiere-agent']['sequence']; both writers
     forward that to their post-write patchers without having to
     re-resolve the EDL.
     """
     try:
-        return (timeline.metadata.get("video-use-premiere") or {}).get("sequence")
+        return (timeline.metadata.get("premiere-agent") or {}).get("sequence")
     except Exception:
         return None
 
@@ -1805,7 +1805,7 @@ def _speed_map_from_timeline(timeline) -> dict | None:
     retimed element in the XML without re-walking the EDL.
     """
     try:
-        return (timeline.metadata.get("video-use-premiere") or {}).get("speed_map")
+        return (timeline.metadata.get("premiere-agent") or {}).get("speed_map")
     except Exception:
         return None
 
@@ -2678,7 +2678,7 @@ def _patch_xmeml_bin_layout(
         # internal asset registry — UUIDv5 over the file id keeps it
         # deterministic across runs.
         ET.SubElement(clip_e, "uuid").text = str(
-            _uuid.uuid5(_uuid.NAMESPACE_URL, f"video-use-premiere/{fid}")
+            _uuid.uuid5(_uuid.NAMESPACE_URL, f"premiere-agent/{fid}")
         )
         ET.SubElement(clip_e, "masterclipid").text = master_id
         ET.SubElement(clip_e, "ismasterclip").text = "TRUE"
