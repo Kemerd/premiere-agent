@@ -1,6 +1,6 @@
 # premiere-agent
 
-Edit videos by conversation — runs **100% locally** and exports straight into **Premiere Pro** (and Resolve, and Final Cut) with **J cuts, L cuts, dissolves**, and the rest of the cut vocabulary you'd actually use in an NLE.
+Edit videos by conversation — runs **100% locally** and exports straight into **Premiere Pro** (and Resolve, and Final Cut) with **J cuts, L cuts, dissolves**, and the rest of the cut vocabulary you'd actually use in an NLE.Wulululu
 
 Drop raw footage in a folder, chat with your agent ([Claude Code](https://docs.claude.com/en/docs/claude-code/overview) — local CLI **or** [cloud workspaces](https://code.claude.com/docs/en/claude-code-on-the-web), or [Codex](https://developers.openai.com/codex) CLI / IDE / app), get `cut.fcpxml` + `cut.xml` back — XML-only delivery, the cut lives in your NLE. Text + on-demand visuals, no frame-dumping — three perception lanes so the LLM can reason about speech, abstract sounds, and visible objects, not just one of them.
 
