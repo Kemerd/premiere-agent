@@ -810,8 +810,8 @@ def _build_florence(
 #
 # where the first 5-7 sentences are real content and the back half is
 # pure tokenizer noise. On a 6500-frame timeline that ballooned the
-# audiovisual_timeline.md file by ~30-40% and pushed it past the editor
-# sub-agent's reasonable single-read budget. We strip them at decode
+# merged_timeline.md file by ~30-40% and pushed it past the agent's
+# reasonable single-read budget. We strip them at decode
 # (so new caches stay clean) AND defensively in pack_timelines.py
 # (so legacy caches that still carry the leakage pack cleanly without
 # a forced re-preprocess).
@@ -1505,7 +1505,7 @@ def main() -> None:
             f"Sample rate in frames/sec (default: {DEFAULT_FPS:g}). "
             "Fractional values are accepted: 0.5 = one frame every 2 s, "
             "0.25 = one frame every 4 s, etc. Lower fps means a faster "
-            "preprocess and a leaner audiovisual_timeline.md, at the cost of "
+            "preprocess and a leaner merged_timeline.md, at the cost of "
             "coarser temporal resolution. Linear cost — halving fps "
             "roughly halves preprocess wall time."
         ),
