@@ -1,17 +1,16 @@
 # Scripted assembly — script + voiceover cuts
 
-> Cold-path feature. Loaded on demand by the **editor sub-agent** when the
-> parent's brief says `script_mode = true` (i.e. user confirmed they
-> have a written script, an already-recorded voiceover, or both, and they
-> want b-roll matched to it). Parent gates this in step 4 of the
-> 9-step process — see `parent_rules.md`. If the user is editing a
-> talking-head / interview / vlog / workshop with no separate VO, this
-> file is **not** in scope and the editor never reads it.
+> Cold-path feature. Loaded on demand by **the agent** when the user
+> confirms `script_mode = true` (i.e. they have a written script, an
+> already-recorded voiceover, or both, and want b-roll matched to it).
+> If the user is editing a talking-head / interview / vlog / workshop
+> with no separate VO, this file is **not** in scope and the agent
+> never reads it.
 >
-> Read this file in full when spawned with `script_mode = true`.
-> It binds the assembly model — script is the source of truth, the
-> voiceover provides the timing, and b-roll is matched per beat against
-> the visual lane. Do not improvise around these rules.
+> Read this file in full when entering scripted mode. It binds the
+> assembly model — script is the source of truth, the voiceover
+> provides the timing, and b-roll is matched per beat against the
+> visual lane. Do not improvise around these rules.
 
 ---
 
@@ -42,11 +41,10 @@ The voiceover source can be either:
 
 - **An audio-only file** (`.wav`, `.mp3`, `.m4a`, `.flac`, ...) — the
   common case when the user recorded VO at a desk post-shoot.
-  Parent runs `preprocess.py <voiceover.wav>` (or via
-  `preprocess_batch.py` mixed with video sources) and the
-  speech lane produces `<edit>/transcripts/<voiceover_stem>.json` just
-  like any other source. The visual lane is
-  auto-skipped for audio-only sources.
+  Run `preprocess.py <voiceover.wav>` (or via `preprocess_batch.py`
+  mixed with video sources) and the speech lane produces
+  `<edit>/transcripts/<voiceover_stem>.json` just like any other
+  source. The visual lane is auto-skipped for audio-only sources.
 - **A video file with the VO baked into the audio track** — e.g. the
   user re-recorded VO in their NLE and exported a `.mov` reference.
   Treated like any other video; the speech lane transcribes the audio
@@ -55,9 +53,10 @@ The voiceover source can be either:
 
 Treatment is the same either way. The transcript
 shape is identical; the path is `<edit>/transcripts/<voiceover_stem>
-.json`. Verify the file via `source_tags.json`
-(if present) for clips tagged `voiceover` — that's the parent's
-declaration of which file is the timing spine.
+.json`. You already saw the folder layout during the inventory pass
+in step 1 — if there's a `voiceover/` folder (or `vo_anna/` etc.),
+its clips are the timing spine. No on-disk tag file is needed; you
+have the folder names in your working memory.
 
 Because both script and voiceover are fixed, **the cut
 problem inverts**: instead of "find the best take in this footage,"
@@ -80,17 +79,16 @@ Per cut decision in scripted mode:
    script's prose timing. The script tells you *what* is said;
    the voiceover transcript tells you *when*.
 3. **Visual captions decide which clip lands on each beat.** The
-   `[…]` visual lines in `audiovisual_timeline.md` (Florence-2
-   captions @ 1 fps) are how you verify a clip shows the named
-   subject.
+   `[…]` visual lines in `merged_timeline.md` (Florence-2
+   captions @ 1 fps, interleaved with the speech and audio lanes)
+   are how you verify a clip shows the named subject.
 4. **Audio events are noisy hints only**, same as the default rule
    (Hard Rule on CLAP cross-checks).
 
 ## What to ignore — explicitly
 
-When parent's brief says `script_mode = true` and the user has
-provided a script + separate VO, **ignore these unless user
-explicitly asks for them:**
+When `script_mode = true` and the user has provided a script +
+separate VO, **ignore these unless user explicitly asks for them:**
 
 - Old `cut.fcpxml` / `cut.xml` from a previous session.
 - Old `master.srt` (it's stale relative to the new script + VO).
@@ -117,8 +115,8 @@ show…"*. The two source-side detection rules from your default
 operating manual — **in-clip editor notes** (per-clip verbal
 directives) and **retake detection** (frustration markers,
 restarts, paraphrased redos) — apply to the VO transcription
-exactly as for A-roll. Re-read those sections in
-`subagent_editor_rules.md` if unclear.
+exactly as for A-roll. Re-read those sections in `SKILL.md` if
+unclear.
 
 Concretely on the VO:
 
@@ -216,22 +214,18 @@ voiceover that doesn't mention Riot.
 ### 4. Shortlist b-roll candidates per beat
 
 For each beat, you need a clip whose `[…]` visual captions in
-`audiovisual_timeline.md` describe what the script says is visible.
+`merged_timeline.md` describe what the script says is visible.
 
-The default reading surface is the dual spine
-(`audiovisual_timeline.md` + `speech_timeline.md`) — read BOTH
-end-to-end (per the ABSOLUTE READ MANDATE in
-`subagent_editor_rules.md`) before this step. The visual lane lines
-in `audiovisual_timeline.md` are your search target; the
-`speech_timeline.md` cross-check tells you whether the clip's
-on-camera speech aligns with or contradicts the script beat.
+The default reading surface is `merged_timeline.md` end-to-end
+(speech, audio, and visual lanes interleaved by timestamp). The
+visual lane lines (`[…]`) are your search target; the speech lines
+(`"..."`) on the same source tell you whether the clip's on-camera
+speech aligns with or contradicts the script beat.
 
-**Three shortlisting paths**, pick whichever fits the library size
-and the user_profile bar:
+**Two shortlisting paths**, pick whichever fits the library size:
 
-1. **In-context scan (default for small libraries).** Walk
-   the `[…]` visual lines in `audiovisual_timeline.md` per beat
-   for matches. Build a shortlist
+1. **In-context scan (default).** Walk the `[…]` visual lines in
+   `merged_timeline.md` per beat for matches. Build a shortlist
    of 3-8 candidate clips per beat by:
    - Captions containing the beat's named subject ("Riot Games sign"
      → captions mentioning Riot, sign, banner, booth signage, logo).
@@ -242,36 +236,27 @@ and the user_profile bar:
      visual lines (>= 3 seconds of stable visual evidence) over a
      single one-frame hit (which might be a fast pan-through).
 
-2. **Spawn b-roll scout subagents (recommended for large libraries
-   or `professional` bar).** Per `subagent_editor_rules.md` "B-roll
-   scout spawn protocol", delegate per-beat shortlisting to
-   parallel scout subagents. Pass them `source_tags.json` (when
-   present) so they only consider b-roll-tagged clips. They return
-   ranked shortlists with evidence; you pick / verify / write the
-   EDL range. This keeps your context for cut decisions
-   vs caption re-scans.
+2. **Use a clip index (when available, as a shortlist aid).** If
+   `<edit>/clip_index/index.json` exists, text-search it for
+   shortlisting. **Verification still binds in step 5** — the index
+   suggests; the visual-lane drill-down decides.
 
-3. **Use a clip index (when available, as a shortlist aid).** If
-   the brief mentions `<edit>/clip_index/index.json`, you
-   may text-search it for shortlisting. Whether you use it
-   in-context or hand it to a scout, **verification still binds in
-   step 5** — the index suggests; the visual-lane drill-down decides.
-
-When `source_tags.json` is in the brief, restrict candidate
-searches (whether in-context, scout-delegated, or index-queried) to
-clips tagged `b_roll` / `cutaway` / `unknown`. A-roll-tagged clips
-are the speech bed in talking-head mode; in scripted assembly the
-A-roll tag is rare since the VO carries audio — but if it appears,
-respect user organization.
+When the user organized footage by folder convention (`b_roll/`,
+`cutaway/`, `a_roll/`, `voiceover/`, etc. — anything semantically
+meaningful that you saw during the inventory pass), restrict
+candidate searches to clips under `b_roll` / `cutaway` / unlabeled
+folders. A-roll-tagged clips are the speech bed in talking-head
+mode; in scripted assembly the A-roll tag is rare since the VO
+carries audio — but if it appears, respect the user's organization.
+The folder structure IS the tag; nothing is written to disk.
 
 ### 5. Verify the top candidate against the visual evidence
 
 Pick the highest-evidence clip from the shortlist. Then **verify**
 before committing:
 
-- Read the surrounding `[…]` visual lines in
-  `audiovisual_timeline.md` (the range you're proposing to cut from
-  + 1-2 seconds before/after).
+- Read the surrounding `[…]` visual lines in `merged_timeline.md`
+  (the range you're proposing to cut from + 1-2 seconds before/after).
   Continuous matching captions = good. A single matching frame
   surrounded by something else = a fast pan, reject.
 - Drill into `<edit>/visual_timeline.md` for the full 1fps caption
@@ -368,11 +353,10 @@ mattered.
   word-boundary discipline (Hard Rule 6) on every cut edge.
 - **Hard Rule 14** still defers J/L cuts and dissolves to `0.0` —
   scripted mode does not unlock split edits.
-- **Hard Rule 15** (dual-spine read) still applies — read BOTH
-  `audiovisual_timeline.md` AND `speech_timeline.md` end-to-end,
-  drill into per-lane files at ambiguous moments. The script does
-  not replace the dual-spine read; it *adds* a structural anchor on
-  top of it.
+- **Hard Rule 15 / 16** (full merged-timeline read) still applies —
+  read `merged_timeline.md` end-to-end, drill into the per-lane
+  files at ambiguous moments. The script does not replace the
+  merged-timeline read; it *adds* a structural anchor on top of it.
 
 ---
 
@@ -390,12 +374,11 @@ the voiceover (they're reading the script on camera). In that case:
   `b_roll_selection.md` — the named-subject rule still applies when
   inserting cutaways.
 
-Parent picks the mode by asking user up-front
-("do you have a separate voiceover, or is the speaker reading the
-script on camera?"). If on-camera, it sets `script_mode = false` but
-keeps `b_roll_mode = true` and forwards the script as a "structural
-hint" in the brief — you read it for context, not as the assembly
-spine.
+Ask the user up-front ("do you have a separate voiceover, or is the
+speaker reading the script on camera?"). If on-camera, set
+`script_mode = false` but keep `b_roll_mode = true` and treat the
+script as a "structural hint" — read it for context, not as the
+assembly spine.
 
 ---
 
@@ -412,13 +395,13 @@ against.
 ## Anti-patterns specific to scripted mode
 
 - **Using stale transcripts for the voiceover.** Every scripted
-  session starts with a fresh Parakeet pass on the VO file
-  the user provided. Parent re-runs preprocessing for that file;
-  trust the freshly cached transcript, not anything older.
+  session starts with a fresh Parakeet pass on the VO file the user
+  provided. Re-run preprocessing for that file; trust the freshly
+  cached transcript, not anything older.
 - **Matching by filename / metadata instead of visual captions.**
   Filenames lie ("riot_booth.mp4" might be a wide of the
   show floor where Riot is barely visible). Always verify against
-  the `[…]` visual lines in `audiovisual_timeline.md`.
+  the `[…]` visual lines in `merged_timeline.md`.
 - **Picking the first index hit without verifying.** Two-stage
   matching is the rule (shortlist + verify). Skipping verification
   is how brand b-roll lands on the wrong booth.
@@ -433,44 +416,30 @@ against.
   `b_roll_selection.md` for the full preference rule.
 - **Re-using last session's EDL as a starting point on a script
   rewrite.** If the script changed, the b-roll mapping changed.
-  Start fresh; diff old EDL only on parent's request, not as a
-  default.
+  Start fresh; diff old EDL only when the user asks for it, not as
+  a default.
 - **Skipping the QA note on a named-subject beat.** Those notes are
-  load-bearing on revisions. Skip the note → next revision the
-  parent has nothing to forward → user repeats same
-  feedback.
+  load-bearing on revisions. Skip the note → next revision has
+  nothing to forward → user repeats same feedback.
 
 ---
 
-## Scaling shortlisting — scouts, indexes, in-context
+## Scaling shortlisting — in-context vs clip index
 
-Three escalation tiers as your library grows:
+Two escalation tiers as your library grows:
 
-- **Tier 1 — in-context scan (small libraries).** Read both
-  `audiovisual_timeline.md` and `speech_timeline.md` end-to-end
-  once, then scan the `[…]` visual lines in the AV file per beat.
-  Cheap when library fits your read budget and the number of beats
-  is small (<= 8).
-- **Tier 2 — clip index (medium-large libraries, no scouts yet).**
-  When parent has built `<edit>/clip_index/index.json` (a
-  per-clip text-searchable record from cached captions + speech),
-  query the index per beat for shortlisting, then verify the
-  top candidate(s) against `audiovisual_timeline.md` /
-  `visual_timeline.md`. The index is a parent-managed helper
-  (`helpers/clip_index.py`-style); it's optional. The index
-  accelerates step 4; it doesn't replace verification in step 5.
-- **Tier 3 — b-roll scout subagents (large libraries OR
-  professional bar OR many beats).** Per `subagent_editor_rules.md`
-  "B-roll scout spawn protocol", spawn parallel scout subagents
-  (Hard Rule 10) — one per beat or one per cluster of beats.
-  Scouts read `<edit>/visual_timeline.md` for in-scope sources in
-  their own fresh context windows, return ranked shortlists with
-  evidence, and you pick / verify / write the EDL range. This keeps
-  your context for editorial decisions vs caption-re-
-  scanning, and it stacks with the index when both are available
-  (you can pass the index path to scouts for faster shortlisting).
+- **Tier 1 — in-context scan (small to medium libraries).** Read
+  `merged_timeline.md` end-to-end once, then scan the `[…]` visual
+  lines per beat. Cheap when the library fits your read budget and
+  the number of beats is small-to-moderate (<= 16 or so).
+- **Tier 2 — clip index (large libraries).** When
+  `<edit>/clip_index/index.json` exists (a per-clip text-searchable
+  record built from cached captions + speech), query the index per
+  beat for shortlisting, then verify the top candidate(s) against
+  `merged_timeline.md` / `visual_timeline.md`. The index accelerates
+  step 4; it does NOT replace verification in step 5.
 
-For ALL tiers: the dual-spine pre-flight read
-(`audiovisual_timeline.md` + `speech_timeline.md`) is still
-mandatory; the verification step (step 5) still binds; and source
-in-points (step 6) are computed by you, not by scouts or the index.
+For BOTH tiers: the full `merged_timeline.md` read remains mandatory;
+the verification step (step 5) still binds; source in-points (step
+6) are computed by hand against `helpers/find_quote.py`, not by the
+index.

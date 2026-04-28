@@ -1,3 +1,13 @@
+> Drop raw footage in a folder. Talk to it like an assistant editor. Get an `.fcpxml` straight into your timeline — every cut, transition, retime, and caption decision comes with a written rationale you can inspect, reject, or iterate on by just saying so.
+>
+> **Not another half-baked AI editor that demos pretty and falls apart the second you point it at real footage.** Three perception lanes — **Parakeet ONNX** speech, **Florence-2** visual captions at 1 fps, **CLAP** audio events scored against an agent-curated vocabulary — interleaved into a single `merged_timeline.md` the agent reads end-to-end and reasons over instead of watching pixels. Word-precise EDL anchors come from `helpers/find_quote.py` against the cached transcripts — no greps, no off-by-one. State-of-the-art open models, composed in a way nobody else has shipped, running **100% on your machine**. Every cut boundary is verified against the source clips before export — mid-word cuts and visual discontinuities **block** the FCPXML.
+>
+> No cloud. No black box. No watermark. No subscription. Iteration on revision 50 costs the same as revision 1.
+>
+> **This isn't a novelty.** It's the assistant editor you wish you could hire — doing real assembly work, on your machine, in your NLE. If you edit for a living, it saves you hundreds of hours.
+
+---
+
 # premiere-agent
 
 Edit videos by conversation — runs **100% locally** and exports straight into **Premiere Pro** (and Resolve, and Final Cut) with **J cuts, L cuts, dissolves**, and the rest of the cut vocabulary you'd actually use in an NLE.Wulululu
@@ -18,36 +28,35 @@ What ends up in the cut you get back:
 - **Captions ambient sound** — knows when the drill is running, when something's being sanded, when there's applause
 - **Captions every visible second** so the LLM can find match cuts, B-roll candidates, and identify shots without watching
 - **Ships a `master.srt` captions sidecar with every export** (Premiere-friendly UTF-8 + CRLF) — Premiere / Resolve / FCP X import it via `File → Import` onto a captions track the editor restyles in their own caption panel. 2-word UPPERCASE chunks by default, fully customizable
-- **Generates animation overlays** coming soon
 - **Self-evaluates the cut decisions** at every EDL boundary against the source clips before handing the XML over
 - **Persists session memory** in `project.md` so next week's session picks up where you left off
 
 ## How it works
 
-The LLM never watches the video. It **reads** it — through three timestamp-aligned timelines plus an on-demand visual drill-down. Same idea as browser-use giving an LLM a structured DOM instead of a screenshot, but for video.
+The LLM never watches the video. It **reads** it — through one chronologically-interleaved `merged_timeline.md` (speech + audio events + visual captions, all by timestamp) plus on-demand drill-down into per-lane files and a word-precise transcript crawler. Same idea as browser-use giving an LLM a structured DOM instead of a screenshot, but for video.
 
 ### The agent loop
 
-A session is split between a **parent agent** that runs the conversation and **sub-agents** that do the heavy timeline reading in fresh context windows — long iteration sessions cost the same per spawn as the first revision because the parent's context grows linearly with the conversation, not with caption density.
+A single agent runs the conversation, the inventory, the strategy, the EDL, and the export — no sub-agent gymnastics. The merged timeline is small enough (200 KB – 1.5 MB on typical projects, caveman-compressed and sentence-delta-deduped at pack time) that the agent reads it end-to-end every spawn without context pressure. Iteration cost is constant: the cached lane outputs and the merged file are reused across revisions, so revision 50 costs the same as revision 1.
 
 ```
-1. Inventory          parent reads ffprobe metadata, detects folder conventions
+1. Inventory          agent reads ffprobe metadata, detects folder conventions
                       (b_roll/, timelapse/, voiceover/), pairs dual-mic .wav to
                       video stems, asks 4 mode-gating questions
 2. Phase A preprocess speech (Parakeet ONNX) ‖ visual (Florence-2) on one GPU
                       with a VRAM-aware scheduler — cached on disk so it's
                       one-shot per source, not per revision
-3. Vocab spawn        a sub-agent reads speech_timeline.md + audiovisual_timeline.md
-                      (BOTH end-to-end) and writes a project-specific CLAP
-                      vocabulary (audio_vocab.txt)
+3. Vocab curation     agent reads merged_timeline.md (speech + visual at this
+                      stage; audio lane hasn't scored yet), writes a project-
+                      specific CLAP vocabulary to audio_vocab.txt
 4. Phase B preprocess CLAP scores the audio against that vocabulary, pack_timelines
-                      folds the audio lane into audiovisual_timeline.md
-5. Strategy           parent proposes a cut shape (pacing, J/L policy, b-roll, retime,
+                      folds the audio events into merged_timeline.md
+5. Strategy           agent proposes a cut shape (pacing, J/L policy, b-roll, retime,
                       subtitles), waits for user OK
-6. Editor spawn       a sub-agent reads audiovisual_timeline.md AND speech_timeline.md
-                      (BOTH, end-to-end, line by line), writes edl.json with
-                      ranges, transitions, retime, overlay slots — re-spawned per
-                      revision request, never hand-editing the EDL
+6. EDL                agent reads merged_timeline.md end-to-end and writes
+                      edl.json — every word-boundary anchor verified through
+                      helpers/find_quote.py against the cached transcripts;
+                      regenerated wholesale on every revision, never hand-edited
 7. Self-eval          timeline_view runs at every cut boundary against the source
                       clips; mid-word cuts and visual discontinuities block export
 8. Export             cut.fcpxml + cut.xml + master.srt next to the sources
@@ -86,23 +95,20 @@ Pre-processing produces three small markdown files per session, each addressable
   [015] hands placing the drill down on a workbench
 ```
 
-`pack_timelines.py` also emits an `audiovisual_timeline.md` by default that interleaves the audio + visual lanes chronologically — speech is intentionally NOT in this file. The editor and vocab sub-agents read TWO files end-to-end side by side: `audiovisual_timeline.md` (audio + visual, scannable per-second cadence) and `speech_timeline.md` (phrase ranges with outer-aligned `floor(start)..ceil(end)` rounding). Splitting the lanes this way keeps the AV view dense and the speech view word-precise, and lets `helpers/find_quote.py` map any integer range from the speech file straight back to a sub-second window in `transcripts/<stem>.json` without off-by-one fences. Pass `--no-audiovisual` (legacy alias `--no-merge`) to skip the AV view. The per-lane files above remain on disk as drill-down references.
-
-```
-0:12 (drill 0.87, power_tool 0.71)
-0:12 [a person holding a cordless drill above a metal panel]
-0:13 + [close-up of a drill bit entering metal, sparks visible]
-0:24 (metal_scraping 0.62)
-```
-
-…paired with the speech file:
+`pack_timelines.py` also emits the **`merged_timeline.md`** — the agent's default reading surface — that interleaves all three lanes chronologically by timestamp into a single file. Speech phrases as `"..."` (outer-aligned `M:SS-M:SS` ranges so any integer range can be passed verbatim to `helpers/find_quote.py --range` without off-by-one fences), audio events as `(label, label, ...)`, visual captions as `[caption]` (or `+ [delta]` for sentence-level diffs against the prior frame). One file, one full read, every event in order — the per-lane files above remain on disk as drill-down references when the merged view is ambiguous and the agent zooms in on one lane. Pass `--no-merge` (legacy alias `--no-audiovisual`) to skip the merged view.
 
 ```
 0:11-0:18 [S0] "okay now we're going to drill the pilot holes"
+0:12 (drill 0.87, power_tool 0.71)
+0:12 [a person holding a cordless drill above a metal panel]
+0:13 + [close-up of a drill bit entering metal, sparks visible]
 0:18-0:22 [S0] "good, pass me the deburring tool"
+0:24 (metal_scraping 0.62)
 ```
 
-> The CLAP audio lane is a **separate Phase B step** invoked after `preprocess.py` (or `preprocess_batch.py`) finishes. The first `pack_timelines.py` run produces an `audiovisual_timeline.md` carrying only the visual lane (audio hasn't scored yet) plus the standalone `speech_timeline.md`; the vocab agent reads BOTH end-to-end, writes a project-specific vocabulary to `audio_vocab.txt`, and then `helpers/audio_lane.py` scores against it. A second `pack_timelines.py` run folds the new audio events into `audiovisual_timeline.md` for the editor. Pass `--include-audio` to the preprocessor to instead run CLAP inline against a baked-in baseline vocabulary (smoke tests, agent-less runs).
+For sub-second word-precise EDL anchors the agent calls **`helpers/find_quote.py`** — pass the clip stem, the integer `M:SS-M:SS` range read straight off the `"..."` line, and a quote substring; the helper returns word-pinned `{first_word, last_word, prev_word, next_word, lead_silence_s, trail_silence_s, cut_window}` JSON ready for the pacing-preset margin clamp. No greps, no off-by-one, sub-millisecond hot.
+
+> The CLAP audio lane is a **separate Phase B step** invoked after `preprocess.py` (or `preprocess_batch.py`) finishes. The first `pack_timelines.py` run produces a `merged_timeline.md` carrying speech + visual (audio hasn't scored yet); the agent reads it end-to-end, writes a project-specific vocabulary to `audio_vocab.txt`, and then `helpers/audio_lane.py` scores against it. A second `pack_timelines.py` run folds the new audio events into `merged_timeline.md`. Pass `--include-audio` to the preprocessor to instead run CLAP inline against a baked-in baseline vocabulary (smoke tests, agent-less runs).
 
 ### On-demand visual drill-down
 
@@ -442,14 +448,9 @@ GPU and commit the cached lane outputs into the videos repo so the
 cloud agent only does the CPU-cheap conversation + EDL + FCPXML
 export pass.
 
-> Codex's sub-agent primitive lives in `~/.codex/agents/` (or
-> `.codex/agents/` checked into the repo). The skill's parent rules
-> assume parallel sub-agent dispatch — without it, the editor /
-> vocab / animation sub-agents run inline and you pay their token
-> cost in the parent's context window. See
-> [the Codex subagents docs](https://developers.openai.com/codex/concepts/customization/)
-> if you want to wire up the parallel primitive — it's optional, the
-> skill degrades gracefully without it.
+> The skill is single-agent by design — no parent/sub-agent dispatch
+> to wire up. Whatever runtime loads it (Codex, Claude Code, local
+> CLI or cloud) just runs the loop end-to-end in one agent context.
 
 ### Which folder do I open with the agent?
 
@@ -596,20 +597,22 @@ Color is the colorist's job; the skill never emits a grade.
 ├── <source files, untouched>
 └── edit/
     ├── project.md               ← memory; appended every session
-    ├── audiovisual_timeline.md  ← MANDATORY read #1 (audio + visual lanes
-    │                              interleaved chronologically; NO speech)
-    ├── speech_timeline.md       ← MANDATORY read #2 (phrase ranges, outer-
+    ├── merged_timeline.md       ← DEFAULT reading surface — speech + audio +
+    │                              visual interleaved chronologically by
+    │                              timestamp into one file (agent reads end-to-end)
+    ├── speech_timeline.md       ← lane 1 drill-down (phrase ranges, outer-
     │                              aligned floor-start / ceil-end rounding)
-    ├── audio_timeline.md        ← lane 2, drill-down
-    ├── visual_timeline.md       ← lane 3, drill-down
+    ├── audio_timeline.md        ← lane 2 drill-down (per-window CLAP scoring)
+    ├── visual_timeline.md       ← lane 3 drill-down (1-fps Florence captions
+    │                              including `(same)` repeats the merged view drops)
     ├── edl.json                 ← cut decisions
-    ├── transcripts/<name>.json  ← raw Parakeet ONNX words (cached)
+    ├── transcripts/<name>.json  ← raw Parakeet ONNX words (cached) — read via
+    │                              helpers/find_quote.py for sub-second anchors
     ├── audio_tags/<name>.json   ← raw CLAP zero-shot events (cached)
     ├── visual_caps/<name>.json  ← raw Florence-2 output (cached)
     ├── audio_vocab.txt          ← agent-curated CLAP vocabulary (Phase B)
     ├── audio_vocab_embeds.npz   ← cached CLAP text embeddings for that vocab
     ├── audio_16k/<name>.wav     ← shared 16kHz mono PCM (cached)
-    ├── animations/slot_<id>/    ← per-animation source + render + reasoning
     ├── master.srt               ← output-timeline subtitles (build_srt.py)
     ├── verify/                  ← debug frames / timeline PNGs
     ├── cut.fcpxml               ← NLE export, FCPXML 1.10+ (Resolve / FCP X)

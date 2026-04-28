@@ -1,18 +1,15 @@
 # B-roll selection — rules + optimized matching
 
-> Cold-path. The **editor sub-agent** loads it when
-> the brief says `b_roll_mode = true` (user confirmed
-> b-roll / cutaway material exists — either as a
-> dedicated library for scripted assembly, or cutaways over
-> a single talking-head A-roll). The parent gates this in step
-> 4 of the 9-step process — see `parent_rules.md`. If the project is
-> single-source dialogue with no cutaways, this file is **not** in
-> scope and the editor never reads it.
+> Cold-path. **The agent** loads this on demand when
+> `b_roll_mode = true` — the user has b-roll / cutaway material,
+> either as a dedicated library for scripted assembly or cutaways
+> over a single talking-head A-roll. If the project is single-source
+> dialogue with no cutaways, this file is **not** in scope and the
+> agent never reads it.
 >
-> Read in full when spawned with `b_roll_mode = true`.
-> Selection rules bind every cutaway choice; the matching
-> philosophy (caching / two-stage / index-first) bind how you spend
-> your time.
+> Read in full when entering b-roll mode. Selection rules bind every
+> cutaway choice; the matching philosophy (caching / two-stage /
+> index-first) binds how you spend your time.
 
 ---
 
@@ -95,7 +92,7 @@ A candidate is **rejected** (drop and pick next in the
 shortlist) if any of these are true:
 
 - **Visual captions contradict the script beat.** The
-  `audiovisual_timeline.md` `[…]` visual line for the candidate range says
+  `merged_timeline.md` `[…]` visual line for the candidate range says
   one thing, the script says another, and they're not the same
   subject. Older filenames or path-based hints don't override the
   caption — Florence-2 saw what's there; trust it. Example: file
@@ -142,10 +139,10 @@ look for runs where consecutive captions describe the same subject
 with mild variation vs completely different things on each
 frame.
 
-If the parent's brief mentions a `<edit>/clip_index/index.json` with
-stability scores attached (an optional optimization — see "Optimized
-matching" below), use them as a tiebreaker; otherwise reason
-from the captions.
+If `<edit>/clip_index/index.json` exists with stability scores
+attached (an optional optimization — see "Optimized matching"
+below), use them as a tiebreaker; otherwise reason from the
+captions.
 
 ## Diversification — don't repeat distinctive visuals
 
@@ -185,10 +182,10 @@ not present in any candidate's visual captions:
    (a different game's gameplay tagged as the right game's
    gameplay). The user will spot it; revisions multiply.
 
-The user's note in `parent_rules.md` step 4 about named-game beats
-(e.g. "Quake III Arena RTX") is an *example* of this rule, not a
-hard-coded exclusion. Prefer footage that visibly matches the named
-subject; only reject loose matches when a better verified option
+The named-game-beat example (e.g. "Quake III Arena RTX") is an
+*illustration* of this rule, not a hard-coded exclusion. Prefer
+footage that visibly matches the named subject; only reject loose
+matches when a better verified option
 exists.
 
 ---
@@ -215,48 +212,26 @@ The reusable model:
 - **`pack_timelines.py`** rolls those lane files into the merged
   view + per-lane drill-down files. Re-runs are fast on cached
   inputs.
-- **Folder convention auto-detection** (parent's step 1) writes
-  `<edit>/source_tags.json` mapping clip stems → categories
-  (`a_roll`, `b_roll`, `timelapse`, `voiceover`, `unknown`) when
-  the user organizes by convention folder. **Respect these tags**
-  for candidate searches: only `b_roll` / `cutaway` / `unknown`
-  clips are eligible cutaway candidates; A-roll is the speech bed
-  in talking-head mode; `timelapse` clips are pre-organized retime
+- **Folder convention as semantic tags.** During the inventory pass
+  in step 1 of the SKILL.md process, you saw the parent folder of
+  every source. When the user organized by convention (`b_roll/`,
+  `b_roll_intro/`, `a_roll/`, `voiceover_anna/`, `timelapse_buildout/`,
+  or any other semantically meaningful name), keep that folder→
+  category mapping in your working memory and **respect it** for
+  candidate searches: only `b_roll` / `cutaway` / unlabeled clips
+  are eligible cutaway candidates; A-roll is the speech bed in
+  talking-head mode; `timelapse`-folder clips are pre-organized retime
   source material (still gated by `timelapse_mode` — see below).
-  When tags are absent, all sources are eligible.
-- **(Optional) clip index** is a parent-managed helper that walks
-  `transcripts/` + `visual_caps/` and builds a per-clip
-  searchable record. The editor doesn't build it; the parent runs
-  the helper and (if available) names the path in the brief.
-  Without an index, scan `audiovisual_timeline.md` per beat —
-  slower but correct.
+  When the folders aren't categorized, all sources are eligible.
+  Nothing is written to disk — you have the folder names already.
+- **(Optional) clip index** is a helper that walks `transcripts/`
+  + `visual_caps/` and builds a per-clip searchable record. Without
+  an index, scan `merged_timeline.md` per beat — slower but
+  correct.
 
-If the parent's brief says `clip_index_available = true` and points
-at `<edit>/clip_index/index.json`, treat it as a shortlisting aid
-only — the dual-spine pre-flight (ABSOLUTE READ MANDATE on
-`audiovisual_timeline.md` + `speech_timeline.md`) still binds
-before any beat-level matching.
-
-### 1b. Delegate shortlisting to b-roll scout sub-agents (large libraries / professional bar)
-
-For large libraries (`>50` b-roll-eligible clips) OR `user_profile
-= professional` with many named-subject beats OR ambiguous beats
-where the AV view didn't decide: delegate per-beat
-shortlisting to **b-roll scout subagents** per
-`subagent_editor_rules.md` "B-roll scout spawn protocol". Spawn N
-scouts in parallel (Hard Rule 10), one per beat or one per
-cluster, pass them the in-scope source list from
-`source_tags.json`, and consume their ranked shortlists.
-
-Scouts read `<edit>/visual_timeline.md` in their own fresh context
-window for the in-scope sources only — they don't re-read your
-dual-spine timelines. Their job is shortlisting; yours is
-verification + selection + EDL writing. See
-`references/subagent_broll_scout_rules.md` for what scouts do.
-
-For small libraries (`<= 30` clips) and `personal` / `creator`
-bar, do shortlisting in your own context — spawn overhead isn't
-worth it.
+If `<edit>/clip_index/index.json` exists, treat it as a
+shortlisting aid only — the full `merged_timeline.md` read still
+binds before any beat-level matching.
 
 ### 2. Two-stage matching — shortlist first, verify second
 
@@ -264,14 +239,14 @@ The non-negotiable structure:
 
 - **Stage 1 (shortlist):** fast text-overlap query against cached
   evidence (clip-index search, or careful read of
-  `audiovisual_timeline.md` `[…]` visual lines) → top 3-8
+  `merged_timeline.md` `[…]` visual lines) → top 3-8
   candidates per beat.
 - **Stage 2 (verify):** drill into the surrounding visual context
-  in `audiovisual_timeline.md` (and `visual_timeline.md` for full
-  1fps detail) on the top
-  candidate. If verification fails, descend to the next candidate.
-  Optionally invoke `helpers/timeline_view.py` for filmstrip /
-  waveform PNG inspection at high-stakes moments.
+  in `merged_timeline.md` (and `visual_timeline.md` for the full
+  1-fps stream including `(same)` repeats) on the top candidate.
+  If verification fails, descend to the next candidate. Optionally
+  invoke `helpers/timeline_view.py` for filmstrip / waveform PNG
+  inspection at high-stakes moments.
 
 Stage 2 is where quality lives. The shortlist doesn't decide the
 cut; verification does. Skipping stage 2 to "save time" is the
@@ -290,8 +265,9 @@ accepting the first verified hit. Compare:
 - Which is least re-used relative to other recent beats?
 
 Note the comparison in the `reason` field. The user (especially in
-professional / company / client contexts — see `parent_rules.md`'s
-`user_profile` field) reads those notes as confidence.
+professional / company / client contexts — see the `user_profile`
+question in step 4 of the SKILL.md process) reads those notes as
+confidence.
 
 ### 4. Cache discipline
 
@@ -301,13 +277,13 @@ professional / company / client contexts — see `parent_rules.md`'s
   time on unchanged media. Pass `--force` only when source file,
   model settings, dependencies, or matching rules changed.
 - **Rebuild the index only when clip-set / captions / inventory /
-  matching rules change.** Index rebuild is parent-managed; flag it
-  in the return rationale if your matching uncovered new clips not
-  in the index.
-- **Network / OneDrive paths:** if the parent has the project on a
-  synced volume, local scratch / cache may be used for speed, but
-  final deliverables and editable timelines are copied back to the
-  project / edit folder by the parent.
+  matching rules change.** Note in your rationale if matching
+  uncovered new clips not in the index — that's the trigger for a
+  rebuild.
+- **Network / OneDrive paths:** if the project lives on a synced
+  volume, local scratch / cache may be used for speed, but final
+  deliverables and editable timelines are copied back to the
+  project / edit folder.
 
 ### 5. Spend GPU time on evidence, not on re-runs
 
@@ -315,17 +291,15 @@ The general principle behind every cache rule: GPU time should buy
 **better matching evidence** — better visual captions, more accurate
 voiceover timing, stability checks, top-candidate review — not
 brute-force reanalysis of unchanged media. If you find yourself
-asking the parent to re-preprocess clips that haven't changed,
-reframe: what evidence do you actually need, and is it already
-cached?
+re-preprocessing clips that haven't changed, reframe: what evidence
+do you actually need, and is it already cached?
 
 ---
 
 ## How `timelapse_mode` interacts with b-roll selection
 
-The parent's brief carries `timelapse_mode`. It binds the
-time-squeezing section in `subagent_editor_rules.md`, but also
-shapes b-roll selection in two ways:
+`timelapse_mode` binds the time-squeezing section in SKILL.md, but
+also shapes b-roll selection in two ways:
 
 - **`timelapse_mode = false` (default).** Any visually-continuous
   long-stretch clip in the b-roll library — workshop builds,
@@ -337,23 +311,24 @@ shapes b-roll selection in two ways:
   the beat or pick a different shorter clip; do not retime to fit.
 - **`timelapse_mode = true`.** Long-stretch clips in the b-roll
   library are also valid timelapse retime candidates per the
-  time-squeezing rules. If `source_tags.json` tagged a clip as
-  `timelapse`, prefer it for retime over discovering retime
+  time-squeezing rules. If a clip lives under a `timelapse/` (or
+  similar) folder, prefer it for retime over discovering retime
   stretches in arbitrary footage — the user pre-organized the
   retime source.
 
 This matters most for workshop / build / travel / vlog projects
 where the user has long-running source material that could go
-either way. Asking the timelapse question explicitly in step 4 is
-how the parent disambiguates; your job is to honour the answer.
+either way. Asking the timelapse question explicitly in step 4 of
+the SKILL.md process disambiguates; your job is to honour the
+answer.
 
 ---
 
 ## How `user_profile` shapes the bar
 
-The parent's brief includes `user_profile` (one of `personal`,
-`creator`, or `professional` — see `parent_rules.md` step 4 for the
-question template). Use it to set the verification bar:
+`user_profile` is one of `personal`, `creator`, or `professional`
+— ask the user during step 4 of the SKILL.md process. Use it to
+set the verification bar:
 
 - **`personal` / `creator`** — default rules apply; one verified
   candidate per beat is fine, QA notes terse.
@@ -374,18 +349,20 @@ QA / verification dial.
 
 - The **assembly procedure** (script + voiceover, beat segmentation,
   vo-anchored timing, source in-points on spoken words) lives in
-  `references/scripted.md`. If the parent set both `script_mode =
-  true` and `b_roll_mode = true`, read both files. (The
-  common combo.)
+  `references/scripted.md`. When both `script_mode = true` and
+  `b_roll_mode = true`, read both files. (The common combo.)
 - The **pacing preset** binds every range edge — word-boundary
   discipline (Hard Rule 6), 30-200ms padding window (Hard Rule 7),
-  silence-removal threshold (parent's brief has the four numbers).
+  silence-removal threshold (the four numbers from the chosen preset).
+- **Hard Rule 6** — every cut anchor is verified with
+  `helpers/find_quote.py` against the cached transcripts. B-roll
+  cutaway in/out times still snap to word boundaries on whichever
+  source carries the audio bed.
 - **Hard Rule 14** still defers J/L cuts and dissolves. B-roll
   cutaways are hard cuts only; the NLE's caption track and the 30ms
   `afade` pair on each boundary handle the soundscape.
-- **Hard Rule 15** — read BOTH `audiovisual_timeline.md` AND
-  `speech_timeline.md` end-to-end before any beat-level work; the
-  dual spine is your default reading surface.
+- **Hard Rule 15 / 16** — read `merged_timeline.md` end-to-end before
+  any beat-level work; that's your default reading surface.
 
 ---
 
@@ -400,7 +377,7 @@ QA / verification dial.
 - **Repeating distinctive visuals within a 30-second window.**
   Diversify unless the user explicitly asked for the callback.
 - **Substituting "close enough" for a named subject silently.** Note
-  the compromise in the `reason` field; let the parent flag it.
+  the compromise in the `reason` field so the user can flag it.
 - **Putting people-heavy crowd shots on subject-named beats.** Crowd
   shots belong on crowd-named beats.
 - **Cutting the b-roll *before* the named word lands.** Land the
@@ -409,15 +386,17 @@ QA / verification dial.
 - **Skipping QA notes on named-subject beats.** Revisions need them.
 - **Re-running preprocessing with `--force` to "refresh" matching.**
   The cache is correct; bypass only on real input change.
-- **Ignoring `source_tags.json` and proposing A-roll clips as
-  cutaways.** The user organized their footage; respect the tags.
-  A-roll-tagged clips are the speech bed, not the cutaway library.
+- **Ignoring folder organization and proposing A-roll clips as
+  cutaways.** The user organized their footage; respect the folder
+  layout you inventoried in step 1. Clips under an `a_roll/` folder
+  are the speech bed, not the cutaway library.
 - **Retiming a b-roll candidate to fit a beat when
   `timelapse_mode = false`.** The user opted out of timelapses for
   this session. Pick a different clip or shorter range; never
   silently retime.
-- **Skipping the b-roll scout protocol on a 100-clip professional
-  brief.** That's where scouts pay off most. Verification +
-  detailed QA notes the professional bar requires are easier to
-  write when scouts have done the shortlisting in their own
-  fresh-context windows.
+- **Skipping the clip-index build on a 100-clip professional
+  project.** That's where the index pays off most — text-overlap
+  shortlisting against cached captions cuts beat-matching time by
+  ~10x on large libraries, and the verification + detailed QA notes
+  the professional bar requires are easier to write when shortlisting
+  is fast.

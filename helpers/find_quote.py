@@ -3,22 +3,24 @@
 Why this exists
 ===============
 
-The editor sub-agent reads two markdown views end-to-end every spawn —
-`<edit>/audiovisual_timeline.md` (audio + visual lanes interleaved) and
-`<edit>/speech_timeline.md` (phrase-grouped transcripts with outer-
-aligned `floor(start)..ceil(end)` integer ranges). Both views are
-deliberately **token-cheap**: speech is grouped into phrase lines, time
-is rounded to whole seconds, and the per-word boundary information
-that lives in `<edit>/transcripts/<stem>.json` is dropped on the way
-into the markdown. That trade-off is correct for *reading* the
-timelines but useless when the editor has to set an actual EDL
-in/out point — Hard Rule 6 demands cuts land on word boundaries, and
-those boundaries are sub-second.
+The agent reads `<edit>/merged_timeline.md` end-to-end every session —
+all three lanes (speech, audio events, visual captions) interleaved
+chronologically by timestamp into one file. Speech phrases on those
+lines wear an outer-aligned `M:SS-M:SS` range (start floor, end
+ceil), so the integer span always fully encloses the underlying float
+[start, end] of the phrase in `<edit>/transcripts/<stem>.json`. The
+merged view is deliberately **token-cheap**: time is rounded to whole
+seconds, words are concatenated into phrases, and the per-word
+boundary information that lives in `transcripts/<stem>.json` is
+dropped on the way into the markdown. That trade-off is correct for
+*reading* the timeline but useless when the agent has to set an
+actual EDL in/out point — Hard Rule 6 demands cuts land on word
+boundaries, and those boundaries are sub-second.
 
-Historically, the editor's only path was "open the transcripts JSON
+Historically, the agent's only path was "open the transcripts JSON
 and grep / hand-walk the words[] array." That works but is slow,
 error-prone, off-by-one prone, and burns context on JSON noise the
-editor doesn't need (`type: "spacing"` rows, full duration headers,
+agent doesn't need (`type: "spacing"` rows, full duration headers,
 etc.). This helper replaces that step with a single CLI call:
 
     python helpers/find_quote.py \\
@@ -40,18 +42,19 @@ the millisecond:
           "last_word":  {"text": "hook.",     "start": 2.508, "end": 3.198},
           "prev_word":  {"text": "to",        "start": 1.021, "end": 1.166},
           "next_word":  {"text": "But",       "start": 4.418, "end": 5.246},
-          "words":      [...sequence the editor matched...],
+          "words":      [...sequence the agent matched...],
           "text":       "fabricate A hook.",
           "speaker_id": null
         }
       ]
     }
 
-The editor reads `first_word.start` as the in-point candidate and
+The agent reads `first_word.start` as the in-point candidate and
 `last_word.end` as the out-point candidate, then applies the pacing
-preset's lead/trail margins (with the next_word.start / prev_word.end
-clamp to leave 60ms for the `afade` pair) and emits the EDL range.
-No greps. No off-by-one. No partial JSON parses.
+preset's lead/trail margins (clamped against `cut_window.safe_in_s` /
+`cut_window.safe_out_s` so the lead/trail pads leave at least 60ms of
+true silence for the `afade` pair) and emits the EDL range. No greps.
+No off-by-one. No partial JSON parses.
 
 Calling shapes
 ==============
@@ -59,14 +62,16 @@ Calling shapes
     # 1. Quote-only (no range filter, hits all matches across the clip).
     find_quote.py --edit-dir <edit> --clip <stem> --quote "lock in"
 
-    # 2. Quote bounded by a speech_timeline.md integer range. The range
-    #    is OUTER-ALIGNED — start floors, end ceils — so it always
-    #    contains the actual float span. Pass it verbatim.
+    # 2. Quote bounded by an integer range read straight off the
+    #    `"..."` line in merged_timeline.md (or speech_timeline.md
+    #    drill-down). The range is OUTER-ALIGNED — start floors, end
+    #    ceils — so it always contains the actual float span. Pass it
+    #    verbatim.
     find_quote.py --edit-dir <edit> --clip <stem> \\
                   --range 0:02-0:18 --quote "lock in"
 
     # 3. Range-only — return every word inside the range, plus the
-    #    bracketing prev/next. Useful when the editor wants to see the
+    #    bracketing prev/next. Useful when the agent wants to see the
     #    full sub-second word stream for a phrase.
     find_quote.py --edit-dir <edit> --clip <stem> --range 0:02-0:18
 
@@ -77,7 +82,8 @@ Calling shapes
 
 Time arguments accept `M:SS`, `MM:SS`, `H:MM:SS`, integer seconds, or
 floating-point seconds (e.g. `1.234`). The integer-rounded ranges out
-of `speech_timeline.md` are always safe to pass through.
+of `merged_timeline.md` (and the `speech_timeline.md` drill-down) are
+always safe to pass through.
 
 Performance
 ===========
@@ -91,7 +97,7 @@ linear in the number of words[] entries (no copies of the whole
 JSON object) and bounded by one transcript at a time.
 
 The helper is self-contained: no third-party dependencies, no model
-loads, no network calls. Safe to invoke from any sub-agent context
+loads, no network calls. Safe to invoke from any subprocess context
 without warming up a venv.
 """
 
@@ -118,8 +124,8 @@ from typing import Any
 # Python on Windows defaults stdout/stderr to the legacy console
 # codepage (cp1252-ish), which mangles fancy quotes, em-dashes, and
 # anything outside Latin-1 in the JSON output. Reconfigure both
-# streams to UTF-8 before any print so the editor sub-agent (which
-# pipes our output back through json.loads) never has to worry about
+# streams to UTF-8 before any print so the agent (which pipes our
+# output back through json.loads) never has to worry about
 # encoding-induced parse failures.
 # ──────────────────────────────────────────────────────────────────────
 try:
@@ -485,8 +491,8 @@ def _assemble_match(
     #     trail_margin_used = min(target_trail_margin, trail_silence_s - 0.06)
     #
     # leaving 60ms of true silence for the 30ms `afade` pair on
-    # each boundary (per the worked example in
-    # subagent_editor_rules.md). Same on the lead side.
+    # each boundary (per the "Word-boundary verification" worked
+    # example in SKILL.md). Same on the lead side.
     lead_silence_s: float | None
     if prev_w is not None:
         lead_silence_s = max(0.0, float(first["start"]) - float(prev_w["end"]))
@@ -585,9 +591,9 @@ def _build_argparser() -> argparse.ArgumentParser:
         prog="find_quote.py",
         description=(
             "Word-precise quote / range crawler over Parakeet "
-            "transcript JSON. Used by the editor sub-agent for cut "
-            "anchor verification — see references/subagent_editor_"
-            "rules.md 'Word-boundary verification'."
+            "transcript JSON. Used by the agent for cut anchor "
+            "verification — see SKILL.md 'Word-boundary verification' "
+            "for the workflow."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

@@ -7,59 +7,68 @@ After preprocess[_batch].py finishes, every video has THREE JSON files:
     <edit>/visual_caps/<stem>.json   — visual_lane        (Florence-2 captions)
 
 This script fans those out into FOUR markdown timelines that the SKILL
-points Claude at:
+points the agent at:
 
-    <edit>/speech_timeline.md       — phrase-grouped transcripts (per file)
-    <edit>/audio_timeline.md        — vocab-scored sound events  (per file)
-    <edit>/visual_timeline.md       — 1-second captions, dedup'd (per file)
-    <edit>/audiovisual_timeline.md  — audio + visual interleaved by timestamp
-                                      (NO speech — speech lives in its own
-                                      file at sub-second precision)
+    <edit>/merged_timeline.md       — DEFAULT reading surface; speech +
+                                      audio + visual interleaved by
+                                      timestamp into one file (the
+                                      "single triangulated picture" the
+                                      agent reasons over)
+    <edit>/speech_timeline.md       — phrase-grouped transcripts (lane 1, drill-down)
+    <edit>/audio_timeline.md        — vocab-scored sound events  (lane 2, drill-down)
+    <edit>/visual_timeline.md       — 1-second captions, dedup'd (lane 3, drill-down)
 
-The editor and vocab sub-agents read **both** `audiovisual_timeline.md`
-AND `speech_timeline.md` end-to-end, line by line. The split exists
-because speech is the editorial spine — it carries word-level timestamps
-that need their own range/floor/ceil rounding rules — and interleaving
-phrase-long speech blocks against per-second visual captions made the
-merged view harder to scan without buying anything (the editor still
-had to cross-reference `speech_timeline.md` for accurate spans). Two
-sibling files, both mandatory, no ambiguity. The per-lane drill-down
-files (`audio_timeline.md`, `visual_timeline.md`) stay on disk for the
-moments the AV view is ambiguous and the editor zooms in on one lane.
+The agent reads **`merged_timeline.md` end-to-end** every session — one
+file, every event in chronological order, all three lanes triangulated.
+The per-lane drill-down files stay on disk for the moments the merged
+view is ambiguous and the agent zooms in on one lane (word-level
+timing detail in speech, the full 1-fps caption stream including
+`(same)` repeats in visual, full per-window CLAP scoring in audio).
 
-The interleaved AV view looks like:
+For sub-second word-precise EDL anchors, the agent uses
+`helpers/find_quote.py` against the underlying transcript JSON — the
+merged view is intentionally rounded to whole seconds for token
+economy, and `find_quote.py` returns first/last/prev/next word
+boundaries with millisecond precision plus a `cut_window` (safe_in_s,
+safe_out_s) ready for the pacing-preset margin clamp.
 
+The merged view looks like:
+
+    0:02 [Workbench hand tools laid brown wooden surface.]
+    0:03-0:18 "okay now we're going to drill the pilot holes"
     0:12 (cordless drill 0.42, drill press 0.31)
     0:12 [a person holding a cordless drill above a metal panel]
     0:13 + [hand reaching for a deburring tool on the workbench]
-
-`speech_timeline.md` looks like:
-
-    0:11-0:18 "okay now we're going to drill the pilot holes"
     0:19-0:21 "good, pass me the deburring tool"
 
-Speech timestamps round OUTWARD (start floor, end ceil) so the integer
-range always fully encloses the actual word-level span — this lets the
-editor (and `helpers/find_quote.py`) take an integer range from
-`speech_timeline.md` and know it is a guaranteed superset of the
-matching window in `transcripts/<stem>.json`, no off-by-one fences.
+Bracket conventions are the type marker — `"..."` for speech, `(...)`
+for audio events, `[...]` for visual captions — so the agent can scan
+without per-line `speech:` / `audio:` / `visual:` prefixes burning
+tokens. Speech phrases carry an outer-aligned `M:SS-M:SS` range
+(start floor, end ceil) — the integer span always fully encloses the
+underlying float [start, end] in `transcripts/<stem>.json`, so any
+range read out of the merged file can be passed verbatim to
+`find_quote.py --range` without off-by-one fences. Audio and visual
+events sit on point timestamps (their windows / 1-fps stride don't
+need range display).
 
-The phrase-grouping logic for speech_timeline.md is reused verbatim from
-the old pack_transcripts.py so existing prompts that reference packed
-transcripts continue to work — only the filename changed.
+The phrase-grouping logic for `speech_timeline.md` is reused verbatim
+from the old pack_transcripts.py so existing prompts that reference
+packed transcripts continue to work — only the filename changed.
 
-The audio lane emits PANNs-shape (label, score) events scored by a CLAP
-encoder against a vocabulary list (see helpers/audio_lane.py). For
-backward compatibility with caches still on disk from the abandoned
-Audio Flamingo 3 migration, a separate caption-shape renderer is kept
-behind a `model` sniff and removed once those caches age out.
+The audio lane emits PANNs-shape (label, score) events scored by a
+CLAP encoder against a vocabulary list (see helpers/audio_lane.py).
+For backward compatibility with caches still on disk from the
+abandoned Audio Flamingo 3 migration, a separate caption-shape
+renderer is kept behind a `model` sniff and removed once those caches
+age out.
 
 CLI:
-    python helpers/pack_timelines.py --edit-dir <dir> [--no-audiovisual]
+    python helpers/pack_timelines.py --edit-dir <dir> [--no-merge]
 
-By default emits all four files. Pass `--no-audiovisual` (legacy alias
-`--no-merge`) to skip the AV interleaved view (rare — only useful when
-the per-lane files are all you want).
+By default emits all four files. Pass `--no-merge` to skip the merged
+interleaved view (rare — only useful when the per-lane files are all
+you want).
 """
 
 from __future__ import annotations
@@ -279,11 +288,10 @@ def group_into_phrases(
 
 
 # ---------------------------------------------------------------------------
-# Time format helper for audiovisual_timeline — alias to the shared
-# compact `M:SS` / `H:MM:SS` formatter above. Kept as a thin alias
-# because the AV-timeline call sites read more clearly with `_hms(t)`
-# than with `_fmt_ts(t)`, and renaming all of them would balloon the
-# diff for no
+# Time format helper for merged_timeline — alias to the shared compact
+# `M:SS` / `H:MM:SS` formatter above. Kept as a thin alias because the
+# merged-timeline call sites read more clearly with `_hms(t)` than with
+# `_fmt_ts(t)`, and renaming all of them would balloon the diff for no
 # semantic gain.
 # ---------------------------------------------------------------------------
 
@@ -472,9 +480,9 @@ def _pack_speech(transcripts_dir: Path, silence_threshold: float) -> str:
         f"sub-second word span in `transcripts/<stem>.json`, so any "
         f"integer range from this file can be handed to "
         f"`helpers/find_quote.py` (or scanned by hand) without "
-        f"off-by-one fences. Speech is NOT mirrored into "
-        f"`audiovisual_timeline.md` — that file is audio + visual "
-        f"only. Editor / vocab sub-agents read BOTH files end-to-end."
+        f"off-by-one fences. Drill-down only — the agent's primary "
+        f"reading surface is `merged_timeline.md`, which carries the "
+        f"same phrase ranges interleaved with audio + visual events."
     )
     lines.append("")
 
@@ -545,7 +553,7 @@ def _render_audio_events(events: list[dict], lines: list[str]) -> None:
 
     Format: `M:SS-M:SS (label score, label score, ...)`. The
     surrounding parens identify this as audio across all timeline
-    files (matches the audiovisual_timeline.md convention); the
+    files (matches the merged_timeline.md convention); the
     timestamp is bare, no `[…]` wrapper.
 
     Co-occurring labels in the same window collapse onto one line so a
@@ -598,7 +606,7 @@ def _pack_audio(audio_tags_dir: Path) -> str:
         "Per-window sound events scored by LAION CLAP against a vocabulary "
         "list. Each line: `M:SS-M:SS (label score, label score, ...)` — "
         "the parens are the audio type marker (consistent with "
-        "`audiovisual_timeline.md`). Scores are cosine similarities "
+        "`merged_timeline.md`). Scores are cosine similarities "
         "(typically 0.10-0.45 — higher is more confident). CLAP is "
         "much sharper than the abandoned PANNs ontology but still "
         "noisy on edge classes; if labels look wrong for THIS video, "
@@ -706,7 +714,7 @@ def _pack_visual(visual_caps_dir: Path) -> str:
     lines.append(
         "Format: `M:SS [caption]` per second (or `H:MM:SS [caption]` "
         "once a clip exceeds 1h). Square brackets are the type marker "
-        "— consistent with `audiovisual_timeline.md` so the editor "
+        "— consistent with `merged_timeline.md` so the agent "
         "can scan both files with the same parser in its head. "
         "Static/slow scenes collapse to `(same)`. Slowly-evolving "
         "scenes emit only the NEW sentences with a `+ ` prefix "
@@ -769,63 +777,82 @@ def _pack_visual(visual_caps_dir: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Audiovisual interleave — audio + visual lanes by timestamp.
+# Merged interleave — speech + audio + visual lanes by timestamp.
 #
-# Speech is intentionally OMITTED from this view. Phrase-long speech
-# blocks rendered against per-second visual captions made the merged
-# view harder to scan without buying anything (the editor still had to
-# cross-reference `speech_timeline.md` for accurate spans because the
-# merged view only carried phrase START times). Splitting the lanes
-# cleanly — speech in its own file at outer-aligned integer ranges,
-# audio + visual interleaved here — gives both the editor and vocab
-# sub-agents two unambiguous reading surfaces to walk end-to-end.
+# This is the agent's DEFAULT reading surface. One file, one full read,
+# every event in chronological order across all three lanes — speech as
+# the editorial spine (`"..."` quoted phrases with outer-aligned
+# `M:SS-M:SS` ranges), audio events as `(label, label, ...)` per CLAP
+# window, visual captions as `[caption text]` per 1fps Florence frame
+# (delta-dedup'd so visually static stretches collapse out).
+#
+# The per-lane drill-down files (`speech_timeline.md`, `audio_timeline.md`,
+# `visual_timeline.md`) stay on disk for moments the merged view is
+# ambiguous and the agent zooms in on one lane (word-level timing,
+# `(same)` repeats, full per-window CLAP scoring). For sub-second
+# word-precise EDL anchors the agent uses `helpers/find_quote.py`
+# against `transcripts/<stem>.json` — never grep / hand-parse those
+# JSONs directly.
 # ---------------------------------------------------------------------------
 
-def _build_audiovisual(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
-    """Walk the audio_tags + visual_caps caches in lock-step per video
-    and emit one timestamp-sorted (audio + visual) stream per video.
-
-    Speech is NOT included — read `speech_timeline.md` alongside this
-    file. Both files are mandatory full reads for the editor and vocab
-    sub-agents.
+def _build_merged(
+    edit_dir: Path,
+    silence_threshold: float,
+    *,
+    prefer_caveman: bool = True,
+) -> str:
+    """Walk transcripts + audio_tags + visual_caps in lock-step per
+    video and emit one timestamp-sorted (speech + audio + visual)
+    stream per video — `merged_timeline.md`.
 
     `prefer_caveman` controls whether we read the caveman-compressed
     visual caps (default) or the raw paragraphs.
     """
+    transcripts = edit_dir / "transcripts"
     audio_tags = edit_dir / "audio_tags"
     visual_caps = _resolve_visual_caps_dir(edit_dir, prefer_caveman=prefer_caveman)
 
-    # Pull stems from BOTH lanes that contribute to this view PLUS the
-    # transcripts dir — the latter so audio-only / visual-skipped clips
-    # that still have speech show up as `## stem` headers (with
-    # `_no AV events_` underneath) in the same order the speech file
-    # uses them. Keeps the two files structurally aligned for the
-    # editor sub-agent reading them line-by-line.
-    transcripts = edit_dir / "transcripts"
+    # Union the stems contributing to ANY lane so audio-only or
+    # visual-skipped clips (e.g. voiceover .wav with no Florence pass)
+    # still get a `## <stem>` header — keeps the merged file
+    # structurally aligned with the per-lane drill-downs.
     stems: set[str] = set()
-    for d in (audio_tags, visual_caps, transcripts):
+    for d in (transcripts, audio_tags, visual_caps):
         if d.is_dir():
             stems.update(p.stem for p in d.glob("*.json"))
     if not stems:
-        return "# Audiovisual timeline\n\n_no lane outputs to merge_\n"
+        return "# Merged timeline\n\n_no lane outputs to merge_\n"
 
     out: list[str] = []
-    out.append("# Audiovisual timeline")
+    out.append("# Merged timeline (speech + audio + visual)")
     out.append("")
     out.append(
-        "Audio events + visual captions interleaved by timestamp. "
+        "All three lanes interleaved chronologically by timestamp. "
         "Each line is `M:SS` (or `H:MM:SS` once a clip exceeds 1h) "
-        "followed by ONE of two event types, distinguishable by the "
-        "bracket style (no `visual:` / `audio:` prefixes — the "
-        "brackets are the type marker, save tokens):\n"
-        "  - `(...)`  audio event(s) (CLAP zero-shot labels, comma-sep)\n"
-        "  - `[...]`  visual caption (Florence-2, caveman-compressed)\n"
+        "followed by ONE of three event types, distinguishable by the "
+        "bracket style (no `speech:` / `audio:` / `visual:` prefixes — "
+        "the brackets are the type marker, save tokens):\n"
+        "  - `\"...\"`   speech phrase (Parakeet, outer-aligned `M:SS-M:SS` "
+        "range — start floors, end ceils, integer span fully encloses "
+        "the underlying float [start, end] in `transcripts/<stem>.json`)\n"
+        "  - `(...)`   audio event(s) (CLAP zero-shot labels, comma-sep, "
+        "scored against the agent-curated vocabulary)\n"
+        "  - `[...]`   visual caption (Florence-2, caveman-compressed)\n"
         "\n"
-        "Speech is NOT in this file — read `speech_timeline.md` "
-        "alongside. Editor and vocab sub-agents read BOTH files "
-        "end-to-end, line by line; the per-clip `## <stem>` headers "
-        "are aligned across both files so the two views can be "
-        "scrolled in parallel.\n"
+        "**This is the default reading surface — read end-to-end, every "
+        "spawn.** The per-lane files (`speech_timeline.md`, "
+        "`audio_timeline.md`, `visual_timeline.md`) stay on disk as "
+        "drill-down references for moments the merged view is ambiguous "
+        "and you need to zoom in on one lane.\n"
+        "\n"
+        "**For sub-second word-precise cut anchors, use "
+        "`helpers/find_quote.py`** — pass the clip stem, the integer "
+        "`M:SS-M:SS` range read straight off the `\"...\"` line "
+        "(guaranteed superset of the float span), and a quote substring "
+        "to get back word-precise `{first_word, last_word, prev_word, "
+        "next_word, lead_silence_s, trail_silence_s, cut_window}` JSON "
+        "ready for the pacing-preset margin clamp. Never grep / "
+        "hand-parse `transcripts/<stem>.json` directly.\n"
         "\n"
         "A visual line prefixed with `+ ` is a delta — only the NEW "
         "sentences vs the prior caption are shown (sentences that "
@@ -837,13 +864,60 @@ def _build_audiovisual(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
     )
     out.append("")
 
+    # ── Sort stability for same-timestamp collisions ──
+    # Within identical start times we want a predictable visual order:
+    # visual context first (sets the scene), then audio events
+    # (soundscape colour), then speech (the editorial spine — readers
+    # naturally land on the quote last). Python's sort is stable, so
+    # we append in (visual, audio, speech) order and the tuple sort
+    # by start time alone preserves it within ties.
     for stem in sorted(stems):
         out.append(f"## {stem}")
         events: list[tuple[float, str]] = []  # (t, line)
 
-        # ── Audio: one line per merged CLAP event range. Co-occurring   ──
-        # labels in the same window collapse to one comma-separated tag  ──
-        # so the merged stream stays scannable.                          ──
+        # ── Visual: raw captions, run through the sentence-level fuzzy ──
+        # delta dedup. We work off `captions` (the raw per-frame list) so
+        # the dedup runs on actual content, not on the byte-exact pre-
+        # collapse from visual_lane. Frames that fully overlap the prior
+        # caption are dropped entirely (mode == "same" / "empty"); deltas
+        # carry a `+ ` prefix so the agent can see at a glance which
+        # rows are partial vs full re-descriptions.
+        # Format: `M:SS [caption text]` for full re-descriptions, or
+        # `M:SS + [delta sentences]` when the caption is a partial
+        # delta against the prior frame. The square brackets are the
+        # type marker; the leading `+ ` lives OUTSIDE the brackets so
+        # the delta nature is visible at the left margin without the
+        # agent having to peek inside the bracket text. The
+        # `_delta_caption` helper emits its display text already
+        # prefixed with `+ ` in delta mode — strip that prefix so we
+        # can re-attach it cleanly outside the brackets.
+        vp = visual_caps / f"{stem}.json"
+        if vp.exists():
+            data = json.loads(vp.read_text(encoding="utf-8"))
+            caps = data.get("captions") or data.get("captions_dedup") or []
+            prev_norms: list[str] = []
+            for c in caps:
+                t = float(c.get("t", 0.0))
+                raw = (c.get("text") or "").strip().replace("\n", " ")
+                raw = _clean_caption_text(raw)
+                # Legacy byte-exact `(same)` survivors: skip — they don't
+                # add information and we don't want them mucking with the
+                # prev_norms baseline.
+                if raw == "(same)":
+                    continue
+                mode, prev_norms, display = _delta_caption(raw, prev_norms)
+                if mode in ("same", "empty"):
+                    continue
+                if mode == "delta" and display.startswith("+ "):
+                    body = display[2:]
+                    line = f"{_hms(t)} + [{body}]"
+                else:
+                    line = f"{_hms(t)} [{display}]"
+                events.append((t, line))
+
+        # ── Audio: one line per merged CLAP event range. Co-occurring  ──
+        # labels in the same window collapse to one comma-separated tag ──
+        # so the merged stream stays scannable.                         ──
         ap = audio_tags / f"{stem}.json"
         if ap.exists():
             data = json.loads(ap.read_text(encoding="utf-8"))
@@ -880,49 +954,51 @@ def _build_audiovisual(edit_dir: Path, *, prefer_caveman: bool = True) -> str:
                         s, f"{_hms(s)} ({text})",
                     ))
 
-        # ── Visual: raw captions, run through the sentence-level fuzzy ──
-        # delta dedup. We work off `captions` (the raw per-frame list) so
-        # the dedup runs on actual content, not on the byte-exact pre-
-        # collapse from visual_lane. Frames that fully overlap the prior
-        # caption are dropped entirely (mode == "same" / "empty"); deltas
-        # carry a `+ ` prefix so the editor can see at a glance which
-        # rows are partial vs full re-descriptions.
-        # Format: `M:SS [caption text]` for full re-descriptions, or
-        # `M:SS + [delta sentences]` when the caption is a partial
-        # delta against the prior frame. The square brackets are the
-        # type marker (no `visual:` prefix); the leading `+ ` lives
-        # OUTSIDE the brackets so the delta nature is visible at the
-        # left margin without the editor having to peek inside the
-        # bracket text. The `_delta_caption` helper emits its display
-        # text already prefixed with `+ ` in delta mode — strip that
-        # prefix so we can re-attach it cleanly outside the brackets.
-        vp = visual_caps / f"{stem}.json"
-        if vp.exists():
-            data = json.loads(vp.read_text(encoding="utf-8"))
-            caps = data.get("captions") or data.get("captions_dedup") or []
-            prev_norms: list[str] = []
-            for c in caps:
-                t = float(c.get("t", 0.0))
-                raw = (c.get("text") or "").strip().replace("\n", " ")
-                raw = _clean_caption_text(raw)
-                # Legacy byte-exact `(same)` survivors: skip — they don't
-                # add information and we don't want them mucking with the
-                # prev_norms baseline.
-                if raw == "(same)":
-                    continue
-                mode, prev_norms, display = _delta_caption(raw, prev_norms)
-                if mode in ("same", "empty"):
-                    continue
-                if mode == "delta" and display.startswith("+ "):
-                    body = display[2:]
-                    line = f"{_hms(t)} + [{body}]"
+        # ── Speech: phrase-grouped Parakeet, outer-aligned ranges ──
+        # Phrases break on silence ≥ silence_threshold OR speaker
+        # change (same logic as `_pack_speech`, reused via the shared
+        # `group_into_phrases`). Each phrase emits one line at its
+        # start timestamp. Format mirrors `speech_timeline.md` so the
+        # agent reads the same shape across both files:
+        #   `M:SS-M:SS [Sn] "phrase text"`
+        # The `[Sn]` speaker tag is omitted on undiarized inputs to
+        # save tokens. Sort key is `phrase['start']` (float) — speech
+        # appended last so when two phrases share the same integer
+        # second with a visual / audio event, speech sorts after them
+        # for visual-first / audio-mid / speech-last ordering within
+        # ties.
+        tp = transcripts / f"{stem}.json"
+        if tp.exists():
+            data = json.loads(tp.read_text(encoding="utf-8"))
+            words = data.get("words", [])
+            phrases = group_into_phrases(words, silence_threshold)
+            for ph in phrases:
+                spk = ph.get("speaker_id")
+                if spk is not None:
+                    spk_str = str(spk)
+                    if spk_str.startswith("speaker_"):
+                        spk_str = spk_str[len("speaker_"):]
+                    spk_tag = f" [S{spk_str}]"
                 else:
-                    line = f"{_hms(t)} [{display}]"
-                events.append((t, line))
+                    spk_tag = ""
+                start = float(ph["start"])
+                end = float(ph["end"])
+                # Outer-aligned `M:SS-M:SS` so the integer span always
+                # fully encloses the float [start, end] — `find_quote.py
+                # --range <span>` is then guaranteed to enclose every
+                # word of the phrase without off-by-one fences.
+                events.append((
+                    start,
+                    f"{_fmt_range_outer(start, end)}{spk_tag} \"{ph['text']}\"",
+                ))
 
+        # Stable sort by start time. Within identical timestamps the
+        # append order (visual → audio → speech) is preserved by
+        # Python's stable timsort, giving the desired visual-first /
+        # speech-last ordering on collisions.
         events.sort(key=lambda x: x[0])
         if not events:
-            out.append("  _no AV events_")
+            out.append("  _no events on any lane_")
         else:
             for _t, line in events:
                 out.append(f"  {line}")
@@ -945,26 +1021,26 @@ def main() -> None:
                          "audio_tags/, visual_caps/")
     ap.add_argument("--silence-threshold", type=float, default=0.5,
                     help="Break speech phrases on silences >= this (default 0.5s)")
-    # `audiovisual_timeline.md` is one of the two mandatory reading
-    # surfaces for the editor / vocab sub-agents (the other is
-    # `speech_timeline.md`). We emit it by default. `--no-audiovisual`
-    # (legacy alias `--no-merge`) is the opt-out for the rare case
-    # where only the per-lane files are wanted.
-    ap.add_argument("--no-audiovisual", "--no-merge",
-                    dest="audiovisual", action="store_false",
+    # `merged_timeline.md` is the agent's DEFAULT reading surface —
+    # speech + audio + visual interleaved chronologically into one
+    # file. We emit it by default. `--no-merge` (legacy alias
+    # `--no-audiovisual`) is the opt-out for the rare case where only
+    # the per-lane drill-down files are wanted.
+    ap.add_argument("--no-merge", "--no-audiovisual",
+                    dest="merge", action="store_false",
                     default=True,
-                    help="Skip audiovisual_timeline.md (the audio + "
-                         "visual interleaved view). `--no-merge` is "
-                         "kept as a legacy alias. Default is to emit.")
-    ap.add_argument("--audiovisual", "--merge",
-                    dest="audiovisual", action="store_true",
+                    help="Skip merged_timeline.md (the speech + audio + "
+                         "visual interleaved view). `--no-audiovisual` "
+                         "is kept as a legacy alias. Default is to emit.")
+    ap.add_argument("--merge", "--audiovisual",
+                    dest="merge", action="store_true",
                     help="(default, no-op flag for symmetry with "
-                         "--no-audiovisual / legacy --no-merge.)")
+                         "--no-merge / legacy --no-audiovisual.)")
     # ── Caveman compression (default ON) ──
     # Strips stop words / determiners / auxiliaries / weak adverbs from
     # every Florence-2 caption via spaCy before packing. Caches output
     # in <edit>/comp_visual_caps/ keyed by source mtime + caveman
-    # version + lang. Saves 40-60% of audiovisual_timeline.md tokens
+    # version + lang. Saves 40-60% of merged_timeline.md tokens
     # with zero loss of editorial signal. See helpers/caveman_compress.py
     # for the full filter list.
     ap.add_argument("--no-caveman", dest="caveman", action="store_false",
@@ -1007,7 +1083,7 @@ def main() -> None:
               file=sys.stderr)
 
     # ── Pre-pack: caveman compression on visual_caps ──
-    # Has to happen BEFORE _pack_visual / _build_audiovisual so the
+    # Has to happen BEFORE _pack_visual / _build_merged so the
     # downstream readers see the freshly-compressed comp_visual_caps/.
     # Skipped silently when --no-caveman OR when there are no
     # visual_caps to compress (e.g. visual lane never ran).
@@ -1053,20 +1129,25 @@ def main() -> None:
 
     written = [out_speech, out_audio, out_visual]
 
-    if args.audiovisual:
-        out_av = edit_dir / "audiovisual_timeline.md"
-        out_av.write_text(
-            _build_audiovisual(edit_dir, prefer_caveman=args.caveman),
+    if args.merge:
+        out_merged = edit_dir / "merged_timeline.md"
+        out_merged.write_text(
+            _build_merged(
+                edit_dir,
+                args.silence_threshold,
+                prefer_caveman=args.caveman,
+            ),
             encoding="utf-8",
         )
-        written.append(out_av)
+        written.append(out_merged)
 
-        # Legacy `merged_timeline.md` cleanup — the rename happened
-        # within a single conversation; old caches in long-lived edit
-        # folders would otherwise confuse the editor sub-agent (which
-        # is now told to read `audiovisual_timeline.md`). Best-effort
-        # delete; ignore failures (read-only mounts, locked files).
-        legacy = edit_dir / "merged_timeline.md"
+        # Legacy `audiovisual_timeline.md` cleanup — the rename
+        # happened mid-conversation; old caches in long-lived edit
+        # folders would otherwise leave stale AV-only files alongside
+        # the new merged file and confuse the agent (which is now
+        # told to read `merged_timeline.md`). Best-effort delete;
+        # ignore failures (read-only mounts, locked files).
+        legacy = edit_dir / "audiovisual_timeline.md"
         if legacy.exists():
             try:
                 legacy.unlink()
