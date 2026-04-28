@@ -1,20 +1,20 @@
-# Subtitles (always on)
+# Subtitles (when requested)
 
-> Loaded on demand from `SKILL.md`. The SRT sidecar is **always emitted** by `helpers/export_fcpxml.py` — read for caption style, chunking, or NLE pickup. Skip SRT only when subtitles are out of scope (silent cinema, lyric-only music video) via `--no-srt`.
+> Loaded on demand from `SKILL.md`. Read this only when the user asks for burned or imported subtitles.
 
-Three dimensions worth reasoning about:
+Subtitles have three dimensions worth reasoning about:
 
-- **Chunking** — 1 / 2 / 3 / sentence-per-line. Tight for fast social, longer for narrative.
-- **Case** — UPPERCASE / Title Case / Sentence case. Upper reads as urgency; sentence reads as documentary.
-- **Placement** — `MarginV` (margin from bottom). Higher lifts captions into frame, off device-UI safe areas.
+- **Chunking** — 1 / 2 / 3 / sentence-per-line. Tight chunks for fast-paced social, longer chunks for narrative.
+- **Case** — UPPERCASE / Title Case / Natural sentence case. Uppercase reads as urgency; sentence case reads as documentary.
+- **Placement** — `MarginV` (margin from bottom). Higher `MarginV` lifts subtitles into the frame, away from device-UI safe areas.
 
-Combo depends on content. Pick deliberately, don't default.
+The right combo depends on content. Pick deliberately, don't default.
 
 ## Worked styles — pick, adapt, or invent
 
 ### `bold-overlay` — short-form tech launch, fast-paced social
 
-2-word chunks, UPPERCASE, break on punctuation, Helvetica 18 Bold, white-on-outline, `MarginV=35`. `helpers/build_srt.py` emits SRT in this rhythm — style in the NLE's caption panel.
+2-word chunks, UPPERCASE, break on punctuation, Helvetica 18 Bold, white-on-outline, `MarginV=35`. `render.py` ships with this as `SUB_FORCE_STYLE`.
 
 ```
 FontName=Helvetica,FontSize=18,Bold=1,
@@ -25,7 +25,7 @@ Alignment=2,MarginV=35
 
 ### `natural-sentence` — narrative, documentary, education
 
-4–7 word chunks, sentence case, break on natural pauses, `MarginV=60–80`, larger font, wider max-width. No shipped force_style — design one if needed. Starting point:
+4–7 word chunks, sentence case, break on natural pauses, `MarginV=60–80`, larger font for readability, slightly wider max-width. No shipped force_style — design one if you need it. Suggested starting point:
 
 ```
 FontName=Inter,FontSize=22,Bold=0,
@@ -34,44 +34,19 @@ BorderStyle=1,Outline=1,Shadow=0,
 Alignment=2,MarginV=70
 ```
 
-Invent a third if neither fits.
+Invent a third style if neither fits.
 
 ## Hard rules
 
-1. **Master SRT uses output-timeline offsets** (Hard Rule 5): `output_time = word.start - segment_start + segment_offset`. Else captions drift across the cut.
-2. **Word-level boundaries from speech lane.** Never invent chunk timing — Parakeet word timestamps give exact in/out. Group N words into a line; line `start` is `words[0].start`, `end` is `words[-1].end`.
+1. **Subtitles are applied LAST in the filter chain**, after every overlay (Hard Rule 1 in main SKILL.md). Otherwise overlays cover captions. Silent failure.
+2. **Master SRT uses output-timeline offsets** (Hard Rule 5): `output_time = word.start - segment_start + segment_offset`. Otherwise captions drift after segment concat.
+3. **Word-level boundaries from the speech lane.** Never invent chunk timing — the Parakeet word timestamps already give you exact in/out. Group N words into a line; the line's `start` is `words[0].start` and its `end` is `words[-1].end`.
 
 ## FCPXML / xmeml delivery
 
-`helpers/export_fcpxml.py` runs `build_master_srt` after writing the timeline XML, so every export drops `<edit>/master.srt` next to `cut.fcpxml` / `cut.xml`:
+Ship `master.srt` alongside `cut.fcpxml` and `cut.xml`. Most NLEs (Premiere, Resolve, FCP X) import SRT as a captions track that the editor can restyle in their own caption panel. Don't burn subtitles into the segments for the NLE path — the editor will want to control style themselves.
 
-```bash
-python helpers/export_fcpxml.py edit/edl.json -o edit/cut.fcpxml
-# writes cut.fcpxml + cut.xml + master.srt
-```
-
-Regenerate the SRT after a hand-tweak to the EDL without rebuilding XML?
-
-```bash
-python helpers/build_srt.py edit/edl.json
-```
-
-The SRT is written **on the OUTPUT timeline** from the cached Parakeet transcripts in `<edit>/transcripts/`. Format is Premiere-friendly:
-
-- UTF-8 (no BOM) — modern Premiere / Resolve / FCP X parse this cleanly.
-- CRLF line endings — Notepad-class editors render the file legibly on Windows; every NLE we target accepts \r\n.
-- Sequential numbering from 1, exact `HH:MM:SS,mmm --> HH:MM:SS,mmm` timestamp shape, blank line between cues.
-- Retimed (timelapse) ranges are SKIPPED — by convention they contain no speech (see SKILL.md "Time-squeezing"); the offset accumulator advances by the OUTPUT duration so subsequent cues land correctly.
-
-Importing into the NLE — every major NLE accepts SRT via plain `File → Import`:
-
-| NLE | Path | What you get |
-|---|---|---|
-| Adobe Premiere Pro | `File → Import → master.srt` | A captions clip on the project bin; drag to a captions track. Restyle via the Captions panel. |
-| DaVinci Resolve | `File → Import → Subtitle…` | A subtitle track on the timeline; restyle via the Captions inspector. |
-| Final Cut Pro X | `File → Import → Captions…` | A connected captions clip on the primary storyline; restyle in the inspector. |
-
-The skill never burns subtitles into a flat output — XML-only delivery: the NLE owns the final pixels and the editor controls caption style end-to-end.
+For the flat MP4 path (`render.py`), subtitles are baked into the final pass via the `subtitles=…:force_style=…` filter, applied LAST after every overlay.
 
 ## Decision shortcuts
 
