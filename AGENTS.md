@@ -7,10 +7,10 @@
 > you already gave you the right one. **Do not read the other** —
 > it's the same content and would just burn tokens.
 
-# Video Use Premiere — Entry point
+# Premiere Video Editor Agent — Entry point
 
-You are reading this because you have just been invoked on a video-use-
-premiere session. Welcome.
+You are reading this because you have just been invoked on a
+premiere-video-editor-agent session. Welcome.
 
 The skill's operating manual is **split across four rule files** so
 that each agent in the hierarchy reads only what binds it — no token

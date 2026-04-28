@@ -1,6 +1,6 @@
 @echo off
 REM ---------------------------------------------------------------------------
-REM premiere-agent bootstrap (Windows).
+REM premiere-video-editor-agent bootstrap (Windows).
 REM
 REM Idempotent. Honors TORCH_INDEX env var so CPU-only / ROCm users can swap:
 REM   set TORCH_INDEX=https://download.pytorch.org/whl/cpu
@@ -35,19 +35,19 @@ if "%PYTHON%"=="" (
     exit /b 1
 )
 
-echo [premiere-agent] python: %PYTHON%
+echo [premiere-video-editor-agent] python: %PYTHON%
 
 REM ---------------------------------------------------------------------------
 REM 1. Pip itself first.
 REM ---------------------------------------------------------------------------
-echo [premiere-agent] upgrading pip
+echo [premiere-video-editor-agent] upgrading pip
 %PYTHON% -m pip install --upgrade pip || goto :err
 
 REM ---------------------------------------------------------------------------
 REM 2. PyTorch from the right index.
 REM ---------------------------------------------------------------------------
 if "%TORCH_INDEX%"=="" set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-echo [premiere-agent] installing torch from %TORCH_INDEX%
+echo [premiere-video-editor-agent] installing torch from %TORCH_INDEX%
 %PYTHON% -m pip install torch torchvision torchaudio --index-url %TORCH_INDEX% || goto :err
 
 REM ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ REM    OpenTimelineIO FCPXML / xmeml adapters, since every real run needs
 REM    both. Diarize / animations / flash / parakeet-NeMo stay opt-in
 REM    (heavy, niche, or pre-gated).
 REM ---------------------------------------------------------------------------
-echo [premiere-agent] installing package
+echo [premiere-video-editor-agent] installing package
 %PYTHON% -m pip install -e "." || goto :err
 
 REM ---------------------------------------------------------------------------
@@ -77,11 +77,11 @@ REM ---------------------------------------------------------------------------
 REM 5. CUDA smoke test. Doesn't fail install if CUDA is missing — CPU
 REM    fallback path exists. Just informs the user what they'll get.
 REM ---------------------------------------------------------------------------
-echo [premiere-agent] CUDA smoke test:
+echo [premiere-video-editor-agent] CUDA smoke test:
 %PYTHON% -c "import torch; ok=torch.cuda.is_available(); name=torch.cuda.get_device_name(0) if ok else 'n/a'; tot=(torch.cuda.get_device_properties(0).total_memory/(1024**3)) if ok else 0.0; print(f'  cuda available : {ok}'); print(f'  device         : {name}'); print(f'  total VRAM     : {tot:.1f} GB')"
 
 echo.
-echo [premiere-agent] install complete.
+echo [premiere-video-editor-agent] install complete.
 echo   next: copy .env.example .env       ^(only needed for --diarize^)
 echo         %PYTHON% helpers\preprocess_batch.py C:\path\to\your\videos
 echo.
@@ -92,7 +92,7 @@ exit /b 0
 
 :err
 echo.
-echo [premiere-agent] install FAILED.
+echo [premiere-video-editor-agent] install FAILED.
 popd
 endlocal
 exit /b 1

@@ -53,6 +53,45 @@ satisfying that rule.
 
 ---
 
+## Subject-forward rule
+
+For named-subject beats, a match is not good enough merely because the
+caption contains the right word. The named thing must be the visual
+subject of the shot.
+
+Prefer ranges where the subject is one or more of:
+
+- Front / center / foreground.
+- Readable as signage, logo, display text, product label, screen text,
+  or booth banner.
+- The dominant object or booth in frame, not a background detail.
+- Present across several consecutive caption seconds, not a single
+  flash.
+
+Reject or downgrade ranges where the subject is:
+
+- Only mentioned in the background (`bg`, `background`, `distant`,
+  "sign in the distance").
+- Partially blocked by people or motion blur.
+- Visible only while the camera is walking or whipping past.
+- A crowd shot where the named brand/product/game is incidental.
+
+Example: if the voiceover says "Magic: The Gathering", a shot where
+the Magic sign or Magic booth display is front/center beats a general
+show-floor wide where "Magic" appears in the far background. If the
+voiceover says "PNY", a close PNY graphics card or a large PNY banner
+beats a crowd in front of the PNY booth.
+
+Subject quality is the primary ranking signal. Smoothness, longer
+holds, and rhythm are tiebreakers **after** the subject match is equal.
+Do not replace a stronger subject match with a smoother or longer range
+whose subject evidence is weaker. If the user asks for a smoother
+revision of a cut they already liked, first look for smoother ranges
+inside the same subject-correct clips; only swap to a new clip when it
+is at least as subject-forward as the original.
+
+---
+
 ## Selection preference order (named-subject beats)
 
 When the audio (script or transcript) names a specific subject, rank
@@ -105,6 +144,11 @@ shortlist) if any of these are true:
   *"distant booths in the background"* — the Riot booth might be
   one of those distant booths but you can't tell. Reject; find a
   closer shot.
+- **The named subject is not the subject of the frame.** Captions
+  mention it as background, incidental signage, or a partially
+  visible edge detail while the real subject is a person, crowd, or
+  different booth. Reject for named-subject beats unless no
+  subject-forward option exists, and note the compromise.
 - **The match is a single-frame flash from a fast pan.** One matching
   caption surrounded by completely different ones means the camera
   whipped past. Reject; the cut won't read.
@@ -118,6 +162,10 @@ shortlist) if any of these are true:
 At the same subject-match level, **prefer stable / static /
 smooth source ranges over shaky handheld walking-and-talking
 b-roll.** Reasons:
+
+This is a same-subject-quality rule. It never authorizes downgrading
+from a better subject match to a weaker subject match just because the
+weaker shot is steadier or can hold longer.
 
 - Stable shots cut cleaner — boundaries don't betray the camera move.
 - Captions are more reliable on stable footage (Florence-2 confidence
@@ -141,6 +189,16 @@ shortlist), use the motion shot but prefer the **smoothest** one —
 look for runs where consecutive captions describe the same subject
 with mild variation vs completely different things on each
 frame.
+
+For named-subject beats, subject-forward evidence beats pure stability
+only when the subject is clearly readable. A stable generic crowd shot
+does not beat a slightly less stable but still smooth shot where the
+named product/brand/game is large and readable. Preferred order:
+
+1. Correct subject, front/center/readable, stable.
+2. Correct subject, front/center/readable, mildly moving.
+3. Correct subject, background/incidental, stable.
+4. Generic context shot.
 
 If the parent's brief mentions a `<edit>/clip_index/index.json` with
 stability scores attached (an optional optimization — see "Optimized
@@ -284,6 +342,10 @@ content, named-subject beats with sponsor implications), spend the
 extra time **reviewing the top 2-3 candidates explicitly** vs
 accepting the first verified hit. Compare:
 
+- Which candidate makes the named subject the actual subject of the
+  frame, not background context?
+- Which candidate gives the cleanest readable signage/product/screen
+  at the moment the word is spoken?
 - Which candidate has the longest stable visual evidence?
 - Which lands cleanest at the boundaries (no continuity break against
   adjacent ranges)?
@@ -397,6 +459,12 @@ QA / verification dial.
   matching is the rule. Shortlist suggests; verification decides.
 - **Ignoring stability differences when several candidates match.**
   Same subject + steadier shot wins.
+- **Treating a background mention as a subject match.** Named words
+  need subject-forward footage: front/center/readable signage,
+  product, screen, booth, or character.
+- **Using jerky walk-by footage when a smooth/static subject shot
+  exists.** Smooth subject-forward shot wins, even if the walk-by has
+  a slightly earlier text hit.
 - **Repeating distinctive visuals within a 30-second window.**
   Diversify unless the user explicitly asked for the callback.
 - **Substituting "close enough" for a named subject silently.** Note

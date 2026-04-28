@@ -1365,7 +1365,7 @@ documents the full input shape; this is the fill-in-the-blanks
 template):
 
 ```
-You are the B-ROLL SCOUT sub-agent for a premiere-agent session.
+You are the B-ROLL SCOUT sub-agent for a premiere-video-editor-agent session.
 You have a fresh context window. Use it.
 
 STEP 0 (mandatory):

@@ -62,7 +62,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # CRITICAL: this import MUST come before anything that could pull in
@@ -531,6 +531,20 @@ def _extract_frames_to_disk(
     print(f"  extract: {video_path.name} -> {n} frames in {time.time()-t0:.1f}s "
           f"(hdr={meta['is_hdr']}, nvdec={nvdec_first})")
     return cache_dir
+
+
+def _visual_processing_order(
+    video_paths: list[Path],
+    extract_futures: dict[Path, "Future[Path]"],
+):
+    """Yield cache hits first, then fresh clips as extraction completes."""
+    for v in video_paths:
+        if v not in extract_futures:
+            yield v
+
+    future_to_video = {future: v for v, future in extract_futures.items()}
+    for future in as_completed(future_to_video):
+        yield future_to_video[future]
 
 
 def _iter_frames_from_dir(cache_dir: Path, fps: float):
@@ -1191,7 +1205,7 @@ def _process_one(
 
     rate = len(captions) / max(1e-3, dt)
     print(f"  visual_lane done: {len(captions)} captions, {dt:.1f}s wall "
-          f"({rate:.1f} fps) → {out_path.name}")
+          f"({rate:.1f} fps) -> {out_path.name}")
     return out_path
 
 
@@ -1332,9 +1346,9 @@ def run_visual_lane_batch(
     # Filter out clips that already have caption JSON. We don't want to
     # waste prefetch + Florence cycles on cache hits, AND we want to
     # keep the per-clip cache_dir mapping tight so the prefetch pool
-    # only touches what it'll actually feed. The filtered list is what
-    # we drive Florence with; the original `video_paths` is what we
-    # return at the end so caller order is preserved.
+    # only touches what it'll actually feed. Fresh clips are processed
+    # as their frame extraction completes so one slow source cannot
+    # stall every ready clip behind it.
     # ------------------------------------------------------------------
     work_videos: list[Path] = []
     for v in video_paths:
@@ -1405,7 +1419,7 @@ def run_visual_lane_batch(
             unit="video",
             desc="visual captioning",
         ) as vbar:
-            for v in video_paths:
+            for v in _visual_processing_order(video_paths, extract_futures):
                 vbar.start_item(v.name)
 
                 # Cache-hit fast path: never made it onto work_videos,

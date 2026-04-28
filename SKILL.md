@@ -1,6 +1,6 @@
 ---
-name: premiere-agent
-description: Edit any video by conversation. Local two-phase preprocessing — Phase A runs Parakeet ONNX speech + Florence-2 visual captions in parallel; Phase B runs CLAP zero-shot audio events against an agent-curated vocabulary derived from the speech + visual timelines. Reasons over the timelines and exports FCPXML / FCP7 xmeml to Premiere / Resolve / Final Cut Pro X — XML-only delivery with native J/L cuts, dissolves, and timelapse retime. Generates overlay animations and a `master.srt` captions sidecar; the colorist owns color in the NLE. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
+name: premiere-video-editor-agent
+description: Edit any video by conversation. Local two-phase preprocessing — Phase A runs Parakeet ONNX speech + Florence-2 visual captions in parallel; Phase B runs CLAP zero-shot audio events against an agent-curated vocabulary derived from the speech + visual timelines. Reasons over the timelines and exports FCPXML / FCP7 xmeml to Premiere / Resolve / Final Cut Pro X — XML-only delivery with native J/L cuts, dissolves, and timelapse retime. Generates overlay animations and a `master.srt` captions sidecar; the colorist owns color in the NLE. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask only essential questions, infer safe defaults when the user grants autonomous editing, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
 ---
 
 > **Agent: read ONE entry point, not both.** This file (`SKILL.md`) is
@@ -11,10 +11,10 @@ description: Edit any video by conversation. Local two-phase preprocessing — P
 > already gave you the right one. **Do not read the other** — it's the
 > same content and would just burn tokens.
 
-# Video Use Premiere — Entry point
+# Premiere Video Editor Agent — Entry point
 
-You are reading this because you have just been invoked on a video-use-
-premiere session. Welcome.
+You are reading this because you have just been invoked on a
+premiere-video-editor-agent session. Welcome.
 
 The skill's operating manual is **split across four rule files** so
 that each agent in the hierarchy reads only what binds it — no token
