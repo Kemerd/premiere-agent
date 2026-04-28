@@ -1,6 +1,6 @@
-> Drop raw footage in a folder. Talk to it like an assistant editor. Get an `.fcpxml` straight into your timeline — real J/L cuts, dissolves, retimes, captions, plus a written rationale for every cut you can inspect, reject, or iterate on by just saying so.
+> Drop raw footage in a folder. Talk to it like an assistant editor. Get an `.fcpxml` straight into your timeline — every cut, transition, retime, and caption decision comes with a written rationale you can inspect, reject, or iterate on by just saying so.
 >
-> Three perception lanes — **Parakeet ONNX** speech, **Florence-2** visual captions at 1 fps, **CLAP** audio events scored against an agent-curated vocabulary — feed a parent/sub-agent loop that reasons over *text timelines* instead of pixels. State-of-the-art open models, composed in a way nobody else has shipped, running **100% on your machine**. Every cut boundary is verified against the source clips before export — mid-word cuts and visual discontinuities **block** the FCPXML.
+> **Not another half-baked AI editor that demos pretty and falls apart the second you point it at real footage.** Three perception lanes — **Parakeet ONNX** speech, **Florence-2** visual captions at 1 fps, **CLAP** audio events scored against an agent-curated vocabulary — feed a parent/sub-agent loop that reasons over *text timelines* instead of pixels. State-of-the-art open models, composed in a way nobody else has shipped, running **100% on your machine**. Every cut boundary is verified against the source clips before export — mid-word cuts and visual discontinuities **block** the FCPXML.
 >
 > No cloud. No black box. No watermark. No subscription. Iteration on revision 50 costs the same as revision 1.
 >
