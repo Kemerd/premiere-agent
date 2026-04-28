@@ -157,7 +157,7 @@ _KEEP_PUNCT = frozenset({"-", "/", ":", "%", "$", "€", "£"})
 #   1. _DROP_WORDS  — generic English filler that survives the POS filter
 #      because it's a plain noun/verb but carries zero editorial signal
 #      in a Florence-2 caption. Empirically derived from word-frequency
-#      analysis on a 6500-line `audiovisual_timeline.md` from the reference
+#      analysis on a 6500-line `merged_timeline.md` from the reference
 #      project: "image" appeared 5648 times, "visible" 2334, "including"
 #      1283, "appearance" 653, etc. — every one is pure padding.
 #
@@ -222,7 +222,7 @@ _DROP_WORDS = frozenset({
 #   interior    -> int    :   472 occ  *  5           =  ~2k chars
 #
 # Combined with _DROP_WORDS this layer alone trims another ~10-15% of
-# audiovisual_timeline.md token count on top of the spaCy POS pass.
+# merged_timeline.md token count on top of the spaCy POS pass.
 _SHORTHAND = {
     "person":       "prsn",
     "people":       "ppl",

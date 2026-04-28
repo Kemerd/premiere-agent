@@ -1127,9 +1127,10 @@ def main() -> None:
         help="Path to a per-line vocabulary file (blank lines and # "
              "comments allowed). When omitted, the baked-in default "
              "vocab from helpers/audio_vocab_default.py is used. "
-             "Tip: have the Claude agent write a curated vocab from "
-             "speech_timeline.md + audiovisual_timeline.md (produced "
-             "by the first pack_timelines.py run after Phase A), then "
+             "Tip: have the agent write a curated vocab from "
+             "merged_timeline.md (produced by the first "
+             "pack_timelines.py run after Phase A — speech + visual at "
+             "that point; audio events fold in on the second pass), then "
              "re-run this lane with --vocab <edit>/audio_vocab.txt "
              "--force.",
     )
