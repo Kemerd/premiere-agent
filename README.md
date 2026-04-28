@@ -1,10 +1,10 @@
-> **This is Cursor for video editing.**
+> Drop raw footage in a folder. Talk to it like an assistant editor. Get an `.fcpxml` straight into your timeline — real J/L cuts, dissolves, retimes, captions, plus a written rationale for every cut you can inspect, reject, or iterate on by just saying so.
 >
-> Not another "AI editor" gimmick — real engineering. Three perception lanes (Parakeet ONNX speech, Florence-2 visual captions, CLAP audio events scored against an agent-curated vocabulary) feed a parent/sub-agent loop that reasons over *text timelines* instead of pixels, so iteration on revision 50 costs the same as revision 1. State-of-the-art open models, composed in a way nobody else is composing them, running **100% local**.
+> Three perception lanes — **Parakeet ONNX** speech, **Florence-2** visual captions at 1 fps, **CLAP** audio events scored against an agent-curated vocabulary — feed a parent/sub-agent loop that reasons over *text timelines* instead of pixels. State-of-the-art open models, composed in a way nobody else has shipped, running **100% on your machine**. Every cut boundary is verified against the source clips before export — mid-word cuts and visual discontinuities **block** the FCPXML.
 >
-> Drop raw footage in a folder, talk to it like an assistant editor, and get an `.fcpxml` straight into your timeline — real J/L cuts, dissolves, retimes, captions, plus a written rationale for every cut you can inspect, reject, or iterate on by just saying so. No cloud. No black box. No watermark. No subscription. You stay the editor. The agent does the work.
+> No cloud. No black box. No watermark. No subscription. Iteration on revision 50 costs the same as revision 1.
 >
-> **If you edit for a living, this saves you hundreds of hours.**
+> **This isn't a novelty.** It's the assistant editor you wish you could hire — doing real assembly work, on your machine, in your NLE. If you edit for a living, it saves you hundreds of hours.
 
 ---
 
