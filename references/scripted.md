@@ -53,9 +53,10 @@ The voiceover source can be either:
 
 Treatment is the same either way. The transcript
 shape is identical; the path is `<edit>/transcripts/<voiceover_stem>
-.json`. Verify the file via `source_tags.json` (if present) for
-clips tagged `voiceover` — that's the agent's declaration of which
-file is the timing spine.
+.json`. You already saw the folder layout during the inventory pass
+in step 1 — if there's a `voiceover/` folder (or `vo_anna/` etc.),
+its clips are the timing spine. No on-disk tag file is needed; you
+have the folder names in your working memory.
 
 Because both script and voiceover are fixed, **the cut
 problem inverts**: instead of "find the best take in this footage,"
@@ -240,11 +241,14 @@ speech aligns with or contradicts the script beat.
    shortlisting. **Verification still binds in step 5** — the index
    suggests; the visual-lane drill-down decides.
 
-When `source_tags.json` is present, restrict candidate searches to
-clips tagged `b_roll` / `cutaway` / `unknown`. A-roll-tagged clips
-are the speech bed in talking-head mode; in scripted assembly the
-A-roll tag is rare since the VO carries audio — but if it appears,
-respect user organization.
+When the user organized footage by folder convention (`b_roll/`,
+`cutaway/`, `a_roll/`, `voiceover/`, etc. — anything semantically
+meaningful that you saw during the inventory pass), restrict
+candidate searches to clips under `b_roll` / `cutaway` / unlabeled
+folders. A-roll-tagged clips are the speech bed in talking-head
+mode; in scripted assembly the A-roll tag is rare since the VO
+carries audio — but if it appears, respect the user's organization.
+The folder structure IS the tag; nothing is written to disk.
 
 ### 5. Verify the top candidate against the visual evidence
 
