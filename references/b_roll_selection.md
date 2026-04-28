@@ -212,15 +212,18 @@ The reusable model:
 - **`pack_timelines.py`** rolls those lane files into the merged
   view + per-lane drill-down files. Re-runs are fast on cached
   inputs.
-- **Folder convention auto-detection** (parent's step 1) writes
-  `<edit>/source_tags.json` mapping clip stems → categories
-  (`a_roll`, `b_roll`, `timelapse`, `voiceover`, `unknown`) when
-  the user organizes by convention folder. **Respect these tags**
-  for candidate searches: only `b_roll` / `cutaway` / `unknown`
-  clips are eligible cutaway candidates; A-roll is the speech bed
-  in talking-head mode; `timelapse` clips are pre-organized retime
+- **Folder convention as semantic tags.** During the inventory pass
+  in step 1 of the SKILL.md process, you saw the parent folder of
+  every source. When the user organized by convention (`b_roll/`,
+  `b_roll_intro/`, `a_roll/`, `voiceover_anna/`, `timelapse_buildout/`,
+  or any other semantically meaningful name), keep that folder→
+  category mapping in your working memory and **respect it** for
+  candidate searches: only `b_roll` / `cutaway` / unlabeled clips
+  are eligible cutaway candidates; A-roll is the speech bed in
+  talking-head mode; `timelapse`-folder clips are pre-organized retime
   source material (still gated by `timelapse_mode` — see below).
-  When tags are absent, all sources are eligible.
+  When the folders aren't categorized, all sources are eligible.
+  Nothing is written to disk — you have the folder names already.
 - **(Optional) clip index** is a helper that walks `transcripts/`
   + `visual_caps/` and builds a per-clip searchable record. Without
   an index, scan `merged_timeline.md` per beat — slower but
@@ -308,8 +311,8 @@ also shapes b-roll selection in two ways:
   the beat or pick a different shorter clip; do not retime to fit.
 - **`timelapse_mode = true`.** Long-stretch clips in the b-roll
   library are also valid timelapse retime candidates per the
-  time-squeezing rules. If `source_tags.json` tagged a clip as
-  `timelapse`, prefer it for retime over discovering retime
+  time-squeezing rules. If a clip lives under a `timelapse/` (or
+  similar) folder, prefer it for retime over discovering retime
   stretches in arbitrary footage — the user pre-organized the
   retime source.
 
@@ -383,9 +386,10 @@ QA / verification dial.
 - **Skipping QA notes on named-subject beats.** Revisions need them.
 - **Re-running preprocessing with `--force` to "refresh" matching.**
   The cache is correct; bypass only on real input change.
-- **Ignoring `source_tags.json` and proposing A-roll clips as
-  cutaways.** The user organized their footage; respect the tags.
-  A-roll-tagged clips are the speech bed, not the cutaway library.
+- **Ignoring folder organization and proposing A-roll clips as
+  cutaways.** The user organized their footage; respect the folder
+  layout you inventoried in step 1. Clips under an `a_roll/` folder
+  are the speech bed, not the cutaway library.
 - **Retiming a b-roll candidate to fit a beat when
   `timelapse_mode = false`.** The user opted out of timelapses for
   this session. Pick a different clip or shorter range; never
