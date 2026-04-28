@@ -328,7 +328,14 @@ def _shared_audio_extraction(videos: list[Path], edit_dir: Path) -> None:
     ) as bar:
         for v in videos:
             bar.start_item(v.name)
-            extract_audio_for(v, edit_dir, verbose=True)
+            try:
+                extract_audio_for(v, edit_dir, verbose=True)
+            except Exception as exc:
+                print(
+                    f"  audio_16k skipped: {v.name} "
+                    f"({type(exc).__name__}: {exc})",
+                    file=sys.stderr,
+                )
             bar.update(advance=1)
 
 

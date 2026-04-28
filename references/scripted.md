@@ -218,6 +218,18 @@ voiceover that doesn't mention Riot.
 For each beat, you need a clip whose `[…]` visual captions in
 `audiovisual_timeline.md` describe what the script says is visible.
 
+For named-subject beats, shortlist **source ranges**, not just clips.
+The candidate range must make the named subject the visual subject:
+front/center/readable signage, product label, screen, booth, character,
+or stage. A caption hit where the named thing is only in the
+background is a fallback, not a match. Within the valid subject-forward
+shortlist, prefer smoother ranges: repeated or consistent captions,
+static shots, and low-motion camera work beat jerky walk-bys.
+Smoothness never outranks subject accuracy. On revisions to an already
+liked cut, preserve the existing subject-correct clip unless the
+replacement is at least as subject-forward and only improves stability,
+framing, or rhythm.
+
 The default reading surface is the dual spine
 (`audiovisual_timeline.md` + `speech_timeline.md`) — read BOTH
 end-to-end (per the ABSOLUTE READ MANDATE in
@@ -274,6 +286,15 @@ before committing:
   + 1-2 seconds before/after).
   Continuous matching captions = good. A single matching frame
   surrounded by something else = a fast pan, reject.
+- Verify subject dominance: the named thing should be the frame's
+  subject, not incidental background. Look for words like
+  `foreground`, `center`, `large sign`, `screen displays`, `logo`,
+  `banner`, `close-up`, `booth`, or product text. Treat
+  `background`, `distant`, `blurred`, and people-heavy descriptions
+  as downgrades.
+- Verify smoothness: prefer ranges where adjacent captions keep
+  describing the same subject. Reject shaky/jerky walk-by footage
+  when a stable subject-forward option exists.
 - Drill into `<edit>/visual_timeline.md` for the full 1fps caption
   stream (including `(same)` repeats — those are gold for stability).
   A long run of `(same)` near the candidate range means the shot is
@@ -324,6 +345,12 @@ For named subjects (brands / products / games / people / venues),
 "Riot Games" b-roll that lands two seconds late on the wrong word —
 scripted-mode users mean this when asking for "tighter
 sync" or "land the booth on the booth."
+
+The sync target is the subject-forward moment, not the first weak
+caption hit. If the source has a background glimpse at 0:02 but the
+subject becomes front/center/readable at 0:05, align the 0:05 moment
+to the spoken name. A slightly earlier background flash does not count
+as `candidate.subject_visible_t`.
 
 ### 7. Emit a QA note per b-roll decision
 

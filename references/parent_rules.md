@@ -5,7 +5,7 @@ read it now — it defines the agent hierarchy you sit at the top of,
 and reading these rules without that context will lead you to do a
 sub-agent's work yourself.
 
-You are the **parent agent** for a premiere-agent session. You run
+You are the **parent agent** for a premiere-video-editor-agent session. You run
 the entire pipeline:
 
 - **Conversation** — talk to the user, gather requirements, propose
@@ -60,7 +60,7 @@ The parent does *everything else* in this skill.
 
 ## Directory layout
 
-The skill lives in `premiere-agent/`. User footage lives wherever
+The skill lives in `premiere-video-editor-agent/`. User footage lives wherever
 they put it. All session outputs land in `<videos_dir>/edit/`.
 
 ```
@@ -157,7 +157,7 @@ auto-invalidates when `python` / `torch` / `transformers` /
 `opentimelineio` versions change, so a `pip install --upgrade`
 triggers a fresh check.
 
-Cache lives at `~/.premiere-agent/health.json` — **outside** the
+Cache lives at `~/.premiere-video-editor-agent/health.json` — **outside** the
 per-session `<videos_dir>/edit/` so it persists across projects. The
 one exception to Hard Rule 12, intentional: skill-environment health
 is a per-machine property, not a per-session one.
@@ -441,13 +441,32 @@ organization.
 Then run Phase A preprocessing — speech (Parakeet ONNX) + visual
 (Florence-2):
 
+Before launching a large batch, do a metadata-only bad-media preflight
+with `ffprobe` / file attributes. Skip placeholder or broken clips
+instead of letting one bad source abort the whole folder. Common skip
+signals: zero/near-zero byte files, OneDrive placeholders that are not
+hydrated, no decodable video stream for video inputs, no audio stream
+when speech/audio lanes are required, or ffprobe duration/stream
+failure. Log skipped paths and reasons in `<edit>/run_logs/` and keep
+processing the good clips. If the user already said to skip bad clips,
+do this automatically; if not, ask only when the skipped file looks
+important or irreplaceable.
+
+For nested shoot folders, prefer one recursive master batch instead of
+running one folder at a time. This preserves the same 1 fps visual
+analysis but avoids repeated model reloads and warmups. When source
+media lives in OneDrive or another sync folder, prefer a local scratch
+copy for preprocessing when practical, then write/copy the XML, SRT,
+notes, and timelines back to the project folder.
+
 ```bash
-python helpers/preprocess_batch.py <videos_dir>
+python helpers/preprocess_batch.py <videos_dir> --recursive
 python helpers/pack_timelines.py --edit-dir <videos_dir>/edit
 ```
 
 `preprocess_batch.py` flags: `--wealthy` (24GB+ GPU), `--diarize`,
 `--language en`, `--force`, `--skip-speech`, `--skip-visual`,
+`--recursive`, `--no-skip-bad-media`,
 `--visual-fps N` (visual sample rate in frames/sec, default `1.0`,
 fractional accepted — `0.5` = one frame every 2 s, `0.25` = every
 4 s; lower for slow / lecture / static / long-form content where
@@ -456,6 +475,10 @@ linearly). **Do NOT pass `--include-audio`** — that flag runs CLAP
 inline against a fallback vocabulary that exists only for `tests.py`
 smoke testing. This skill mandates the curated-vocab path (step 2
 below).
+
+Default to full visual coverage (`--visual-fps` omitted, meaning 1 fps)
+for named-subject b-roll matching unless the user explicitly approves a
+speed/coverage tradeoff.
 
 `pack_timelines.py` produces TWO mandatory sub-agent reading
 surfaces — `audiovisual_timeline.md` (audio + visual interleaved;
@@ -588,15 +611,44 @@ questions *shaped by what they said*. Collect:
   whether time-squeezing is permitted, and the verification bar
   the editor uses.
 
+#### Prompt-minimized autonomous editing
+
+If the user explicitly grants broad access or says to process/make
+changes/create the final XML with as few prompts as possible, switch
+the session into **autonomous editing mode** and persist that preference
+in `project.md`.
+
+In autonomous editing mode:
+
+- Infer obvious choices from folder conventions, script files, source
+  tags, current request, and prior `project.md`.
+- Use `script_mode = true` when there is a script or VO-driven assembly
+  request; set `b_roll_mode = true` automatically for scripted assembly.
+- Default `user_profile = professional` for company/client/branded work
+  or any folder/project connected to the user's workplace.
+- Default pacing to `Paced` unless the user already picked another
+  preset or the requested style clearly implies `Energetic` / `Measured`.
+- Do not ask confirmation questions whose answer can be safely inferred.
+- Still stop for essential approvals: destructive changes to source
+  media, deleting/renaming originals, overwriting a user-approved final,
+  paid/cloud/external account actions, unresolved health/dependency
+  failures, or a creative fork with no reasonable default.
+
+Autonomous mode does not lower the QA bar. It removes routine prompts;
+it does not remove strategy notes, evidence-backed b-roll selection, or
+the final XML validation step.
+
 While conversing, build the **Conversation Context bundle** in your
 working memory (see `shared_rules.md` Agent roles for the structure).
 Forward this bundle into every subagent brief.
 
 #### Mode-gating questions
 
-Four short questions — ask once per session, persist the answers in
-`project.md` so subsequent sessions inherit defaults. Always still
-confirm; users change modes between sessions on the same project.
+Four short questions — ask once per session when answers cannot be
+inferred, persist the answers in `project.md` so subsequent sessions
+inherit defaults. In autonomous editing mode, infer and state the
+values instead of stopping for confirmation unless an inferred value is
+high-risk or genuinely ambiguous.
 
 If `<edit>/project.md` already records a value, default to it and
 ask the user to confirm or change ("Last session you were in scripted
@@ -606,6 +658,11 @@ pre-filled some, in which case treat the auto-detected
 values as the defaults and confirm vs re-ask blank
 ("I detected a `b_roll/` folder — going with `b_roll_mode = true`,
 sound right?").
+
+In autonomous editing mode, the same logic becomes a status note:
+"I detected script + b-roll, using scripted b-roll assembly, Paced
+pacing, professional QA." Proceed unless the user interrupts or an
+essential approval is required.
 
 **1. "Are you using a script?"** → sets `script_mode`
 
@@ -684,8 +741,9 @@ qualify as candidates.
 Write 4-8 sentences describing the editorial shape, take direction,
 chosen pacing preset (name + four expanded ms values), animation plan,
 subtitle style (NLE captions track), length estimate, NLE delivery
-dialect. **Wait for confirmation.** No subagent runs until the user
-says yes.
+dialect. In normal mode, **wait for confirmation**. In autonomous
+editing mode, present this as a strategy note and proceed unless an
+essential approval is required or the user interrupts with a change.
 
 You are writing the strategy in the user's terms — what they said the
 video is, what they said they want. You are NOT writing it from a read
@@ -805,17 +863,21 @@ an updated brief that includes:
 Re-self-eval. Re-export only on pass. Show. Loop until the user is
 happy — every revision repeats the same gate (eval before XML).
 
-Final export on confirmation. Then **append to `project.md`** — see
-"project.md memory format" below. Your only persistent state
-across sessions; do not skip it.
+Final export on confirmation, or automatically in autonomous editing
+mode after QA passes. Then **append to `project.md`** — see
+"project.md memory format" below. Your only persistent state across
+sessions; do not skip it.
 
 ---
 
-## Pacing presets — required, asked in step 4
+## Pacing presets — required, inferred or asked in step 4
 
-Every session must have a pacing preset (Hard Rule 13). Ask the user
-up-front. Default is **Paced**. Each preset expands to four numbers
-the editor subagent applies when picking cut points.
+Every session must have a pacing preset (Hard Rule 13). Default is
+**Paced**. In normal mode, ask the user up-front. In autonomous editing
+mode, infer/reuse the preset, state it in the strategy note, and proceed
+unless pacing is the creative fork the user is asking to decide. Each
+preset expands to four numbers the editor subagent applies when picking
+cut points.
 
 | Preset       | min_silence_to_remove | min_talk_to_keep | lead_margin | trail_margin | Vibe |
 |--------------|----------------------:|-----------------:|------------:|-------------:|------|
@@ -848,7 +910,7 @@ possible.
 Spawn this in step 2.
 
 ```
-You are the VOCAB sub-agent for a premiere-agent session. Your job
+You are the VOCAB sub-agent for a premiere-video-editor-agent session. Your job
 is to produce a project-specific CLAP zero-shot vocabulary file.
 
 STEP 0 (mandatory before anything else):
@@ -900,7 +962,7 @@ Spawn this in step 6 for the initial cut, re-spawn in step 9 for
 every revision.
 
 ```
-You are the EDITOR sub-agent for a premiere-agent session. Your job
+You are the EDITOR sub-agent for a premiere-video-editor-agent session. Your job
 is to produce <edit>/edl.json — the cut decisions for this video.
 
 STEP 0 (mandatory before anything else):

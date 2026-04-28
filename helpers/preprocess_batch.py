@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import shutil
 import sys
 from pathlib import Path
@@ -94,7 +95,21 @@ AUDIO_ONLY_EXTS = {
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_ONLY_EXTS
 
 
-def _discover_sources(sources_dir: Path) -> tuple[list[Path], list[Path]]:
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    """Backport-friendly Path.is_relative_to helper."""
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _discover_sources(
+    sources_dir: Path,
+    *,
+    recursive: bool = False,
+    edit_dir: Path | None = None,
+) -> tuple[list[Path], list[Path]]:
     """Return (videos, audio_only) sorted lists under sources_dir.
 
     Non-recursive on purpose — recursion picks up B-roll and proxy
@@ -110,17 +125,113 @@ def _discover_sources(sources_dir: Path) -> tuple[list[Path], list[Path]]:
     """
     videos: list[Path] = []
     audio: list[Path] = []
-    for p in sources_dir.iterdir():
+    iterator = sources_dir.rglob("*") if recursive else sources_dir.iterdir()
+    edit_dir_resolved = edit_dir.resolve() if edit_dir is not None else None
+    for p in iterator:
         if not p.is_file():
+            continue
+        resolved = p.resolve()
+        if edit_dir_resolved is not None and _is_relative_to(resolved, edit_dir_resolved):
             continue
         sfx = p.suffix.lower()
         if sfx in VIDEO_EXTS:
-            videos.append(p.resolve())
+            videos.append(resolved)
         elif sfx in AUDIO_ONLY_EXTS:
-            audio.append(p.resolve())
+            audio.append(resolved)
     videos.sort()
     audio.sort()
     return videos, audio
+
+
+def _probe_media(path: Path, *, is_video: bool) -> tuple[bool, str]:
+    """Metadata-only bad-media preflight.
+
+    Valid silent videos are kept because they still carry visual signal;
+    the speech lane can write an empty transcript for them later.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return False, f"stat failed: {exc}"
+    if size < 4096:
+        return False, f"too small / placeholder-like ({size} bytes)"
+
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=codec_type:format=duration",
+        "-of", "json", str(path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"ffprobe failed: {exc}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()[-1:] or ["unknown ffprobe error"]
+        return False, tail[0]
+
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return False, f"ffprobe JSON parse failed: {exc}"
+
+    streams = data.get("streams") or []
+    stream_types = {s.get("codec_type") for s in streams}
+    duration_raw = (data.get("format") or {}).get("duration")
+    try:
+        duration = float(duration_raw)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        return False, "missing or zero duration"
+
+    if is_video and "video" not in stream_types:
+        return False, "no decodable video stream"
+    if not is_video and "audio" not in stream_types:
+        return False, "no decodable audio stream"
+    return True, "ok"
+
+
+def _filter_bad_media(
+    videos: list[Path],
+    audio_only: list[Path],
+    edit_dir: Path,
+) -> tuple[list[Path], list[Path], list[dict]]:
+    """Drop placeholder/corrupt media before expensive model work."""
+    kept_videos: list[Path] = []
+    kept_audio: list[Path] = []
+    skipped: list[dict] = []
+
+    for p in videos:
+        ok, reason = _probe_media(p, is_video=True)
+        if ok:
+            kept_videos.append(p)
+        else:
+            skipped.append({"path": str(p), "kind": "video", "reason": reason})
+
+    for p in audio_only:
+        ok, reason = _probe_media(p, is_video=False)
+        if ok:
+            kept_audio.append(p)
+        else:
+            skipped.append({"path": str(p), "kind": "audio", "reason": reason})
+
+    if skipped:
+        log_dir = edit_dir / "run_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        out_path = log_dir / "preprocess_skipped_media.json"
+        out_path.write_text(json.dumps(skipped, indent=2), encoding="utf-8")
+        print(
+            f"[preprocess_batch] skipped {len(skipped)} bad/placeholder "
+            f"file(s); details: {out_path}"
+        )
+        for item in skipped[:20]:
+            print(f"  - [skip] {Path(item['path']).name}: {item['reason']}")
+        if len(skipped) > 20:
+            print(f"  - ... {len(skipped) - 20} more")
+
+    return kept_videos, kept_audio, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +440,13 @@ def main() -> None:
                          "and/or audio-only files like voiceover .wav)")
     ap.add_argument("--edit-dir", type=Path, default=None,
                     help="Edit output dir (default: <videos_dir>/edit)")
+    ap.add_argument("--recursive", action="store_true",
+                    help="Discover media recursively under videos_dir and "
+                         "process it as one master batch. The edit dir is "
+                         "excluded automatically.")
+    ap.add_argument("--no-skip-bad-media", action="store_true",
+                    help="Disable metadata preflight that skips corrupt or "
+                         "placeholder media before expensive model work.")
     ap.add_argument("--force-schedule",
                     choices=[s.value for s in Schedule],
                     default=None,
@@ -396,13 +514,25 @@ def main() -> None:
     if not videos_dir.is_dir():
         sys.exit(f"[preprocess_batch] FATAL: not a directory: {videos_dir}")
 
-    videos, audio_only = _discover_sources(videos_dir)
+    edit_dir = (args.edit_dir or (videos_dir / "edit")).resolve()
+    edit_dir.mkdir(parents=True, exist_ok=True)
+
+    videos, audio_only = _discover_sources(
+        videos_dir,
+        recursive=args.recursive,
+        edit_dir=edit_dir,
+    )
     if not videos and not audio_only:
         sys.exit(
             f"[preprocess_batch] no source media in {videos_dir}\n"
             f"  recognised video extensions: {sorted(VIDEO_EXTS)}\n"
             f"  recognised audio extensions: {sorted(AUDIO_ONLY_EXTS)}"
         )
+
+    if not args.detect_pairs and not args.no_skip_bad_media:
+        videos, audio_only, _skipped = _filter_bad_media(videos, audio_only, edit_dir)
+        if not videos and not audio_only:
+            sys.exit("[preprocess_batch] all discovered media failed preflight")
 
     # ── Pair detection ──
     # Compute pairs before the discovery summary so we can flag them
@@ -475,8 +605,6 @@ def main() -> None:
         print("\n".join(msg_lines), file=sys.stderr)
         sys.exit(2)
 
-    edit_dir = (args.edit_dir or (videos_dir / "edit")).resolve()
-    edit_dir.mkdir(parents=True, exist_ok=True)
     schedule = parse_force_schedule(args.force_schedule)
 
     # ── Apply pair mode ──

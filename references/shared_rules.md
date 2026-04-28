@@ -1,6 +1,6 @@
 # Shared Rules — every agent in this skill reads this first
 
-Every agent in `premiere-agent` — the parent conversation manager AND every sub-agent it spawns (editor, vocab, animations) — reads this file as step 0. Rules here are **universal**: they bind production correctness, the agent hierarchy, and the philosophy that keeps the skill working without silent failures.
+Every agent in `premiere-video-editor-agent` — the parent conversation manager AND every sub-agent it spawns (editor, vocab, animations) — reads this file as step 0. Rules here are **universal**: they bind production correctness, the agent hierarchy, and the philosophy that keeps the skill working without silent failures.
 
 After reading this file, continue to your role-specific rules:
 
@@ -30,7 +30,17 @@ The two editor cold-path files are gated by mode flags the parent collects in st
 
 2. **Speech is primary, visuals are secondary, audio events are tertiary.** Cut candidates come from Parakeet ONNX speech boundaries and silence gaps — that lane is highly accurate, the editorial spine. Visual captions (Florence-2) are the second source of truth: they answer "what's actually on screen here?" and resolve ambiguous decision points (B-roll spotting, shot continuity, action beats). Audio events (CLAP, zero-shot scoring against an agent-curated vocabulary) tag non-speech sounds per ~10s window. When audio and visual disagree about *what is happening on screen*, **trust the visual lane.**
 
-3. **Ask -> confirm -> execute -> iterate -> persist.** No agent ever touches a cut, a vocabulary, or a render until the user has confirmed the strategy in plain English. The parent handles the conversation; subagents only run after the parent has dispatched them.
+3. **Ask only when the answer changes risk or direction.** The parent
+   still explains the plan in plain English, but if the user has granted
+   broad/autonomous editing permission, do not stop for every routine
+   mode, pacing, or export choice. Infer from folder names, scripts,
+   prior `project.md`, and the user's latest request; proceed with
+   reversible work and write outputs to `<edit>/`. Stop only for
+   essential approvals: destructive source-media changes, overwriting
+   user-approved finals, external paid/cloud actions, unresolved safety
+   or dependency failures, or a creative fork where no reasonable default
+   is clear. The parent handles conversation; subagents only run after
+   the parent has dispatched them.
 
 4. **Generalize.** Do not assume what kind of video this is. Look at the material, ask the user, then edit.
 
@@ -130,11 +140,24 @@ These are where deviation produces silent failures or broken output. They are no
 
 10. **Parallel subagents for multiple animations.** Never sequential. Spawn N at once via the `Agent` / `Task` tool; total wall time approx slowest one.
 
-11. **Strategy confirmation before execution.** No sub-agent runs until the user has approved the plain-English plan via the parent.
+11. **Strategy acknowledgement before execution.** The parent states the
+    plain-English strategy before dispatch. If the user has not granted
+    autonomous editing permission, wait for approval. If the user has
+    granted broad/autonomous permission, proceed after the strategy note
+    unless an essential approval is required (destructive source changes,
+    overwriting an approved final, paid/cloud actions, hard ambiguity, or
+    a failed health/dependency gate).
 
-12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `premiere-agent/` project directory.
+12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `premiere-video-editor-agent/` project directory.
 
-13. **Pacing preset is REQUIRED before strategy.** Every session must have a pacing preset confirmed by the user (Calm / Measured / Paced / Energetic / Jumpy — default Paced). The preset defines four numbers used by the editor sub-agent: `min_silence_to_remove`, `min_talk_to_keep`, `lead_margin`, and `trail_margin`. See `parent_rules.md` for the value table. Never skip the prompt; never invent ad-hoc values.
+13. **Pacing preset is REQUIRED before strategy.** Every session must
+    have a pacing preset (Calm / Measured / Paced / Energetic / Jumpy —
+    default Paced). The preset defines four numbers used by the editor
+    sub-agent: `min_silence_to_remove`, `min_talk_to_keep`,
+    `lead_margin`, and `trail_margin`. See `parent_rules.md` for the
+    value table. In autonomous mode, infer or reuse the preset and state
+    it; ask only when pacing is truly ambiguous or the user asked to
+    choose. Never invent ad-hoc values.
 
 14. **No split edits (J/L cuts) and no cross-dissolves until further notice.** The editor sub-agent MUST emit `audio_lead = video_tail = transition_in = 0` on every range. They are deferred because the OTIO single-track audio model + per-clip independent frame-snapping causes cumulative audio drift across long timelines (visible as the audio sliding further out of sync with each subsequent cut). Audio at cut boundaries is protected by the 30ms `afade` pair from Hard Rule 3 — the current "small crossfade" story.
 
@@ -155,7 +178,9 @@ These fail regardless of role:
 - **SRT / phrase-level lane output.** Loses sub-second gap data. Always word-level verbatim from the speech lane.
 - **Re-running `helpers/preprocess_batch.py --force` reflexively.** The mtime-based cache is correct; bypass only when the source changed or a model was upgraded.
 - **Reading `transcripts/*.json` directly for general timeline scanning.** Use the timeline markdowns; same data, 1/10 the tokens, phrase-aligned. The carve-out: the editor sub-agent reads `transcripts/<stem>.json` *surgically* at cut-verification time — the markdown views drop per-word boundaries (phrase-grouped concatenation) so they cannot satisfy Hard Rule 6 alone. See `subagent_editor_rules.md` "Word-boundary verification".
-- **Editing before confirming the strategy.** Never.
+- **Editing without a strategy note or required approval.** In normal
+  mode, wait for confirmation. In autonomous mode, state the strategy
+  and proceed unless an essential approval is required.
 - **Re-preprocessing cached sources.** Immutable outputs of immutable inputs.
 - **Assuming what kind of video it is.** Look first, ask second, edit last.
 - **Sub-agent reading from one timeline file when both are required.** `audiovisual_timeline.md` AND `speech_timeline.md` are BOTH the default reading surfaces for the editor and the vocab sub-agents (Hard Rule 15). Per-lane files are drill-down only; reading just one of the two mandatory files is the same correctness violation as reading neither.

@@ -1,5 +1,5 @@
 # =============================================================================
-#  Codex CLI — project-level config for premiere-agent
+#  Codex CLI — project-level config for premiere-video-editor-agent
 # -----------------------------------------------------------------------------
 #  Lives at <repo-root>/.codex/config.toml. Codex loads this file ONLY when the
 #  project has been marked trusted in the user's ~/.codex/config.toml — see the
@@ -80,7 +80,7 @@ writable_roots = [
 #  Windows native sandbox
 # -----------------------------------------------------------------------------
 #  When running Codex natively on Windows (which is the case here — the repo
-#  lives at L:\Dev\premiere-agent), set the sandbox mode to "elevated"
+#  lives at L:\Dev\premiere-video-editor-agent), set the sandbox mode to "elevated"
 #  unless you don't have admin rights, in which case fall back to
 #  "unelevated".
 # -----------------------------------------------------------------------------
@@ -112,7 +112,7 @@ exclude = ["AWS_*", "AZURE_*", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "*_TOKEN",
 #    B) Manually add this block to ~/.codex/config.toml (Windows path is
 #       %USERPROFILE%\.codex\config.toml):
 #
-#         [projects."L:\\Dev\\premiere-agent"]
+#         [projects."L:\\Dev\\premiere-video-editor-agent"]
 #         trust_level = "trusted"
 #
 #  After trust is granted, every `codex` invocation inside this repo merges

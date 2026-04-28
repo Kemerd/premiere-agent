@@ -1,6 +1,6 @@
 # premiere-agent
 
-Edit videos by conversation — runs **100% locally** and exports straight into **Premiere Pro** (and Resolve, and Final Cut) with **J cuts, L cuts, dissolves**, and the rest of the cut vocabulary you'd actually use in an NLE.Wulululu
+Edit videos by conversation — runs **100% locally** and exports straight into **Premiere Pro** (and Resolve, and Final Cut) with **J cuts, L cuts, dissolves**, and the rest of the cut vocabulary you'd actually use in an NLE.
 
 Drop raw footage in a folder, chat with your agent ([Claude Code](https://docs.claude.com/en/docs/claude-code/overview) — local CLI **or** [cloud workspaces](https://code.claude.com/docs/en/claude-code-on-the-web), or [Codex](https://developers.openai.com/codex) CLI / IDE / app), get `cut.fcpxml` + `cut.xml` back — XML-only delivery, the cut lives in your NLE. Text + on-demand visuals, no frame-dumping — three perception lanes so the LLM can reason about speech, abstract sounds, and visible objects, not just one of them.
 
@@ -254,7 +254,7 @@ the link).
 
 ```bash
 mkdir -p ~/.claude/skills
-ln -s "$(pwd)" ~/.claude/skills/premiere-agent
+ln -s "$(pwd)" ~/.claude/skills/premiere-video-editor-agent
 ```
 
 **Windows (PowerShell, run as Administrator** — or enable Developer
@@ -264,14 +264,14 @@ create symlinks):
 ```powershell
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude\skills" | Out-Null
 New-Item -ItemType SymbolicLink `
-  -Path   "$env:USERPROFILE\.claude\skills\premiere-agent" `
-  -Target "C:\path\to\premiere-agent"
+  -Path   "$env:USERPROFILE\.claude\skills\premiere-video-editor-agent" `
+  -Target "C:\path\to\premiere-video-editor-agent"
 ```
 
 Verify the link landed (`d----l` in the `Mode` column means symlink):
 
 ```powershell
-Get-Item "$env:USERPROFILE\.claude\skills\premiere-agent" |
+Get-Item "$env:USERPROFILE\.claude\skills\premiere-video-editor-agent" |
   Select-Object FullName, Target, LinkType
 ```
 
@@ -284,7 +284,7 @@ not `.claude`). Same symlink pattern:
 
 ```bash
 mkdir -p ~/.agents/skills
-ln -s "$(pwd)" ~/.agents/skills/premiere-agent
+ln -s "$(pwd)" ~/.agents/skills/premiere-video-editor-agent
 ```
 
 **Windows (PowerShell, Administrator or Developer Mode):**
@@ -292,14 +292,14 @@ ln -s "$(pwd)" ~/.agents/skills/premiere-agent
 ```powershell
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.agents\skills" | Out-Null
 New-Item -ItemType SymbolicLink `
-  -Path   "$env:USERPROFILE\.agents\skills\premiere-agent" `
-  -Target "C:\path\to\premiere-agent"
+  -Path   "$env:USERPROFILE\.agents\skills\premiere-video-editor-agent" `
+  -Target "C:\path\to\premiere-video-editor-agent"
 ```
 
 Codex will pick up `AGENTS.md` via the same symlink — `name` and
 `description` come from the surrounding skill folder metadata; the
 file body is what gets concatenated into the prompt when you invoke
-the skill (explicitly via `$premiere-agent` or implicitly when
+the skill (explicitly via `$premiere-video-editor-agent` or implicitly when
 your task matches the description).
 
 > **Heads-up: Codex symlinks must be valid relative paths.** If the
@@ -324,14 +324,14 @@ SessionStart hook that clones on every boot:
 
 ```bash
 # inside your videos repo
-git submodule add https://github.com/<you>/premiere-agent.git \
-  .claude/skills/premiere-agent
-git commit -am "Add premiere-agent skill"
+git submodule add https://github.com/<you>/premiere-video-editor-agent.git \
+  .claude/skills/premiere-video-editor-agent
+git commit -am "Add premiere-video-editor-agent skill"
 git push
 ```
 
 Now every cloud session has the skill mounted at
-`.claude/skills/premiere-agent/` — Claude Code picks it up
+`.claude/skills/premiere-video-editor-agent/` — Claude Code picks it up
 automatically (the [docs page on cloud sessions](https://code.claude.com/docs/en/claude-code-on-the-web#what-claude-can-and-cant-access-in-cloud-sessions)
 lists `.claude/skills/` as one of the directories included in the
 clone).
@@ -347,7 +347,7 @@ web environment settings (Settings → Environments → your environment
 ```bash
 #!/bin/bash
 set -e
-bash .claude/skills/premiere-agent/scripts/cloud_setup.sh
+bash .claude/skills/premiere-video-editor-agent/scripts/cloud_setup.sh
 ```
 
 The setup script runs as root, installs `ffmpeg` via `apt`, pulls the
@@ -396,13 +396,13 @@ Node, Rust, Go, Swift, Ruby, PHP, Java, bun, bazel, erlang/elixir —
 [but again no `ffmpeg`](https://github.com/openai/codex-universal),
 and the skill's Python deps aren't installed.
 
-**1. Mount the skill** at `.agents/skills/premiere-agent/` in your
+**1. Mount the skill** at `.agents/skills/premiere-video-editor-agent/` in your
 videos repo — Codex CLI scans `.agents/skills/` from cwd up to the
 repo root for skills:
 
 ```bash
-git submodule add https://github.com/<you>/premiere-agent.git \
-  .agents/skills/premiere-agent
+git submodule add https://github.com/<you>/premiere-video-editor-agent.git \
+  .agents/skills/premiere-video-editor-agent
 ```
 
 **2. Configure the environment's setup script** (Codex Settings →
@@ -411,7 +411,7 @@ Environments → your env → Setup script). Same script, different path:
 ```bash
 #!/bin/bash
 set -e
-bash .agents/skills/premiere-agent/scripts/cloud_setup.sh
+bash .agents/skills/premiere-video-editor-agent/scripts/cloud_setup.sh
 ```
 
 Codex caches the resulting container after the setup script finishes,

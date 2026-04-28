@@ -1,4 +1,4 @@
-"""End-to-end smoke tests for premiere-agent.
+"""End-to-end smoke tests for premiere-video-editor-agent.
 
 Runs in two tiers:
 
@@ -484,7 +484,7 @@ def test_pack_timelines(R: Results, tmp: Path) -> None:
         for fname, must_contain in [
             ("speech_timeline.md", "Hello world."),
             ("audio_timeline.md", "drill"),
-            ("visual_timeline.md", "a workshop bench"),
+            ("visual_timeline.md", "bench tools"),
             ("audiovisual_timeline.md", "drill"),
         ]:
             p = edit / fname
@@ -899,7 +899,7 @@ def test_heavy(R: Results, tmp: Path) -> None:
         t0 = time.monotonic()
         out = run_visual_lane_batch(
             [clip], edit,
-            model_id="microsoft/Florence-2-base",
+            model_id="florence-community/Florence-2-base",
             fps=1, batch_size=2,
             task="<MORE_DETAILED_CAPTION>",
             force=False,
@@ -944,7 +944,7 @@ def run_all(heavy: bool = False, keep_tmp: bool = False) -> Results:
     Mirrors `main()` minus the argparse/banner/exit-code wrapping. Returns
     the populated `Results` object so the caller can introspect failures.
     """
-    print("premiere-agent :: smoke tests")
+    print("premiere-video-editor-agent :: smoke tests")
     print("=" * 60)
 
     R = Results()
@@ -979,7 +979,7 @@ def run_all(heavy: bool = False, keep_tmp: bool = False) -> Results:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="premiere-agent smoke tests",
+        description="premiere-video-editor-agent smoke tests",
         epilog=(
             "TIP: For live output during long-running heavy mode, run with:\n"
             "    python -u tests.py --heavy --log run.log\n"

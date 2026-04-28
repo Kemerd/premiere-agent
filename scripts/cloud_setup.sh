@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# premiere-agent — cloud-sandbox bootstrap.
+# premiere-video-editor-agent — cloud-sandbox bootstrap.
 #
 # This script runs INSIDE the cloud sandbox (Claude Code on the web,
 # Codex Cloud, GitHub Actions, devcontainer, Docker) on the very first
@@ -24,10 +24,10 @@
 # field as a single one-liner:
 #
 #   Claude Code on the web (env settings -> Setup script):
-#     bash .claude/skills/premiere-agent/scripts/cloud_setup.sh
+#     bash .claude/skills/premiere-video-editor-agent/scripts/cloud_setup.sh
 #
 #   Codex Cloud (environment -> Setup script):
-#     bash .agents/skills/premiere-agent/scripts/cloud_setup.sh
+#     bash .agents/skills/premiere-video-editor-agent/scripts/cloud_setup.sh
 #
 # (Adjust the path if the user mounted the skill at a different
 # subdirectory of their videos repo.)
@@ -127,7 +127,7 @@ fi
 #
 #    The agent's parent_rules.md mandates `python helpers/health.py
 #    --json` as step 0 of every session. Cached for 7 days at
-#    ~/.premiere-agent/health.json so subsequent calls return in
+#    ~/.premiere-video-editor-agent/health.json so subsequent calls return in
 #    <500 ms. Running it here means the agent's very first invocation
 #    hits the cache instead of paying the smoke-test cost on top of
 #    the model-download cost it ALSO can't avoid.
