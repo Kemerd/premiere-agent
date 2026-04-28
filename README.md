@@ -1,3 +1,13 @@
+> **This is Cursor for video editing.**
+>
+> Not another "AI editor" gimmick — real engineering. Three perception lanes (Parakeet ONNX speech, Florence-2 visual captions, CLAP audio events scored against an agent-curated vocabulary) feed a parent/sub-agent loop that reasons over *text timelines* instead of pixels, so iteration on revision 50 costs the same as revision 1. State-of-the-art open models, composed in a way nobody else is composing them, running **100% local**.
+>
+> Drop raw footage in a folder, talk to it like an assistant editor, and get an `.fcpxml` straight into your timeline — real J/L cuts, dissolves, retimes, captions, plus a written rationale for every cut you can inspect, reject, or iterate on by just saying so. No cloud. No black box. No watermark. No subscription. You stay the editor. The agent does the work.
+>
+> **If you edit for a living, this saves you hundreds of hours.**
+
+---
+
 # premiere-agent
 
 Edit videos by conversation — runs **100% locally** and exports straight into **Premiere Pro** (and Resolve, and Final Cut) with **J cuts, L cuts, dissolves**, and the rest of the cut vocabulary you'd actually use in an NLE.
