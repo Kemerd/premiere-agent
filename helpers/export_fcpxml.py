@@ -429,10 +429,19 @@ def _probe_source_meta(path: Path) -> dict:
 def _pick_primary_source(edl: dict) -> str | None:
     """Return the source key whose ranges sum to the largest cut duration.
 
+    Scripted assemblies may carry a top-level ``audio_bed``. In that
+    shape the bed is the compatibility-critical audio source, so prefer
+    it for the primary-source metadata while still taking video geometry
+    from the visible b-roll ranges later in _resolve_sequence_settings().
+
     Ties are broken by the order of first appearance in the EDL, which
     mirrors how an editor would naturally think of the "primary" clip.
     Returns None for an empty EDL (caller falls back to defaults).
     """
+    audio_bed = edl.get("audio_bed")
+    if isinstance(audio_bed, dict) and audio_bed.get("source"):
+        return str(audio_bed["source"])
+
     totals: dict[str, float] = {}
     order: dict[str, int] = {}
     ranges = edl.get("ranges") or edl.get("edl") or []
@@ -469,6 +478,11 @@ def _collect_used_sources(edl: dict) -> list[str]:
     ranges = edl.get("ranges") or edl.get("edl") or []
     for r in ranges:
         src = r.get("source")
+        if src and src not in seen:
+            seen[src] = None
+    audio_bed = edl.get("audio_bed")
+    if isinstance(audio_bed, dict):
+        src = audio_bed.get("source")
         if src and src not in seen:
             seen[src] = None
     return list(seen.keys())
@@ -819,6 +833,240 @@ def _read_audio_strategy(r: dict, speed: float, range_idx: int) -> str:
     return "keep" if abs(speed - 1.0) < 1e-9 else "drop"
 
 
+def _new_media_ref_for_source(src_path_resolved: Path, src_meta: dict,
+                              media_dur_s: float, frame_rate: float):
+    """Build an OTIO ExternalReference with truthful stream metadata."""
+    otio = _import_otio()
+    media_avail_range = otio.opentime.TimeRange(
+        start_time=otio.opentime.RationalTime(0, frame_rate),
+        duration=_rt(media_dur_s, frame_rate),
+    )
+    ref = otio.schema.ExternalReference(
+        target_url=_safe_file_url(src_path_resolved),
+        available_range=media_avail_range,
+    )
+
+    fcp_xml_media: dict = {}
+    if src_meta["has_video"]:
+        fcp_xml_media["video"] = {
+            "samplecharacteristics": {
+                "width": src_meta["video_width"],
+                "height": src_meta["video_height"],
+            },
+        }
+    if src_meta["has_audio"]:
+        fcp_xml_media["audio"] = {
+            "channelcount": src_meta["audio_channels"],
+            "samplecharacteristics": {
+                "depth": 16,
+                "samplerate": src_meta["audio_rate"],
+            },
+        }
+    if fcp_xml_media:
+        ref.metadata["fcp_xml"] = {"media": fcp_xml_media}
+    ref.metadata["premiere-video-editor-agent"] = {
+        "audio_channels": src_meta["audio_channels"],
+        "audio_rate": src_meta["audio_rate"],
+        "has_audio": src_meta["has_audio"],
+        "has_video": src_meta["has_video"],
+    }
+    return ref
+
+
+def _build_timeline_with_audio_bed(
+    edl: dict, frame_rate: float, sequence_settings: dict | None = None
+):
+    """Build scripted VO assembly: b-roll ranges on V1, one VO bed on A1."""
+    otio = _import_otio()
+
+    sources = edl.get("sources") or {}
+    ranges = edl.get("ranges") or edl.get("edl") or []
+    audio_bed = edl.get("audio_bed") or {}
+    if not isinstance(audio_bed, dict) or not audio_bed.get("source"):
+        raise ValueError("audio_bed EDL requires {'source', 'start', 'end'}")
+    if not ranges:
+        raise ValueError("EDL has no b-roll ranges")
+
+    timeline = otio.schema.Timeline(name=edl.get("name") or "VU_Sequence")
+    timeline.global_start_time = otio.opentime.RationalTime(0, frame_rate)
+    if sequence_settings:
+        timeline.metadata["premiere-video-editor-agent"] = {
+            "sequence": dict(sequence_settings),
+        }
+
+    v_track = otio.schema.Track(
+        name="V1", kind=otio.schema.TrackKind.Video,
+    )
+    a_track = otio.schema.Track(
+        name="A1_VO", kind=otio.schema.TrackKind.Audio,
+    )
+    timeline.tracks.append(v_track)
+    timeline.tracks.append(a_track)
+
+    cur_v = 0.0
+    speed_map: dict[str, dict] = {}
+
+    for i, r in enumerate(ranges):
+        src_name = r["source"]
+        if src_name not in sources:
+            raise KeyError(f"range[{i}].source '{src_name}' not in sources map")
+        src_path_resolved = Path(sources[src_name]).resolve()
+        src_meta = _probe_source_meta(src_path_resolved)
+        if not src_meta["has_video"]:
+            print(
+                f"  skip range[{i}] {src_name}: source has no video stream",
+                file=sys.stderr,
+            )
+            continue
+
+        start = float(r["start"])
+        end = float(r["end"])
+        if end <= start:
+            print(f"  skip range[{i}] {src_name}: zero/negative duration",
+                  file=sys.stderr)
+            continue
+
+        speed = _read_speed(r, i)
+        if float(r.get("audio_lead", 0) or 0) != 0.0:
+            print(f"  warn: range[{i}] audio_lead ignored in audio_bed mode",
+                  file=sys.stderr)
+        if float(r.get("video_tail", 0) or 0) != 0.0:
+            print(f"  warn: range[{i}] video_tail ignored in audio_bed mode",
+                  file=sys.stderr)
+        trans_in = float(r.get("transition_in", 0) or 0)
+
+        media_dur_s = src_meta["duration_s"]
+        if media_dur_s and media_dur_s > 0:
+            safety_s = 6.0 / float(frame_rate)
+            max_end = max(0.0, media_dur_s - safety_s)
+            if start < 0.0 or end > max_end:
+                print(
+                    f"  warn: range[{i}] {src_name} source window "
+                    f"[{start:.3f}s, {end:.3f}s] exceeds media bounds "
+                    f"[0, {max_end:.3f}s] - clamping.",
+                    file=sys.stderr,
+                )
+            start = max(0.0, start)
+            end = min(end, max_end)
+            if end <= start:
+                print(f"  skip range[{i}] {src_name}: clamp collapsed range",
+                      file=sys.stderr)
+                continue
+
+        v_start = _snap_to_frame(start, frame_rate)
+        v_end = _snap_to_frame(end, frame_rate)
+        v_src_dur = max(0.0, v_end - v_start)
+        v_out_dur = _snap_to_frame(v_src_dur / speed, frame_rate)
+        if v_out_dur <= 0:
+            print(f"  skip range[{i}] {src_name}: below one-frame duration",
+                  file=sys.stderr)
+            continue
+
+        if trans_in > 0 and len(v_track) > 0:
+            half = _snap_to_frame(trans_in / 2.0, frame_rate)
+            half_rt = _rt(half, frame_rate)
+            v_track.append(otio.schema.Transition(
+                name=f"xfade_{i:02d}",
+                in_offset=half_rt, out_offset=half_rt,
+                transition_type=otio.schema.TransitionTypes.SMPTE_Dissolve,
+            ))
+
+        src_file_stem = src_path_resolved.stem
+        v_clip_name = f"{src_file_stem}_v_{i:02d}"
+        v_clip = otio.schema.Clip(
+            name=v_clip_name,
+            media_reference=_new_media_ref_for_source(
+                src_path_resolved, src_meta, media_dur_s, frame_rate,
+            ),
+            source_range=_range(v_start, v_out_dur, frame_rate),
+        )
+        v_clip.metadata["premiere-video-editor-agent"] = {
+            "beat": r.get("beat"),
+            "quote": r.get("quote"),
+            "reason": r.get("reason"),
+            "speed": speed,
+        }
+        if speed != 1.0:
+            v_clip.effects.append(otio.schema.LinearTimeWarp(
+                name=f"timelapse_{i:02d}", time_scalar=float(speed),
+            ))
+            speed_map[v_clip_name] = {
+                "kind": "video",
+                "speed": float(speed),
+                "src_start_s": v_start,
+                "src_dur_s": v_src_dur,
+                "out_dur_s": v_out_dur,
+                "media_dur_s": float(media_dur_s),
+                "frame_rate": float(frame_rate),
+            }
+        v_track.append(v_clip)
+        cur_v += v_out_dur
+
+    bed_src_name = str(audio_bed["source"])
+    if bed_src_name not in sources:
+        raise KeyError(f"audio_bed.source '{bed_src_name}' not in sources map")
+    bed_path = Path(sources[bed_src_name]).resolve()
+    bed_meta = _probe_source_meta(bed_path)
+    if not bed_meta["has_audio"]:
+        print(f"  warn: audio_bed source {bed_src_name} has no audio stream",
+              file=sys.stderr)
+
+    bed_start = float(audio_bed.get("start", 0.0) or 0.0)
+    bed_end_raw = audio_bed.get("end")
+    bed_media_dur_s = bed_meta["duration_s"]
+    bed_end = bed_start + cur_v if bed_end_raw is None else float(bed_end_raw)
+    if bed_media_dur_s and bed_media_dur_s > 0:
+        safety_s = 6.0 / float(frame_rate)
+        max_end = max(0.0, bed_media_dur_s - safety_s)
+        if bed_start < 0.0 or bed_end > max_end:
+            print(
+                f"  warn: audio_bed source window [{bed_start:.3f}s, "
+                f"{bed_end:.3f}s] exceeds media bounds [0, {max_end:.3f}s] "
+                "- clamping.",
+                file=sys.stderr,
+            )
+        bed_start = max(0.0, bed_start)
+        bed_end = min(bed_end, max_end)
+    bed_start = _snap_to_frame(bed_start, frame_rate)
+    bed_end = _snap_to_frame(bed_end, frame_rate)
+    bed_dur = max(0.0, bed_end - bed_start)
+    if bed_dur <= 0:
+        raise ValueError("audio_bed duration is zero after clamping")
+
+    a_clip = otio.schema.Clip(
+        name=f"{bed_path.stem}_vo_bed",
+        media_reference=_new_media_ref_for_source(
+            bed_path, bed_meta, bed_media_dur_s, frame_rate,
+        ),
+        source_range=_range(bed_start, bed_dur, frame_rate),
+    )
+    a_clip.metadata["premiere-video-editor-agent"] = {
+        "beat": "VOICEOVER_BED",
+        "quote": audio_bed.get("quote"),
+        "reason": audio_bed.get("reason") or "Continuous VO audio bed",
+    }
+    a_track.append(a_clip)
+
+    if cur_v + (1.0 / frame_rate) < bed_dur:
+        v_track.append(otio.schema.Gap(
+            name="black_tail_for_voiceover",
+            source_range=_range(0.0, bed_dur - cur_v, frame_rate),
+        ))
+        cur_v = bed_dur
+    elif bed_dur + (1.0 / frame_rate) < cur_v:
+        print(
+            f"  warn: b-roll video duration {cur_v:.3f}s exceeds "
+            f"audio_bed duration {bed_dur:.3f}s.",
+            file=sys.stderr,
+        )
+
+    if speed_map:
+        bucket = timeline.metadata.setdefault("premiere-video-editor-agent", {})
+        bucket["speed_map"] = dict(speed_map)
+
+    return timeline
+
+
 # ---------------------------------------------------------------------------
 # Core build — produces an OTIO Timeline with two tracks (V1 + A1).
 #
@@ -833,6 +1081,10 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
 
     Schema fields honored:
       - sources           : map source_id → absolute path
+      - audio_bed         : optional scripted-assembly VO bed dict
+        - source, start, end : audio source key + source-time span.
+                              When present, ranges are video-only b-roll on
+                              V1 and the audio_bed plays continuously on A1.
       - ranges[]          : the cut list (also accepts top-level "edl")
         - source          : key into sources
         - start, end      : float seconds in the SOURCE clip
@@ -859,6 +1111,12 @@ def build_timeline(edl: dict, frame_rate: float, sequence_settings: dict | None 
     `_speed_map_from_timeline()` for the read side.
     """
     otio = _import_otio()
+    if isinstance(edl.get("audio_bed"), dict):
+        return _build_timeline_with_audio_bed(
+            edl,
+            frame_rate=frame_rate,
+            sequence_settings=sequence_settings,
+        )
 
     sources = edl.get("sources") or {}
     ranges = edl.get("ranges") or edl.get("edl") or []
