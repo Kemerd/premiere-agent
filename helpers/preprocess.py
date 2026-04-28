@@ -31,6 +31,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -82,6 +83,42 @@ def _is_audio_only(path: Path) -> bool:
     docstring for rationale.
     """
     return path.suffix.lower() in AUDIO_ONLY_EXTS
+
+
+def _has_audio_stream(path: Path) -> bool:
+    """Return True when ffprobe sees at least one audio stream.
+
+    Some B-roll cameras / transfer tools produce perfectly valid video
+    files with no audio stream. Those should still go to the visual lane,
+    but they must not be sent through extraction, speech, or CLAP.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        # The health check enforces ffprobe, but keep direct library use
+        # from crashing here. Extraction will raise a clearer ffmpeg error.
+        return True
+    proc = subprocess.run(
+        [
+            ffprobe,
+            "-v", "error",
+            "-print_format", "json",
+            "-show_streams",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if proc.returncode != 0:
+        return False
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    return any(
+        isinstance(s, dict) and s.get("codec_type") == "audio"
+        for s in data.get("streams", [])
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -308,8 +345,8 @@ def _kwargs_to_json(extra_args: list[str]) -> str:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def _shared_audio_extraction(videos: list[Path], edit_dir: Path) -> None:
-    """Pre-extract 16kHz mono WAVs for all videos before the lanes run.
+def _shared_audio_extraction(sources: list[Path], edit_dir: Path) -> None:
+    """Pre-extract 16kHz mono WAVs for all audio-capable sources.
 
     Doing this up front (instead of inside the speech / audio lanes)
     means we get a clean progress bar over the ffmpeg work AND we avoid
@@ -322,11 +359,11 @@ def _shared_audio_extraction(videos: list[Path], edit_dir: Path) -> None:
 
     with lane_progress(
         "extract",
-        total=len(videos),
-        unit="video",
+        total=len(sources),
+        unit="source",
         desc="ffmpeg → 16kHz mono WAV",
     ) as bar:
-        for v in videos:
+        for v in sources:
             bar.start_item(v.name)
             try:
                 extract_audio_for(v, edit_dir, verbose=True)
@@ -534,6 +571,12 @@ def run_preprocess(
     #                                   would crash the prefetch)
     video_sources = [v for v in videos if not _is_audio_only(v)]
     audio_only_sources = [v for v in videos if _is_audio_only(v)]
+    audio_sources = [v for v in videos if _has_audio_stream(v)]
+    audio_source_set = set(audio_sources)
+    visual_only_sources = [
+        v for v in video_sources
+        if v not in audio_source_set
+    ]
 
     # Wealthy mode is global: propagate to env so child lanes see it
     # without us having to add --wealthy to every shim invocation.
@@ -569,9 +612,19 @@ def run_preprocess(
         f"{len(audio_only_sources)} audio-only "
         f"({len(videos)} total)"
     )
+    if visual_only_sources:
+        print(
+            f"[orchestrator] Visual-only: {len(visual_only_sources)} video "
+            "source(s) have no audio stream; skipping extraction/speech/audio "
+            "for them, keeping them for visual captions."
+        )
+        for src in visual_only_sources[:10]:
+            print(f"  - [visual-only] {src.name}")
+        if len(visual_only_sources) > 10:
+            print(f"  ... +{len(visual_only_sources) - 10} more")
 
     # 2) Shared audio extraction (cheap, single-threaded ffmpeg)
-    _shared_audio_extraction(videos, edit_dir)
+    _shared_audio_extraction(audio_sources, edit_dir)
 
     # 3) Build lane jobs
     use_cpu = (schedule == Schedule.CPU_FALLBACK)
@@ -579,7 +632,7 @@ def run_preprocess(
     audio_device_arg = "cpu" if use_cpu else "cuda"
 
     jobs: list[LaneJob] = []
-    if not skip_speech:
+    if not skip_speech and audio_sources:
         wargs = ["--device", device_arg]
         if language:
             wargs += ["--language", language]
@@ -594,7 +647,9 @@ def run_preprocess(
         # inside _run_lane() based on VIDEO_USE_SPEECH_LANE; the
         # `script` field below is just a label kept around for log
         # diagnostics and the legacy LaneJob shape.
-        jobs.append(LaneJob("speech", "parakeet_onnx_lane.py", videos, edit_dir, wargs))
+        jobs.append(LaneJob("speech", "parakeet_onnx_lane.py", audio_sources, edit_dir, wargs))
+    elif not skip_speech and not audio_sources:
+        print("[orchestrator] speech lane skipped - no audio-capable sources")
 
     if include_audio:
         # Phase A audio with the baked-in baseline vocabulary. Off by
@@ -606,7 +661,10 @@ def run_preprocess(
         aargs = ["--device", audio_device_arg]
         if force:
             aargs += ["--force"]
-        jobs.append(LaneJob("audio", "audio_lane.py", videos, edit_dir, aargs))
+        if audio_sources:
+            jobs.append(LaneJob("audio", "audio_lane.py", audio_sources, edit_dir, aargs))
+        else:
+            print("[orchestrator] audio lane skipped - no audio-capable sources")
 
     # ── Visual lane scoping ───────────────────────────────────────────
     # Florence-2 needs frames, so we hand it ONLY the video sources.

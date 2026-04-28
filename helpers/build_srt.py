@@ -153,6 +153,81 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
     entries: list[tuple[float, float, str]] = []
     seg_offset = 0.0
 
+    audio_bed = edl.get("audio_bed")
+    if isinstance(audio_bed, dict) and audio_bed.get("source"):
+        src_name = str(audio_bed["source"])
+        src_ref = sources.get(src_name)
+        if not src_ref:
+            print(f"  no source mapping for audio_bed {src_name}, skipping captions")
+            return
+        src_stem = Path(src_ref).stem
+        tr_path = transcripts_dir / f"{src_stem}.json"
+        if not tr_path.exists():
+            legacy = transcripts_dir / f"{src_name}.json"
+            if legacy.exists():
+                tr_path = legacy
+            else:
+                print(f"  no transcript for audio_bed {src_name} "
+                      f"(looked for {src_stem}.json), skipping captions")
+                return
+
+        bed_start = float(audio_bed.get("start", 0.0) or 0.0)
+        bed_end_raw = audio_bed.get("end")
+        transcript = json.loads(tr_path.read_text(encoding="utf-8"))
+        if bed_end_raw is None:
+            words_all = [
+                w for w in transcript.get("words", [])
+                if w.get("type") == "word" and w.get("end") is not None
+            ]
+            bed_end = max((float(w.get("end", 0.0)) for w in words_all),
+                          default=bed_start)
+        else:
+            bed_end = float(bed_end_raw)
+
+        words_in_seg = _words_in_range(transcript, bed_start, bed_end)
+        chunks: list[list[dict]] = []
+        current: list[dict] = []
+        for w in words_in_seg:
+            text = (w.get("text") or "").strip()
+            if not text:
+                continue
+            current.append(w)
+            ends_in_punct = bool(text) and text[-1] in PUNCT_BREAK
+            if len(current) >= 2 or ends_in_punct:
+                chunks.append(current)
+                current = []
+        if current:
+            chunks.append(current)
+
+        for chunk in chunks:
+            local_start = max(bed_start, chunk[0].get("start", bed_start))
+            local_end = min(bed_end, chunk[-1].get("end", bed_end))
+            out_start = max(0.0, local_start - bed_start)
+            out_end = max(0.0, local_end - bed_start)
+            if out_end <= out_start:
+                out_end = out_start + 0.4
+            text = " ".join((w.get("text") or "").strip() for w in chunk)
+            text = re.sub(r"\s+", " ", text).strip()
+            text = text.rstrip(",;:")
+            text = text.upper()
+            entries.append((out_start, out_end, text))
+
+        if not entries:
+            print(f"  warn: no captions emitted from audio_bed; skipping "
+                  f"{out_path.name}", file=sys.stderr)
+            return
+
+        entries.sort(key=lambda e: e[0])
+        lines: list[str] = []
+        for i, (a, b, t) in enumerate(entries, start=1):
+            lines.append(str(i))
+            lines.append(f"{_srt_timestamp(a)} --> {_srt_timestamp(b)}")
+            lines.append(t)
+            lines.append("")
+        out_path.write_text("\r\n".join(lines), encoding="utf-8", newline="")
+        print(f"master SRT -> {out_path.name} ({len(entries)} cues)")
+        return
+
     for i, r in enumerate(edl["ranges"]):
         src_name = r["source"]
         seg_start = float(r["start"])
