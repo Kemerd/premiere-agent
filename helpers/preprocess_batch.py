@@ -456,9 +456,28 @@ def main() -> None:
     )
     ap.add_argument("videos_dir", type=Path,
                     help="Directory containing source media (video files "
-                         "and/or audio-only files like voiceover .wav)")
+                         "and/or audio-only files like voiceover .wav). "
+                         "Recursed by default — see --no-recurse / --max-depth.")
     ap.add_argument("--edit-dir", type=Path, default=None,
                     help="Edit output dir (default: <videos_dir>/edit)")
+    # ── Recursion controls ───────────────────────────────────────────
+    # Recursion is ON by default so the skill's documented folder
+    # conventions (b_roll/, a_roll/, timelapse/, voiceover/) are picked
+    # up automatically. The pruning denylist (`_PRUNE_DIR_NAMES` plus
+    # the dot/underscore-prefix rule in `_is_pruned_dir`) keeps us out
+    # of `edit/`, proxies, hidden dirs, and other bookkeeping subtrees.
+    # Two escape hatches for unusual layouts:
+    #   --no-recurse   restores the legacy top-level-only walk
+    #   --max-depth N  bounds how far we'll descend (0 = no cap)
+    ap.add_argument("--no-recurse", action="store_true",
+                    help="Disable subdirectory recursion (legacy "
+                         "behaviour — only files directly inside "
+                         "videos_dir are picked up).")
+    ap.add_argument("--max-depth", type=int, default=_DEFAULT_MAX_DEPTH,
+                    help=f"Max recursion depth below videos_dir "
+                         f"(default: {_DEFAULT_MAX_DEPTH}; 0 = no cap). "
+                         f"Tight enough that a wrong-root invocation "
+                         f"doesn't walk gigabytes of unrelated files.")
     ap.add_argument("--force-schedule",
                     choices=[s.value for s in Schedule],
                     default=None,
@@ -526,7 +545,15 @@ def main() -> None:
     if not videos_dir.is_dir():
         sys.exit(f"[preprocess_batch] FATAL: not a directory: {videos_dir}")
 
-    videos, audio_only = _discover_sources(videos_dir)
+    # Recursion + depth come from the parsed CLI args. `--no-recurse`
+    # short-circuits to the legacy top-level-only path; `--max-depth`
+    # bounds the walk depth (0 = unbounded). Defaults are recurse=True
+    # and max_depth=10 — see `_DEFAULT_MAX_DEPTH` for the rationale.
+    videos, audio_only = _discover_sources(
+        videos_dir,
+        recurse=not args.no_recurse,
+        max_depth=args.max_depth,
+    )
     if not videos and not audio_only:
         sys.exit(
             f"[preprocess_batch] no source media in {videos_dir}\n"
