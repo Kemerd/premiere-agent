@@ -82,107 +82,6 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 
-MERGED_VOWEL_DROP_THRESHOLD_BYTES = 888 * 1024
-MERGED_VOWEL_DROP_LEADING_CHARS = 1
-MERGED_VOWEL_DROP_TRAILING_CHARS = 1
-_VOWELS = frozenset("aeiouAEIOU")
-_WORD_RE = re.compile(r"[A-Za-z]+")
-_MERGED_VISUAL_LINE_RE = re.compile(
-    r"(?m)^(\s*\d+:\d{2}(?::\d{2})?\s+(?:\+\s+)?)\[([^\]\n]*)\]",
-)
-
-
-def _vowel_drop_word(
-    word: str,
-    *,
-    leading_chars: int = MERGED_VOWEL_DROP_LEADING_CHARS,
-    trailing_chars: int = MERGED_VOWEL_DROP_TRAILING_CHARS,
-) -> str:
-    """Drop interior vowels from one visual-caption word.
-
-    Vowels survive only when they sit in the configured leading or
-    trailing edge slots. Defaults preserve first/last characters only,
-    but callers can widen either edge to 2 chars when readability wins.
-    """
-    if len(word) <= 2:
-        return word
-
-    out: list[str] = []
-    dropped = False
-    leading_chars = max(0, leading_chars)
-    trailing_chars = max(0, trailing_chars)
-    trailing_start = max(0, len(word) - trailing_chars)
-    for i, ch in enumerate(word):
-        in_edge = i < leading_chars or i >= trailing_start
-        if ch in _VOWELS and not in_edge:
-            dropped = True
-            continue
-        out.append(ch)
-
-    squeezed = "".join(out)
-    if (
-        dropped
-        and len(squeezed) >= 2
-        and squeezed[0] == squeezed[1]
-        and squeezed[0] not in _VOWELS
-    ):
-        # Match the user's stretched-spelling example: bbooll -> bll.
-        squeezed = squeezed[1:]
-    return squeezed
-
-
-def _vowel_drop_visual_text(
-    text: str,
-    *,
-    leading_chars: int = MERGED_VOWEL_DROP_LEADING_CHARS,
-    trailing_chars: int = MERGED_VOWEL_DROP_TRAILING_CHARS,
-) -> str:
-    """Apply vowel-drop word-by-word inside visual caption text only."""
-    return _WORD_RE.sub(
-        lambda m: _vowel_drop_word(
-            m.group(0),
-            leading_chars=leading_chars,
-            trailing_chars=trailing_chars,
-        ),
-        text,
-    )
-
-
-def _vowel_drop_merged_visuals(
-    text: str,
-    *,
-    leading_chars: int = MERGED_VOWEL_DROP_LEADING_CHARS,
-    trailing_chars: int = MERGED_VOWEL_DROP_TRAILING_CHARS,
-) -> str:
-    """Squeeze only merged-timeline visual `[caption]` payloads.
-
-    Speech speaker tags like `[S0]` live on range lines (`0:02-0:18`)
-    and audio uses parentheses, so this regex leaves both lanes alone.
-    """
-    def repl(match: re.Match[str]) -> str:
-        prefix, body = match.groups()
-        squeezed = _vowel_drop_visual_text(
-            body,
-            leading_chars=leading_chars,
-            trailing_chars=trailing_chars,
-        )
-        return (
-            f"{prefix}["
-            f"{squeezed}"
-            f"]"
-        )
-
-    return _MERGED_VISUAL_LINE_RE.sub(repl, text)
-
-
-def _maybe_vowel_drop_oversized_merged(text: str) -> tuple[str, bool]:
-    """Apply the extra visual-only squeeze when merged markdown is huge."""
-    if len(text.encode("utf-8")) <= MERGED_VOWEL_DROP_THRESHOLD_BYTES:
-        return text, False
-    squeezed = _vowel_drop_merged_visuals(text)
-    return squeezed, squeezed != text
-
-
 # ---------------------------------------------------------------------------
 # Time formatting helpers
 #
@@ -1232,21 +1131,14 @@ def main() -> None:
 
     if args.merge:
         out_merged = edit_dir / "merged_timeline.md"
-        merged_text, vowel_dropped = _maybe_vowel_drop_oversized_merged(
+        out_merged.write_text(
             _build_merged(
                 edit_dir,
                 args.silence_threshold,
                 prefer_caveman=args.caveman,
-            )
+            ),
+            encoding="utf-8",
         )
-        if vowel_dropped:
-            print(
-                f"[pack_timelines] merged_timeline.md exceeded "
-                f"{MERGED_VOWEL_DROP_THRESHOLD_BYTES // 1024} KB; "
-                f"vowel-dropped visual captions only.",
-                file=sys.stderr,
-            )
-        out_merged.write_text(merged_text, encoding="utf-8")
         written.append(out_merged)
 
         # Legacy `audiovisual_timeline.md` cleanup — the rename
