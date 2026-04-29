@@ -800,6 +800,7 @@ def _build_merged(
     silence_threshold: float,
     *,
     prefer_caveman: bool = True,
+    visual_stride: int = 1,
 ) -> str:
     """Walk transcripts + audio_tags + visual_caps in lock-step per
     video and emit one timestamp-sorted (speech + audio + visual)
@@ -807,6 +808,19 @@ def _build_merged(
 
     `prefer_caveman` controls whether we read the caveman-compressed
     visual caps (default) or the raw paragraphs.
+
+    `visual_stride` keeps every Nth post-dedup visual caption (1 = keep
+    all, 2 = keep every other → effectively 0.5 fps if the source ran
+    at 1 fps, etc.). The dedup walk still updates its `prev_norms`
+    baseline against EVERY caption so the delta lines that DO survive
+    stride-skipping stay tight against the most recently observed
+    visual state — the agent loses density, not delta accuracy. Used
+    by the auto-trim path in `main()` to keep `merged_timeline.md`
+    under a soft byte budget on visually dense projects (hours of
+    1-fps Florence on top of speech + audio is the worst case). When
+    stride > 1, a header banner is emitted so the agent knows visuals
+    are thinned and should drill into `visual_timeline.md` for the
+    full-density caption stream when a visual moment is ambiguous.
     """
     transcripts = edit_dir / "transcripts"
     audio_tags = edit_dir / "audio_tags"
@@ -864,6 +878,30 @@ def _build_merged(
     )
     out.append("")
 
+    # ── Visual auto-trim banner ──
+    # `main()` checks the size of `visual_timeline.md` (a strong proxy
+    # for how big the visual lane will land in the merged file) and,
+    # if the lane is dense enough that the merged file would blow past
+    # the soft byte budget, passes `visual_stride > 1` here. Surface
+    # that to the agent at the top of the file so the lower visual
+    # density is OBVIOUS on first read — the agent should still drill
+    # into `visual_timeline.md` for any visually ambiguous moment, but
+    # now they know to do it more often than usual on this project.
+    if visual_stride > 1:
+        kept_pct = int(round(100.0 / visual_stride))
+        out.append(
+            f"> **VISUAL LANE THINNED {visual_stride}x — keeping every "
+            f"{visual_stride}th post-dedup caption (~{kept_pct}% of the "
+            f"full visual stream).** Auto-applied because the full-"
+            f"density `visual_timeline.md` exceeded the soft size "
+            f"budget for this view. Audio events and speech phrases "
+            f"are UNAFFECTED — only visual `[...]` lines are sparser. "
+            f"Drill into `visual_timeline.md` whenever a visual moment "
+            f"in this file is ambiguous; you'll find the full per-"
+            f"second caption stream there with `(same)` markers."
+        )
+        out.append("")
+
     # ── Sort stability for same-timestamp collisions ──
     # Within identical start times we want a predictable visual order:
     # visual context first (sets the scene), then audio events
@@ -896,6 +934,14 @@ def _build_merged(
             data = json.loads(vp.read_text(encoding="utf-8"))
             caps = data.get("captions") or data.get("captions_dedup") or []
             prev_norms: list[str] = []
+            # `kept_idx` counts only POST-DEDUP survivors per stem. The
+            # stride filter (visual_stride > 1) keeps indices 0, S, 2S,
+            # ... and drops the rest. The dedup baseline `prev_norms`
+            # is updated INSIDE `_delta_caption` regardless of whether
+            # we emit, so the next surviving caption's delta still
+            # measures against the most recently observed visual state
+            # — stride costs density, not delta accuracy.
+            kept_idx = 0
             for c in caps:
                 t = float(c.get("t", 0.0))
                 raw = (c.get("text") or "").strip().replace("\n", " ")
@@ -908,6 +954,13 @@ def _build_merged(
                 mode, prev_norms, display = _delta_caption(raw, prev_norms)
                 if mode in ("same", "empty"):
                     continue
+                # Stride drop happens AFTER the dedup walk so we count
+                # surviving captions, not raw frames. Index 0 is always
+                # kept so every stem starts with a visual anchor.
+                if visual_stride > 1 and (kept_idx % visual_stride) != 0:
+                    kept_idx += 1
+                    continue
+                kept_idx += 1
                 if mode == "delta" and display.startswith("+ "):
                     body = display[2:]
                     line = f"{_hms(t)} + [{body}]"
@@ -1064,6 +1117,26 @@ def main() -> None:
     ap.add_argument("--force-caveman", action="store_true",
                     help="Re-compress every visual_caps file even if "
                          "the cached comp output is fresh.")
+    # ── Merged-file visual auto-trim ──
+    # `merged_timeline.md` is the agent's default reading surface and
+    # gets read end-to-end every spawn — keeping it under a soft byte
+    # budget matters for both context window and read latency. Visual
+    # captions dominate the size on dense projects (long shoots, lots
+    # of motion → few `(same)` collapses). We use the size of the
+    # full-density `visual_timeline.md` as a CHEAP up-front proxy:
+    # write it first, stat it, and if it's over the threshold pass a
+    # `visual_stride` to `_build_merged` that drops every Nth post-
+    # dedup visual caption. `visual_timeline.md` itself is ALWAYS
+    # written at full density so the agent can drill into it for the
+    # complete caption stream when a visual moment is ambiguous.
+    ap.add_argument("--max-visual-kb", type=float, default=500.0,
+                    help="Soft byte budget (KB) for the visual lane in "
+                         "the merged file. When `visual_timeline.md` "
+                         "exceeds this on disk, every other post-dedup "
+                         "visual caption is dropped from "
+                         "`merged_timeline.md` (visual_stride=2). "
+                         "`visual_timeline.md` itself is ALWAYS full "
+                         "density. Default 500. Pass 0 to disable.")
     args = ap.parse_args()
 
     edit_dir = args.edit_dir.resolve()
@@ -1130,12 +1203,33 @@ def main() -> None:
     written = [out_speech, out_audio, out_visual]
 
     if args.merge:
+        # ── Decide visual stride for the merged file ──
+        # Use the full-density `visual_timeline.md` (just written above)
+        # as a cheap proxy for how big the visual lane will land in the
+        # merged file. If it busts the soft byte budget, halve the
+        # visual density in the merged view (every other post-dedup
+        # caption). The drill-down `visual_timeline.md` stays at full
+        # density on disk regardless — the agent zooms in there when a
+        # visual moment in the merged view is ambiguous near a cut.
+        visual_stride = 1
+        if args.max_visual_kb > 0 and out_visual.exists():
+            v_kb = out_visual.stat().st_size / 1024
+            if v_kb > args.max_visual_kb:
+                visual_stride = 2
+                print(
+                    f"  visual_timeline.md is {v_kb:.1f} KB (> "
+                    f"{args.max_visual_kb:.0f} KB budget) — thinning "
+                    f"merged_timeline.md visuals to every {visual_stride}nd "
+                    f"caption. Full density preserved in "
+                    f"visual_timeline.md."
+                )
         out_merged = edit_dir / "merged_timeline.md"
         out_merged.write_text(
             _build_merged(
                 edit_dir,
                 args.silence_threshold,
                 prefer_caveman=args.caveman,
+                visual_stride=visual_stride,
             ),
             encoding="utf-8",
         )
