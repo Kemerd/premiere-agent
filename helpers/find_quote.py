@@ -80,6 +80,27 @@ Calling shapes
     #    for the "last clip we talked about" case.
     find_quote.py --edit-dir <edit> --quote "lock in"
 
+    # 5. Batched — one Python startup, N queries answered. The agent
+    #    builds a JSON document with a `queries` array (each row is the
+    #    same shape as the single-query CLI: `clip` / `quote` / `range`
+    #    / `start` / `end` / `max_matches`, all optional except that
+    #    every row must carry at least a quote or a range), and pipes
+    #    it in via `--batch -` or hands over a file path. Queries are
+    #    grouped by clip internally so each transcript is loaded
+    #    exactly once no matter how many queries reference it — turns
+    #    "40 tool calls" into one. Per-row failures (bad clip stem,
+    #    empty quote, etc.) come back as `{error, detail}` rows
+    #    instead of crashing the whole batch:
+    #
+    #    echo '{
+    #      "queries": [
+    #        {"id":"a","clip":"DJI_..._0176_D","range":"0:02-0:18",
+    #         "quote":"fabricate a hook"},
+    #        {"id":"b","clip":"DJI_..._0176_D","quote":"lock in"},
+    #        {"id":"c","clip":"DJI_..._0182_D","range":"0:12-0:18"}
+    #      ]
+    #    }' | python helpers/find_quote.py --edit-dir <edit> --batch -
+
 Time arguments accept `M:SS`, `MM:SS`, `H:MM:SS`, integer seconds, or
 floating-point seconds (e.g. `1.234`). The integer-rounded ranges out
 of `merged_timeline.md` (and the `speech_timeline.md` drill-down) are
@@ -580,6 +601,183 @@ def _default_clip_stem(transcripts_dir: Path) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Per-query worker — one transcript search, returns the JSON envelope
+# ----------------------------------------------------------------------
+# Pulled out of main() so the batch path can call it N times against a
+# shared transcript cache. Returns the same envelope shape the
+# single-query CLI emits today, OR an `{error, detail, ...}` dict on
+# any per-query failure (missing transcript, bad range, empty quote,
+# no query at all). Never raises — batch callers want one bad row to
+# turn into one error row, not a whole-batch SystemExit.
+#
+# `transcript_cache` is a dict[stem -> (transcript_dict, words_list,
+# duration_s)]. The caller owns it; we just memoise loads through it.
+# Pass an empty dict for single-query mode and the cache is a no-op.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _resolve_query_range(
+    range_str: str | None,
+    start: float | str | None,
+    end: float | str | None,
+) -> tuple[float, float] | None:
+    """Same precedence as the CLI (`range` > `start`/`end`), but
+    accepts already-parsed numeric `start`/`end` from a batch row as
+    well as the string form a CLI arg would carry. Returns None when
+    no range was specified.
+    """
+    if range_str:
+        return _parse_range(range_str)
+    if start is None and end is None:
+        return None
+    if start is None or end is None:
+        raise ValueError("`start` and `end` must be provided together")
+
+    # Coerce numeric input through float() but funnel string input
+    # through _parse_time so both shapes ("0:02" and 2.0) work.
+    s = float(start) if not isinstance(start, str) else _parse_time(start)
+    e = float(end) if not isinstance(end, str) else _parse_time(end)
+    if e < s:
+        raise ValueError(f"`end` ({e}) precedes `start` ({s})")
+    return (s, e)
+
+
+def _run_query(
+    query: dict[str, Any],
+    transcripts_dir: Path,
+    transcript_cache: dict[str, tuple[dict[str, Any], list[dict[str, Any]], float | None]],
+    default_clip_stem: str | None = None,
+) -> dict[str, Any]:
+    """Execute one query against the transcripts directory.
+
+    `query` keys (all optional unless noted):
+      - clip          : transcript stem (falls back to default_clip_stem,
+                        then to most-recently-modified transcript)
+      - quote         : substring to match (must have quote OR range)
+      - range         : "M:SS-M:SS" string
+      - start, end    : numeric seconds OR M:SS string (alternative to range)
+      - max_matches   : int cap on returned matches (0 = unbounded)
+      - id            : opaque token echoed back in `query.id` so a
+                        batch caller can correlate inputs to outputs
+                        without zipping by index
+
+    Returns the same envelope shape the single-query CLI emits, or an
+    `{error, detail, query}` dict on per-query failure. The `query`
+    echo on errors carries the `id` if one was passed, plus whichever
+    inputs we managed to read before failing.
+    """
+    # ── Echo block — built up as we resolve inputs so any error path
+    #    returns as much context as we have at the point of failure.
+    query_echo: dict[str, Any] = {}
+    if "id" in query:
+        query_echo["id"] = query.get("id")
+    query_echo["quote"] = query.get("quote")
+
+    # ── Resolve clip stem (per-query > batch default > newest mtime) ──
+    clip_stem = query.get("clip") or default_clip_stem
+    if clip_stem is None:
+        try:
+            clip_stem = _default_clip_stem(transcripts_dir)
+        except FileNotFoundError as e:
+            return {
+                "error": "no_transcripts",
+                "detail": str(e),
+                "query": query_echo,
+            }
+
+    # Tolerate "<stem>.json" — same defensive trim as the CLI path.
+    if isinstance(clip_stem, str) and clip_stem.endswith(".json"):
+        clip_stem = clip_stem[:-5]
+    query_echo["clip"] = clip_stem
+
+    # ── Load transcript via cache ──────────────────────────────────
+    # Loads cost a json.load + a words[] filter. Doing it once per
+    # unique clip across the whole batch is the whole point of
+    # batching — without the cache a 40-query batch on 12 clips
+    # would still pay 40 disk reads.
+    cached = transcript_cache.get(clip_stem)
+    if cached is None:
+        transcript_path = transcripts_dir / f"{clip_stem}.json"
+        try:
+            transcript = _load_transcript(transcript_path)
+        except FileNotFoundError as e:
+            return {
+                "error": "transcript_not_found",
+                "detail": str(e),
+                "query": query_echo,
+            }
+        words = _word_rows(transcript)
+        duration_s = transcript.get("duration")
+        transcript_cache[clip_stem] = (transcript, words, duration_s)
+    else:
+        transcript, words, duration_s = cached
+
+    transcript_path = transcripts_dir / f"{clip_stem}.json"
+
+    # ── Resolve range (string OR numeric pair) ─────────────────────
+    try:
+        time_range = _resolve_query_range(
+            query.get("range"),
+            query.get("start"),
+            query.get("end"),
+        )
+    except ValueError as e:
+        return {"error": "bad_range", "detail": str(e), "query": query_echo}
+
+    if time_range is not None:
+        rstart, rend = time_range
+        ranged_words = [w for w in words if _in_range(w, rstart, rend)]
+        query_echo["range_s"] = [rstart, rend]
+    else:
+        ranged_words = words
+        query_echo["range_s"] = None
+
+    # ── Match quote / range-only / nothing ─────────────────────────
+    quote = query.get("quote")
+    max_matches = int(query.get("max_matches", 0) or 0)
+    matches: list[dict[str, Any]] = []
+
+    if quote:
+        tokens = _tokenise_quote(quote)
+        if not tokens:
+            return {
+                "error": "empty_quote",
+                "detail": "`quote` tokenised to nothing",
+                "query": query_echo,
+            }
+        windows = _find_quote_windows(ranged_words, tokens)
+        if max_matches > 0:
+            windows = windows[:max_matches]
+        matches = [
+            _assemble_match(ranged_words, s, e, words, duration_s)
+            for s, e in windows
+        ]
+    elif time_range is not None:
+        if ranged_words:
+            matches = [
+                _assemble_match(
+                    ranged_words, 0, len(ranged_words) - 1,
+                    words, duration_s,
+                )
+            ]
+    else:
+        return {
+            "error": "no_query",
+            "detail": "pass `quote`, `range`, or both",
+            "query": query_echo,
+        }
+
+    return {
+        "clip": clip_stem,
+        "transcript": str(transcript_path),
+        "duration_s": duration_s,
+        "query": query_echo,
+        "match_count": len(matches),
+        "matches": matches,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────
 # CLI plumbing
 # ──────────────────────────────────────────────────────────────────────
 
@@ -676,35 +874,96 @@ def _build_argparser() -> argparse.ArgumentParser:
             "consuming the output can json.loads either form."
         ),
     )
+    p.add_argument(
+        "--batch",
+        type=str,
+        default=None,
+        dest="batch_path",
+        help=(
+            "Run a batch of queries from a JSON document. Pass a file "
+            "path or `-` to read from stdin. The document must be "
+            "either {\"queries\": [...]} or a bare [...] array of "
+            "query objects. Each query object accepts the same fields "
+            "as the single-query CLI (`clip`, `quote`, `range` or "
+            "`start`/`end`, `max_matches`) plus an optional `id` that "
+            "is echoed back so the caller can correlate results "
+            "without zipping by index. Queries are grouped by clip "
+            "internally so each transcript JSON is loaded exactly "
+            "once. Per-query failures come back as `{error, detail, "
+            "query}` rows; the batch never aborts mid-stream."
+        ),
+    )
     return p
 
 
-def _resolve_range(args: argparse.Namespace) -> tuple[float, float] | None:
-    """Pick the range out of the three possible argument shapes.
+def _load_batch_doc(path: str) -> list[dict[str, Any]]:
+    """Read the batch JSON document from a file path or stdin (`-`).
 
-    Precedence is `--range` > `--start/--end` > none. Using both is
-    valid only when they agree (we don't bother validating that —
-    agents shouldn't be passing both, and if they do, --range wins).
+    Accepts two top-level shapes for ergonomics:
+      • `{"queries": [...]}` — explicit, leaves room to add batch-
+        level options later (defaults, per-batch flags, etc.) without
+        a breaking change.
+      • bare `[...]` — convenient for hand-rolled batches piped in
+        via heredoc; we wrap it into the canonical shape internally.
+
+    Returns the list of per-query dicts. Raises ValueError on any
+    structural problem so the caller can convert to a clean error
+    envelope.
     """
-    if args.range_str:
-        return _parse_range(args.range_str)
-    if args.start is not None or args.end is not None:
-        if args.start is None or args.end is None:
+    # `-` means stdin — standard CLI convention. Read the whole stream
+    # rather than streaming JSON; batches are bounded by agent context
+    # (well under a megabyte) so memory is a non-issue.
+    if path == "-":
+        raw = sys.stdin.read()
+    else:
+        try:
+            with Path(path).open("r", encoding="utf-8") as f:
+                raw = f.read()
+        except FileNotFoundError as e:
+            raise ValueError(f"batch file not found: {path}") from e
+
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"batch JSON parse error: {e}") from e
+
+    # Normalise both accepted shapes down to a list of dicts.
+    if isinstance(doc, dict) and "queries" in doc:
+        queries = doc["queries"]
+    elif isinstance(doc, list):
+        queries = doc
+    else:
+        raise ValueError(
+            "batch document must be {\"queries\": [...]} or a bare list"
+        )
+
+    if not isinstance(queries, list):
+        raise ValueError("`queries` must be a list")
+
+    # Every row must be a dict — anything else (string, number, list)
+    # is almost certainly a typo and would explode deep inside
+    # _run_query with a confusing AttributeError otherwise.
+    for i, q in enumerate(queries):
+        if not isinstance(q, dict):
             raise ValueError(
-                "--start and --end must be provided together"
+                f"queries[{i}] must be an object, got {type(q).__name__}"
             )
-        if args.end < args.start:
-            raise ValueError(
-                f"--end ({args.end}) precedes --start ({args.start})"
-            )
-        return (args.start, args.end)
-    return None
+
+    return queries
 
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point. Returns process exit code: 0 on any successful
     parse + search (even when no matches found — the empty result IS
     the answer), non-zero only on argument / IO errors.
+
+    Two modes:
+      • Single-query (default) — uses --clip / --quote / --range etc.
+        from the CLI flags. Output is one envelope dict.
+      • Batch (--batch <path|->) — reads N queries from a JSON
+        document. Output is `{batch_count, results:[...]}` with one
+        result row per input query. Single Python startup, single
+        transcript load per unique clip, per-row error isolation.
     """
     parser = _build_argparser()
     args = parser.parse_args(argv)
@@ -732,105 +991,92 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    # ── Pick the clip stem ─────────────────────────────────────────
-    clip_stem = args.clip
-    if clip_stem is None:
+    # ── Shared transcript cache for the duration of this process ──
+    # Single-query mode only ever populates one entry; batch mode
+    # populates one per unique clip across the whole queries[] array.
+    # Cleared on process exit (we don't bother holding it longer).
+    transcript_cache: dict[
+        str, tuple[dict[str, Any], list[dict[str, Any]], float | None]
+    ] = {}
+
+    # ────────────────────────────────────────────────────────────────
+    # Batch path
+    # ────────────────────────────────────────────────────────────────
+    if args.batch_path:
         try:
-            clip_stem = _default_clip_stem(transcripts_dir)
-        except FileNotFoundError as e:
-            print(json.dumps({"error": "no_transcripts", "detail": str(e)}),
-                  file=sys.stderr)
+            queries = _load_batch_doc(args.batch_path)
+        except ValueError as e:
+            print(
+                json.dumps({"error": "bad_batch", "detail": str(e)}),
+                file=sys.stderr,
+            )
             return 2
 
-    # Strip a trailing `.json` if the agent over-reached and pasted
-    # the full filename. Defensive — keeps the CLI robust to small
-    # quoting mistakes.
-    if clip_stem.endswith(".json"):
-        clip_stem = clip_stem[:-5]
+        # Reorder queries by clip so each transcript load happens once
+        # and consecutively (cache-friendly memory access too — the
+        # words[] list stays warm between back-to-back queries on the
+        # same clip). We DON'T reorder the output; results carry their
+        # original input index so the agent can zip-by-index OR by
+        # `query.id` whichever it prefers.
+        order: list[int] = sorted(
+            range(len(queries)),
+            key=lambda i: (
+                queries[i].get("clip") or args.clip or "",
+                i,  # stable secondary key preserves intra-clip order
+            ),
+        )
+        results: list[dict[str, Any] | None] = [None] * len(queries)
+        for i in order:
+            row = _run_query(
+                queries[i],
+                transcripts_dir,
+                transcript_cache,
+                default_clip_stem=args.clip,
+            )
+            # Echo the original input index so the agent can correlate
+            # without trusting iteration order, even after reordering.
+            row.setdefault("query", {})["index"] = i
+            results[i] = row
 
-    transcript_path = transcripts_dir / f"{clip_stem}.json"
-    try:
-        transcript = _load_transcript(transcript_path)
-    except FileNotFoundError as e:
-        print(json.dumps({"error": "transcript_not_found", "detail": str(e)}),
-              file=sys.stderr)
-        return 2
+        envelope = {
+            "batch_count": len(queries),
+            "clips_loaded": len(transcript_cache),
+            "results": results,
+        }
 
-    words = _word_rows(transcript)
-    # Lift duration once — used for trailing-silence accounting when
-    # the match runs to the very last spoken word.
-    duration_s = transcript.get("duration")
+        if args.compact:
+            sys.stdout.write(json.dumps(envelope, ensure_ascii=False))
+        else:
+            sys.stdout.write(json.dumps(envelope, ensure_ascii=False, indent=2))
+        sys.stdout.write("\n")
+        return 0
 
-    # ── Apply range filter (if any) ────────────────────────────────
-    # Important: the index returned by the matcher must reference the
-    # SAME list we use for prev/next lookup, so we filter in-place
-    # to a single ranged_words list and the matcher operates on that.
-    try:
-        time_range = _resolve_range(args)
-    except ValueError as e:
-        print(json.dumps({"error": "bad_range", "detail": str(e)}),
-              file=sys.stderr)
-        return 2
-
-    if time_range is not None:
-        rstart, rend = time_range
-        ranged_words = [w for w in words if _in_range(w, rstart, rend)]
-    else:
-        rstart = rend = None
-        ranged_words = words
-
-    # ── Match the quote (if any) ───────────────────────────────────
-    # Three behaviours depending on which knobs are on:
-    #   1. quote + range: matches inside the range only.
-    #   2. quote without range: matches across the whole clip.
-    #   3. range without quote: every word in the range is returned
-    #      as a single "match" (first_word = first ranged word, etc.)
-    matches: list[dict[str, Any]] = []
-    if args.quote:
-        tokens = _tokenise_quote(args.quote)
-        if not tokens:
-            print(json.dumps({"error": "empty_quote",
-                              "detail": "--quote tokenised to nothing"}),
-                  file=sys.stderr)
-            return 2
-        windows = _find_quote_windows(ranged_words, tokens)
-        if args.max_matches > 0:
-            windows = windows[: args.max_matches]
-        matches = [
-            _assemble_match(ranged_words, s, e, words, duration_s)
-            for s, e in windows
-        ]
-    elif time_range is not None:
-        if ranged_words:
-            matches = [
-                _assemble_match(
-                    ranged_words, 0, len(ranged_words) - 1,
-                    words, duration_s,
-                )
-            ]
-    else:
-        # Neither --quote nor --range supplied — argparse can't catch
-        # this since both are optional; emit a clear error.
-        print(json.dumps({"error": "no_query",
-                          "detail": "pass --quote, --range, or both"}),
-              file=sys.stderr)
-        return 2
-
-    # ── Build the result envelope ──────────────────────────────────
-    # The envelope mirrors the call: clip + query + match list. Even
-    # zero-match results carry the query echo so the editor can see
-    # exactly which inputs failed.
-    result = {
-        "clip": clip_stem,
-        "transcript": str(transcript_path),
-        "duration_s": duration_s,
-        "query": {
-            "quote": args.quote,
-            "range_s": list(time_range) if time_range is not None else None,
-        },
-        "match_count": len(matches),
-        "matches": matches,
+    # ────────────────────────────────────────────────────────────────
+    # Single-query path — synthesise a one-row "batch" and dispatch
+    # through the same worker so the two modes can never drift.
+    # ────────────────────────────────────────────────────────────────
+    single_query: dict[str, Any] = {
+        "clip": args.clip,
+        "quote": args.quote,
+        "range": args.range_str,
+        "start": args.start,
+        "end": args.end,
+        "max_matches": args.max_matches,
     }
+    result = _run_query(
+        single_query,
+        transcripts_dir,
+        transcript_cache,
+        default_clip_stem=None,
+    )
+
+    # In single-query mode we keep the historical exit-code contract:
+    # IO / arg errors return non-zero so shell scripts can branch on
+    # `$?`. Match-zero is still success (the empty `matches: []` is
+    # the answer).
+    if "error" in result:
+        print(json.dumps(result, ensure_ascii=False), file=sys.stderr)
+        return 2
 
     if args.compact:
         sys.stdout.write(json.dumps(result, ensure_ascii=False))

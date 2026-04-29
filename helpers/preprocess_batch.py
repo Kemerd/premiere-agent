@@ -104,7 +104,12 @@ MEDIA_EXTS = VIDEO_EXTS | AUDIO_ONLY_EXTS
 # also has to stay clear of dirs that obviously aren't source media:
 #
 #   * the skill's own session output dir (`edit/`) — re-processing our
-#     own caches would loop forever
+#     own caches would loop forever. We also prune any sibling that
+#     LOOKS like an edit dir variant — `edit_old/`, `edit_v2/`,
+#     `edit_backup/`, `edit-2024-01-15/`, etc. Users routinely rename
+#     a previous session out of the way before starting a fresh cut,
+#     and re-walking those caches would blow up our inventory with
+#     stale FCPXML/SRT/JSON the editor will never touch.
 #   * the paired-audio aliasing dir (`.paired_audio/`) — these are
 #     hardlinks of files we've already inventoried
 #   * proxy / preview render dirs — `proxies/`, `_proxy/`, `previews/`
@@ -124,6 +129,16 @@ _PRUNE_DIR_NAMES = {
     "node_modules", ".git", "__pycache__",
 }
 
+# Prefixes that flag a directory as an edit-session variant — anything
+# matching `edit_*` or `edit-*` (case-insensitive) is treated identically
+# to the canonical `edit/` and pruned. Catches the common archival
+# patterns: `edit_old`, `edit_v2`, `edit_backup`, `edit-2024-01-15/`,
+# `Edit_Final/`, etc. We require the separator (`_` or `-`) so we don't
+# accidentally swallow legitimate footage dirs whose names happen to
+# start with the four letters "edit" (e.g. `editorial_review/` —
+# unlikely, but cheap to defend against).
+_EDIT_VARIANT_PREFIXES = ("edit_", "edit-")
+
 
 def _is_pruned_dir(p: Path) -> bool:
     """True if recursion should skip this directory.
@@ -133,13 +148,21 @@ def _is_pruned_dir(p: Path) -> bool:
     heuristic (those conventions are themselves case-sensitive in
     practice). Symlink loops are out of scope — we follow os.walk's
     default of not following dir symlinks at the call-site below.
+
+    `edit/` and any `edit_*` / `edit-*` sibling are all pruned together
+    so users who rename old sessions out of the way (`edit_old/`,
+    `edit_v2/`, `edit_backup/`) don't get their stale caches re-walked
+    on the next preprocess pass.
     """
     name = p.name
     if not name:
         return False                       # root drive on Windows
     if name.startswith(".") or name.startswith("_"):
         return True                        # dotfiles + bookkeeping
-    return name.lower() in {n.lower() for n in _PRUNE_DIR_NAMES}
+    name_lower = name.lower()
+    if name_lower.startswith(_EDIT_VARIANT_PREFIXES):
+        return True                        # edit_old/, edit_v2/, edit-backup/, ...
+    return name_lower in {n.lower() for n in _PRUNE_DIR_NAMES}
 
 
 # Depth ceiling for recursion. Picked at 10 because:

@@ -155,7 +155,7 @@ The default audio workflow is: read `speech_timeline.md` + `visual_timeline.md` 
 
 ### Editing
 
-- **`helpers/find_quote.py --edit-dir <edit> --clip <stem> --range <M:SS-M:SS> --quote "..."`** — word-precise quote / range crawler over `transcripts/<stem>.json`. **The supported interface for every EDL anchor (Hard Rule 2).** Returns first/last/prev/next word boundaries pinned to the millisecond plus `lead_silence_s` / `trail_silence_s` / `cut_window` ready for the pacing-preset margin clamp. Stdlib-only, no model loads, sub-millisecond hot. With `--clip` omitted, picks the most-recently-modified transcript (the colloquial "last clip we talked about" shortcut). Never grep / hand-parse `transcripts/<stem>.json` directly — the helper is the only sanctioned path.
+- **`helpers/find_quote.py --edit-dir <edit> --clip <stem> --range <M:SS-M:SS> --quote "..."`** — word-precise quote / range crawler over `transcripts/<stem>.json`. **The supported interface for every EDL anchor (Hard Rule 2).** Returns first/last/prev/next word boundaries pinned to the millisecond plus `lead_silence_s` / `trail_silence_s` / `cut_window` ready for the pacing-preset margin clamp. Stdlib-only, no model loads, sub-millisecond hot. With `--clip` omitted, picks the most-recently-modified transcript (the colloquial "last clip we talked about" shortcut). **Batch mode (`--batch <path|->`)** answers N queries in one process — pass a JSON `{"queries":[{clip, quote, range|start|end, max_matches, id}, ...]}` doc as a file path or via stdin and get a `{batch_count, clips_loaded, results:[...]}` envelope back; queries are grouped by clip internally so each transcript loads exactly once, per-row failures come back as `{error, detail, query}` rows instead of aborting the batch, and every result carries `query.index` + the optional `query.id` you passed in for correlation. Use it whenever you'd otherwise spin up the helper more than ~3 times in a row (boundary self-eval, verifying every range in a freshly drafted EDL, etc.) — one Python startup beats forty. Never grep / hand-parse `transcripts/<stem>.json` directly — the helper is the only sanctioned path.
 - **`helpers/timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly. The visual_timeline.md replaces 90% of the old "scan with timeline_view" workflow.
 - **`helpers/build_srt.py <edl.json> -o master.srt`** — standalone captions sidecar generator. Reads each EDL range's `transcripts/<stem>.json`, applies the output-timeline offset math from Hard Rule 1, and emits a single `master.srt` aligned to the cut. Called automatically by `export_fcpxml.py` so the SRT lands next to the XML; invoke directly only when you need to regenerate captions without re-exporting the timeline.
 - **`helpers/export_fcpxml.py <edl.json> -o cut.fcpxml`** — emit editor-ready timeline files. **The single delivery path.** Hard-cut only right now (Hard Rule 9): the EDL's `audio_lead` / `video_tail` / `transition_in` fields are still consumed by the code path but every range must emit `0` for all three. **Default emits BOTH `cut.fcpxml` AND `cut.xml`** side-by-side from a single timeline build, because Premiere Pro and Resolve/FCP X want different XML dialects: `.fcpxml` (FCPXML 1.10+) is native to DaVinci Resolve and Final Cut Pro X, `.xml` (Final Cut Pro 7 xmeml) is native to Premiere Pro. The recipient picks whichever NLE they live in — no XtoCC conversion required for Premiere. Also calls `build_srt.py` to drop `master.srt` next to the XML for caption import. Override with `--targets {both,fcpxml,premiere}`. `--frame-rate 24` (default), 25, 29.97, 30, 60.
@@ -171,7 +171,7 @@ The default audio workflow is: read `speech_timeline.md` + `visual_timeline.md` 
 6. **Execute.** Produce `edl.json` directly. Drill into `timeline_view` at ambiguous moments where the `visual_timeline` caption alone isn't enough; verify every word-boundary anchor with `helpers/find_quote.py` (Hard Rule 2). Then run `python helpers/export_fcpxml.py <edit>/edl.json -o <edit>/cut.fcpxml` — that emits `cut.fcpxml` (Resolve / FCP X), `cut.xml` (Premiere Pro xmeml), and `master.srt` (output-timeline captions) all in one shot. Tell Premiere users to `File → Import → cut.xml` (the `.fcpxml` does **not** work natively in Premiere — that's the file Adobe wants you to run through XtoCC, which we sidestep entirely). Tell Resolve / FCP X users to import `cut.fcpxml`. The SRT goes in as a captions track if they want burned-in subtitles — both NLEs accept it natively.
 7. **Preview is in the NLE.** Hand `cut.fcpxml` / `cut.xml` to the user to open and scrub in their NLE of choice — the `.xml` for Premiere, the `.fcpxml` for Resolve / FCP X. There is no flat-MP4 preview from this skill; the cut lives in the NLE from now on.
 8. **Self-eval (before handing off the XML).** Sample-check the EDL itself, since there is no rendered file to scrub. For each cut boundary in `edl.json`:
-    - Re-run `find_quote.py` on the in-point and out-point clips and confirm `first_word.start` / `last_word.end` match the EDL's `in` / `out` to the millisecond after the pacing-preset margin clamp (a mid-word cut here is a Hard Rule 2 violation).
+    - Re-run `find_quote.py` on the in-point and out-point clips and confirm `first_word.start` / `last_word.end` match the EDL's `in` / `out` to the millisecond after the pacing-preset margin clamp (a mid-word cut here is a Hard Rule 2 violation). **Use `--batch` here** — build one `{queries:[...]}` doc with two rows per EDL range (an in-anchor and an out-anchor, each carrying the range's `id` so you can correlate failures back to the EDL row) and submit it once. A 40-cut EDL is one tool call, not eighty.
     - Spot-check `merged_timeline.md` around the boundary timestamps — does the speech context flow, does the visual lane confirm shot continuity (or an intentional shot change)?
     - Run `ffprobe` on each source referenced by the EDL to confirm `out` is within the source's actual duration (no off-the-end ranges that crash NLE import).
     - Open `master.srt` and skim the first 5 / last 5 cues — confirm they line up with the cut's first and last spoken words and that the timestamps are monotonically increasing across the whole file (Hard Rule 1 sanity check).
@@ -292,6 +292,25 @@ Hard Rule 2 binds you to word-boundary cuts. The merged timeline is rounded to w
 5. **Emit the EDL range.** `range.start` and `range.end` are now word-boundary-pinned, margin-padded, and silence-clamped. No off-by-one. No mid-word cut. No re-introduction of a silence you wanted to drop.
 
 **Reading `transcripts/<stem>.json` by hand or with `grep` is forbidden.** The helper is bounds-checked, sub-millisecond hot, and returns a self-contained match envelope the EDL generator consumes verbatim. Direct JSON access is reserved for cases the helper genuinely cannot answer (e.g. inspecting a stem's diarization metadata).
+
+**Batching when you have many ranges to verify.** When the EDL has more than two or three ranges, do not call `find_quote.py` once per range — submit them all in one batch. The helper accepts a JSON document of N queries via `--batch <path|->` and answers them in a single process:
+
+```bash
+python helpers/find_quote.py --edit-dir <edit> --batch verify.json --compact
+```
+
+```json
+{
+  "queries": [
+    {"id": "r0_in",  "clip": "DJI_..._0317_D", "range": "0:02-0:08", "quote": "Geared to lock"},
+    {"id": "r0_out", "clip": "DJI_..._0317_D", "range": "0:14-0:20", "quote": "uplock hook"},
+    {"id": "r1_in",  "clip": "DJI_..._0320_D", "range": "0:00-0:06", "quote": "Beautiful day"},
+    {"id": "r1_out", "clip": "DJI_..._0320_D", "range": "0:50-0:58", "quote": "permanently"}
+  ]
+}
+```
+
+The result envelope is `{batch_count, clips_loaded, results:[...]}` with one row per input query, each carrying back the `query.id` you passed in plus a `query.index` matching the input order. Per-row failures (`transcript_not_found`, `bad_range`, `empty_quote`, `no_query`) come back as `{error, detail, query}` rows — the batch never aborts mid-stream. Queries are grouped by clip internally so each transcript loads exactly once: a 40-row batch across 12 clips is 12 disk reads. **This is the right shape for the Hard Rule 8 self-eval pass — one tool call, every boundary verified.** Pass `-` instead of a file path to stream the JSON in over stdin.
 
 ### Split edits (DEFERRED — do not emit)
 
