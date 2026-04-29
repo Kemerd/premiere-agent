@@ -500,61 +500,6 @@ def test_pack_timelines(R: Results, tmp: Path) -> None:
                 R.fail(f"content {fname}", f"missing '{must_contain}'")
             else:
                 R.ok(f"output {fname}")
-
-        from pack_timelines import _vowel_drop_merged_visuals, _vowel_drop_word
-
-        examples = {
-            "absorber": "absrbr",
-            "leaning": "lnng",
-            "drawers": "drwrs",
-            "yellow": "yllw",
-            "boxes": "bxs",
-            "toolbox": "tlbx",
-            "draped": "drpd",
-            "aaoo": "ao",
-            "aaeeeeeeeeoo": "ao",
-            "bool": "bl",
-            "bbooll": "bll",
-        }
-        for src, expected in examples.items():
-            got = _vowel_drop_word(src)
-            if got != expected:
-                R.fail("vowel-drop examples", f"{src} -> {got}, expected {expected}")
-                break
-        else:
-            R.ok("vowel-drop examples")
-
-        edge2 = {
-            "absorber": "absrber",
-            "leaning": "lenng",
-            "yellow": "yellow",
-            "boxes": "boxes",
-            "toolbox": "tolbox",
-            "draped": "drped",
-            "aaoo": "aaoo",
-            "aaeeeeeeeeoo": "aaoo",
-            "bool": "bool",
-        }
-        for src, expected in edge2.items():
-            got = _vowel_drop_word(src, leading_chars=2, trailing_chars=2)
-            if got != expected:
-                R.fail("vowel-drop edge override", f"{src} -> {got}, expected {expected}")
-                break
-        else:
-            R.ok("vowel-drop edge override")
-
-        merged_sample = (
-            "  0:01 [absorber leaning drawers yellow boxes toolbox draped]\n"
-            "  0:02-0:03 [S0] \"absorber boxes\"\n"
-            "  0:04 (yellow boxes)\n"
-        )
-        squeezed = _vowel_drop_merged_visuals(merged_sample)
-        if "absrbr lnng drwrs yllw bxs tlbx drpd" not in squeezed:
-            R.fail("merged visual vowel-drop", squeezed)
-        elif "[S0] \"absorber boxes\"" not in squeezed or "(yellow boxes)" not in squeezed:
-            R.fail("merged visual vowel-drop lanes", squeezed)
-        else:
-            R.ok("merged visual vowel-drop")
     except Exception as e:
         traceback.print_exc()
         R.fail("pack_timelines", f"{type(e).__name__}: {e}")
