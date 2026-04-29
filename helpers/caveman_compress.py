@@ -224,8 +224,6 @@ _DROP_WORDS = frozenset({
 # Combined with _DROP_WORDS this layer alone trims another ~10-15% of
 # merged_timeline.md token count on top of the spaCy POS pass.
 _SHORTHAND = {
-    "person":       "prsn",
-    "people":       "ppl",
     "background":   "bg",
     "foreground":   "fg",
     "electrical":   "elec",
@@ -237,8 +235,6 @@ _SHORTHAND = {
     "workshop":     "shop",
     "interior":     "int",
     "exterior":     "ext",
-    "horizontal":   "horiz",
-    "vertical":     "vert",
     "rectangular":  "rect",
     "rectangle":    "rect",
     "cylindrical":  "cyl",
