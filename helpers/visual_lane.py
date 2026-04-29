@@ -57,12 +57,10 @@ import math
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 # CRITICAL: this import MUST come before anything that could pull in
@@ -101,6 +99,13 @@ DEFAULT_FPS: float = 1.0
 DEFAULT_BATCH_SIZE = 8           # safe on 4 GB; orchestrator can override
 DEFAULT_TASK_PROMPT = "<MORE_DETAILED_CAPTION>"
 VISUAL_CAPS_SUBDIR = "visual_caps"
+# Florence-2-base's native vision-tower input is 768x768. The square
+# crop + scale baked into the ffmpeg filter chain matches this exactly
+# so the processor doesn't need to do an extra resize. Pulling the
+# constant out keeps `_build_extract_cmd` and `run_visual_lane_batch`
+# in sync — change in one place if you ever swap to a different
+# Florence variant (e.g. Florence-2-large at 768 too, SigLIP at 384).
+FLORENCE_INPUT_DIM = 768
 
 
 # ---------------------------------------------------------------------------
@@ -240,68 +245,81 @@ def _iter_frames_at_fps(video_path: Path, fps: float):
 
 
 # ---------------------------------------------------------------------------
-# Hardware-accelerated bulk frame prefetch.
+# Hardware-accelerated streaming pipe (NVDEC → ffmpeg stdout → Florence).
 #
-# The legacy `_iter_frames_at_fps` above pipes raw RGB frames through a
-# Popen() pipe and feeds Florence one batch at a time. That worked fine
-# on tutorial / talking-head footage where ffmpeg decode was cheap. On
-# 4K 60fps HDR DJI footage it falls over hard:
+# Design intent (the version 3 rewrite):
 #
-#   - Software h264 decode of 4K 60fps is CPU-bound at ~150-300 ms per
-#     decoded frame on consumer CPUs. Even with `fps=1` decimation
-#     applied AFTER decode, ffmpeg still has to walk the GOP and decode
-#     enough frames to hit each second mark.
-#   - HDR (HLG / PQ) → SDR tonemap is mandatory: Florence-2 was trained
-#     on SDR Rec.709 imagery; feeding it raw HLG yields washed-out
-#     desaturated captions because the colour primaries land outside
-#     its training distribution.
-#   - In-process pipelining (the producer thread we already have)
-#     overlaps decode-of-batch-N with infer-of-batch-N-minus-1, but
-#     CAN'T overlap one CLIP'S decode with another's inference because
-#     ffmpeg decode is bound to the lifetime of the per-clip generator.
+#   Florence loads ONCE, sits primed and hungry on the GPU. For each
+#   clip we spawn a single ffmpeg subprocess that streams 768x768 rgb24
+#   frames out its stdout, into a producer thread that wraps each frame
+#   as a numpy array and pushes it onto a bounded queue. The main
+#   thread (consumer) drains batches off the queue, hands them to
+#   Florence, writes the captions out, and DROPS the references. Peak
+#   in-flight memory is `batch_size * 2 * 1.69 MB` ≈ 27-110 MB,
+#   regardless of clip length. No bulk pre-extract, no disk cache,
+#   no JPEG roundtrip.
 #
-# The fix is two-fold:
+# Why we abandoned the bulk-extract-to-disk model:
 #
-#   1. Move ffmpeg to NVIDIA's NVDEC (`-hwaccel cuda`) so 4K H.264 / H.265
-#      decode runs on the GPU's dedicated decode block — independent of
-#      the CUDA SMs that Florence is using, no contention. NVDEC on
-#      Blackwell does 4K60 H.265 in real time at ~1% SM cost.
-#   2. Bulk-extract ALL clips' frames to disk concurrently in a
-#      ThreadPoolExecutor BEFORE Florence starts inferencing. Each
-#      worker is a separate ffmpeg subprocess pinned to its own clip,
-#      so N workers = N parallel decoders saturating the IO + decode
-#      blocks while Florence eats the per-clip results in order.
+#   The previous design wrote 768x768 mjpeg frames (`-q:v 3`) to a
+#   disk cache via N parallel ffmpeg workers, then PIL-decoded them
+#   back into RAM at consume time. That cost was pure waste:
 #
-# Frame cache layout:
+#     - mjpeg encode is single-threaded (~5-10 ms per 768² frame at q=3)
+#     - filesystem write + fsync (variable but real, especially Windows NTFS)
+#     - filesystem read + libjpeg-turbo decode in PIL (~3-8 ms per frame)
 #
-#   <edit_dir>/visual_caps/_frame_cache/
-#     ├── DJI_..._0303_D/
-#     │   ├── 000001.jpg
-#     │   ├── 000002.jpg
-#     │   └── .done             # sentinel: extraction completed
-#     └── DJI_..._0304_D/
-#         └── ...
+#   That's 10-25 ms × thousands of frames = real wall-clock for ZERO
+#   information gain — the mjpeg-encoded data was about to be decoded
+#   straight back to the same rgb24 we could have just kept in RAM.
+#   Killing it is the dominant speedup of this rewrite.
 #
-# JPEG quality 3 (mjpeg `-q:v 3`, 1=best 31=worst) gives ~150-250 KB
-# per 768x768 frame and is visually lossless for captioning targets.
-# A 14-clip × ~150 frame-avg shoot = ~2100 frames × 200 KB = ~420 MB
-# disk. Trivial. The cache is auto-deleted at end-of-run unless the
-# user sets `VIDEO_USE_FRAME_CACHE_KEEP=1` for debugging.
+# Why we abandoned the multi-clip parallel decoder pool:
+#
+#   The 4-worker prefetch pool assumed Florence was the bottleneck and
+#   we needed to saturate NVDEC independently. In practice ffmpeg+NVDEC
+#   produces 768² rgb24 frames at >200 fps even on entry-level RTX
+#   cards, while Florence-2-base maxes at ~50-100 fps on a 4090. So one
+#   ffmpeg producer always leads one Florence consumer — adding more
+#   producers just steals NVDEC sessions and burns RAM with no win.
+#
+#   Trade-off: we lose the ~50-100 ms of clip-boundary overlap (next
+#   clip's ffmpeg launching while Florence finishes current clip's last
+#   batch). On an N-clip shoot that's N×100ms ≈ 1-2 seconds total. We'll
+#   add a one-clip-lookahead later if it ever shows up in profiling.
+#
+# Why hwaccel + tonemap stays exactly the same:
+#
+#   The filter chain (`fps=N → tonemap (HDR only) → crop=square → scale=768
+#   → rgb24`) is identical to the v2 design. Only the OUTPUT muxer
+#   changes: `-q:v 3 %06d.jpg` becomes `-pix_fmt rgb24 -f rawvideo -`.
+#   That means HDR (HLG/PQ) → SDR Rec.709 still works, NVDEC → CPU
+#   tonemap → re-format still works, and the SDR fast-path still skips
+#   tonemap entirely. We just stream the result instead of muxing it
+#   to disk.
+#
+# Why python's BufferedReader.read(n) is safe here:
+#
+#   Each frame is exactly `target_dim * target_dim * 3` bytes (768²×3
+#   = 1,769,472 bytes). Python's `read(n)` on a binary pipe blocks
+#   until exactly n bytes have arrived OR the pipe hits EOF. So we
+#   read frame-by-frame in a fixed-size loop, and a short read tells
+#   us cleanly that ffmpeg is done. No need to parse a container or
+#   sniff frame boundaries.
+#
+# CPU fallback (the user explicitly asked for this):
+#
+#   _nvdec_available() probes once at process start. If NVDEC is
+#   present we try it first; if ffmpeg's exit code is non-zero AND we
+#   haven't yielded any frames yet, the producer restarts the same
+#   clip with software decode. Mid-stream NVDEC failures (rare) are
+#   surfaced as a producer error so the consumer sees them.
 #
 # HDR detection: ffprobe `color_transfer`. The two HDR transfers in
 # the wild are `arib-std-b67` (HLG, what DJI uses) and `smpte2084`
 # (PQ, what Sony / Apple use). Anything else (`bt709`, blank, etc.)
 # is treated as SDR and skips the tonemap chain.
 # ---------------------------------------------------------------------------
-
-# Subdirectory under visual_caps for pre-extracted frame JPEGs.
-FRAME_CACHE_SUBDIR = "_frame_cache"
-
-# Extraction worker pool size. Capped low to avoid CPU thrash + NVDEC
-# session limit on consumer cards (RTX 3-series / 4-series cap at 3
-# concurrent NVDEC sessions; 5090 lifts that to 5+). Override with
-# VIDEO_USE_FRAME_EXTRACT_WORKERS=N if you know your card.
-DEFAULT_EXTRACT_WORKERS = 4
 
 # Cached NVDEC capability probe — we only run `ffmpeg -hwaccels` once
 # per process. None means "not yet probed".
@@ -367,14 +385,13 @@ def _probe_video_meta(video_path: Path) -> dict:
 
 def _build_extract_cmd(
     video_path: Path,
-    out_dir: Path,
     target_dim: int,
     fps: float,
     meta: dict,
     *,
     use_nvdec: bool,
 ) -> list[str]:
-    """Construct an ffmpeg argv that extracts JPEGs into out_dir.
+    """Construct an ffmpeg argv that streams raw rgb24 frames to stdout.
 
     Filter chain order, picked for performance:
 
@@ -397,14 +414,20 @@ def _build_extract_cmd(
 
         scale=DxD    : lanczos downscale to Florence's native 768x768.
 
+    Output stage: `-pix_fmt rgb24 -f rawvideo -` writes raw interleaved
+    RGB to stdout, exactly `target_dim * target_dim * 3` bytes per
+    frame. The producer thread reads in fixed-size chunks and wraps
+    each chunk as a numpy view — no muxer, no encode, no disk.
+
     NVDEC path:
         Hardware-decodes the H.264 / H.265 / AV1 stream on the dedicated
         NVDEC block, then `hwdownload,format=nv12` brings the frame to
         system RAM for the SDR conversion + crop + scale. This sounds
-        wasteful but the download is ~1 MB/frame at 1 fps which is
-        nothing, and CUDA filters (`scale_cuda` etc.) don't compose
-        cleanly with `tonemap` so we'd need the download anyway on
-        HDR sources.
+        wasteful but a 768² rgb24 frame is ~1.7 MB and we only emit at
+        the decimated `fps`, not the source rate. CUDA filters
+        (`scale_cuda` etc.) don't compose cleanly with `tonemap` so
+        we'd need the download anyway on HDR sources — one code path
+        for both SDR and HDR keeps the filter graph predictable.
     """
     import imageio_ffmpeg
     ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
@@ -440,7 +463,7 @@ def _build_extract_cmd(
     crop_scale = f"crop={square}:{square},scale={target_dim}:{target_dim}:flags=lanczos"
     vf = f"fps={fps},{tonemap}{crop_scale}"
 
-    base = [ffmpeg_bin, "-loglevel", "error", "-y"]
+    base = [ffmpeg_bin, "-loglevel", "error", "-nostdin"]
     if use_nvdec:
         # `-hwaccel cuda` decodes on NVDEC; we deliberately do NOT pass
         # `-hwaccel_output_format cuda` because tonemap + zscale don't
@@ -449,168 +472,13 @@ def _build_extract_cmd(
         # SDR and HDR paths with one code path.
         base += ["-hwaccel", "cuda"]
     base += ["-i", str(video_path), "-vf", vf]
-    # MJPEG quality. -q:v 3 is visually lossless at 768x768 (~200 KB/frame)
-    # and decodes in <5 ms via PIL. Tried PNG (lossless, ~2-5 MB/frame,
-    # ~30 ms decode) — total wall time was worse despite no quality loss.
-    base += ["-q:v", "3", str(out_dir / "%06d.jpg")]
+    # Raw rgb24 to stdout. `-an` skips any audio stream from being
+    # written to the output (we don't want it on the pipe). `-` is
+    # ffmpeg's stdout sigil — the producer thread Popen's this and
+    # reads from proc.stdout in fixed `target_dim * target_dim * 3`
+    # byte chunks.
+    base += ["-an", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
     return base
-
-
-def _extract_frames_to_disk(
-    video_path: Path,
-    cache_dir: Path,
-    fps: float,
-    target_dim: int = 768,
-) -> Path:
-    """Extract all frames-of-interest for one clip into cache_dir.
-
-    Idempotent: if `<cache_dir>/.done` exists we skip the ffmpeg call
-    entirely. On NVDEC failure we automatically retry with software
-    decode — some malformed muxers (corrupted PPS, AV1 with missing
-    sequence header) can choke the hardware path while software handles
-    them fine.
-
-    Returns the cache_dir path so the caller can pass it directly into
-    the consumer iterator.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    sentinel = cache_dir / ".done"
-    if sentinel.exists():
-        try:
-            n_existing = sum(1 for _ in cache_dir.glob("*.jpg"))
-        except Exception:
-            n_existing = -1
-        print(f"  extract: cache hit {video_path.name} ({n_existing} frames)")
-        return cache_dir
-
-    # Wipe any partial extraction from a prior crashed run. We can't
-    # trust frame counts without the .done sentinel.
-    for stale in cache_dir.glob("*.jpg"):
-        try:
-            stale.unlink()
-        except OSError:
-            pass
-
-    meta = _probe_video_meta(video_path)
-    nvdec_first = _nvdec_available()
-
-    t0 = time.time()
-    cmd = _build_extract_cmd(
-        video_path, cache_dir, target_dim, fps, meta, use_nvdec=nvdec_first,
-    )
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-
-    if proc.returncode != 0 and nvdec_first:
-        # NVDEC retry-with-software fallback. Common causes: corrupt
-        # SEI, NVDEC session-limit exhaustion under heavy parallel
-        # extract load, or codec the NVDEC build doesn't support.
-        print(f"  extract: NVDEC failed for {video_path.name} "
-              f"({proc.stderr.strip()[:120]}); retrying software")
-        # Wipe any partial frames the NVDEC attempt may have written.
-        for stale in cache_dir.glob("*.jpg"):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
-        cmd = _build_extract_cmd(
-            video_path, cache_dir, target_dim, fps, meta, use_nvdec=False,
-        )
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg extract failed for {video_path.name}: "
-            f"{proc.stderr.strip()[:500]}"
-        )
-
-    # Atomic-ish completion marker. Written LAST so a SIGKILL mid-extract
-    # leaves the dir in a "no .done -> redo from scratch" state instead
-    # of "looks-done-but-truncated".
-    sentinel.write_text("done")
-    n = sum(1 for _ in cache_dir.glob("*.jpg"))
-    print(f"  extract: {video_path.name} -> {n} frames in {time.time()-t0:.1f}s "
-          f"(hdr={meta['is_hdr']}, nvdec={nvdec_first})")
-    return cache_dir
-
-
-def _iter_frames_from_dir(cache_dir: Path, fps: float):
-    """Yield (timestamp_s, PIL.Image) for each pre-extracted JPEG.
-
-    Drop-in replacement for `_iter_frames_at_fps` — same yield shape so
-    the producer thread + batching loop don't need to know which source
-    they're being fed from. Loads frames in filename order; ffmpeg's
-    `%06d.jpg` template gives 1-indexed sequential numbering. We
-    convert that frame index back to a float timestamp in seconds via
-    `(idx - 1) / fps`, so:
-
-        fps = 1.0   →  ts = 0, 1, 2, 3, ...   (one frame per second)
-        fps = 0.5   →  ts = 0, 2, 4, 6, ...   (one frame every 2 s)
-        fps = 0.25  →  ts = 0, 4, 8, 12, ...  (one frame every 4 s)
-        fps = 2.0   →  ts = 0, 0.5, 1.0, ...  (sub-second precision)
-
-    The float timestamp is preserved through the JSON cache so any
-    downstream consumer (pack_timelines, build_srt, editor sub-agents)
-    can render or align against the true sample time.
-    """
-    from PIL import Image
-    # Guard against accidental fps=0 (would zero-divide); fall back to
-    # 1.0 with a warning rather than crashing the entire batch.
-    if not fps or fps <= 0:
-        print(f"  visual_lane: invalid fps={fps!r} for {cache_dir.name}, "
-              f"falling back to 1.0 for timestamp math")
-        fps = 1.0
-    for jpg in sorted(cache_dir.glob("*.jpg")):
-        try:
-            idx = int(jpg.stem)  # ffmpeg's %06d is 1-indexed
-        except ValueError:
-            continue
-        ts = (idx - 1) / float(fps)
-        # `with` + `.load()` forces the JPEG to fully decode now so we
-        # can release the file handle before yielding. Otherwise PIL
-        # keeps the file open lazily and we leak descriptors at scale.
-        with Image.open(jpg) as fh:
-            fh.load()
-            img = fh.copy()
-        yield ts, img
-
-
-def _resolve_extract_workers(num_videos: int) -> int:
-    """How many parallel ffmpeg extractor processes to spawn.
-
-    Resolution order:
-        1. VIDEO_USE_FRAME_EXTRACT_WORKERS env var (explicit override)
-        2. min(DEFAULT_EXTRACT_WORKERS, num_videos) — never spin up
-           more workers than there is work to do.
-
-    The default ceiling (4) is the comfortable simultaneous-NVDEC limit
-    on consumer Blackwell / Ada (5090 / 4090). Older cards (3090 and
-    earlier) cap at 3 concurrent NVDEC sessions; even at the default 4
-    the auto-fallback to software inside _extract_frames_to_disk handles
-    overflow without crashing.
-    """
-    raw = os.environ.get("VIDEO_USE_FRAME_EXTRACT_WORKERS", "").strip()
-    if raw:
-        try:
-            n = int(raw)
-            if n >= 1:
-                return min(n, max(1, num_videos))
-        except ValueError:
-            pass
-    return min(DEFAULT_EXTRACT_WORKERS, max(1, num_videos))
-
-
-def _safe_rmtree(path: Path) -> None:
-    """Best-effort recursive delete. Never raises.
-
-    Used for frame-cache cleanup at end-of-run. We deliberately swallow
-    every exception class because cleanup failure (e.g. file locked by
-    Windows Defender mid-scan) should not poison a successful run's
-    return code.
-    """
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -846,7 +714,14 @@ def _strip_florence_special_tokens(text: str) -> str:
 
 
 def _caption_batch(model, processor, images, *, device: str, torch_dtype, task: str) -> list[str]:
-    """Run Florence-2 on a list of PIL images, return parsed captions."""
+    """Run Florence-2 on a list of frames, return parsed captions.
+
+    `images` may be either a list of PIL.Image (legacy callers) or a
+    list of numpy `(H, W, 3)` uint8 arrays (the streaming pipe path).
+    Florence-2's processor accepts both shapes natively — internally it
+    normalises everything to a torch tensor of `pixel_values` before
+    feeding the vision tower.
+    """
     import torch
 
     inputs = processor(
@@ -901,8 +776,21 @@ def _caption_batch(model, processor, images, *, device: str, torch_dtype, task: 
     raw_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
     out: list[str] = []
     for raw, img in zip(raw_texts, images):
+        # post_process_generation needs (width, height) for region tasks
+        # like <CAPTION_TO_PHRASE_GROUNDING>; for plain caption prompts
+        # the value is unused but the kwarg is mandatory. Handle both
+        # shapes:
+        #   - PIL.Image  -> .width, .height
+        #   - numpy ndarray (H, W, 3) -> .shape[1], .shape[0]
+        # Falling through to (768, 768) covers any exotic future input.
+        if hasattr(img, "width") and hasattr(img, "height"):
+            img_size = (img.width, img.height)
+        elif hasattr(img, "shape") and len(img.shape) >= 2:
+            img_size = (int(img.shape[1]), int(img.shape[0]))
+        else:
+            img_size = (FLORENCE_INPUT_DIM, FLORENCE_INPUT_DIM)
         parsed = processor.post_process_generation(
-            raw, task=task, image_size=(img.width, img.height),
+            raw, task=task, image_size=img_size,
         )
         # post_process_generation returns {task: caption_str} for caption tasks.
         text = parsed.get(task, "") if isinstance(parsed, dict) else str(parsed)
@@ -943,33 +831,45 @@ def _dedup_consecutive(captions: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Producer / consumer pipelining for disk-cache JPEG decode <-> Florence
-# inference.
+# Producer / consumer streaming pipe (ffmpeg → bounded queue → Florence).
 #
-# Why bother:
-#   Even though all frames are pre-extracted to disk by the prefetch
-#   pool (see _extract_frames_to_disk + _prefetch_all_frames below),
-#   the consumer still has to (a) read the JPEG bytes, (b) decode them
-#   to RGB via PIL/libjpeg-turbo (~3-8 ms per 768x768 frame), and
-#   (c) marshall the resulting PIL.Image into a list ready for the
-#   processor. At batch=32 that's ~100-250 ms of pure CPU work per
-#   batch that would otherwise serialize behind generate(). One
-#   producer thread overlaps it cleanly with Florence inference.
+# Architecture:
+#   The producer thread Popen()'s a single ffmpeg subprocess per clip
+#   that streams 768×768 raw rgb24 frames out its stdout. Each frame
+#   is exactly `target_dim * target_dim * 3` bytes — Python's
+#   BufferedReader.read(n) blocks until exactly n bytes have arrived
+#   or the pipe hits EOF, so we read in fixed chunks with no muxer
+#   parsing or boundary sniffing required. Each chunk is wrapped as
+#   a numpy view (zero copy until consume time) and pushed onto a
+#   bounded queue. The consumer (Florence) drains batches off the
+#   other end, infers, writes the captions, and DROPS the references
+#   so the underlying bytes become collectable immediately.
 #
 # Why a bounded queue:
-#   maxsize = batch_size * 2 caps RAM at ~108 MB peak (2 batches of
-#   32 frames × 768×768×3 RGB uint8 = 56 MB each + PIL header overhead).
-#   Keeps the producer ~1 batch ahead of the consumer without letting it
-#   run away on multi-thousand-frame shoots.
+#   maxsize = batch_size * 2 caps in-flight RAM at ~108 MB peak for a
+#   wealthy batch_size=32 (2 × 32 × 1.69 MB) and ~27 MB for the default
+#   batch_size=8. Keeps the producer ~1 batch ahead of the consumer
+#   without letting it run away on multi-thousand-frame shoots.
 #
 # Why a stop_event + sentinel-on-error:
-#   On consumer-side exception (OOM, KeyboardInterrupt, model crash), we
-#   need the producer to stop reading from disk cleanly. stop_event +
-#   the producer's own try/finally guarantees pending file handles are
-#   closed even on the abrupt exit path. The error sentinel
-#   ("__error__", exc) lets producer-side errors (corrupt JPEG, missing
-#   file) propagate up to the consumer's main thread instead of dying
-#   silently in the background.
+#   On consumer-side exception (OOM, KeyboardInterrupt, model crash),
+#   we need the producer to stop reading from ffmpeg cleanly AND tear
+#   down the subprocess so we don't leak GPU NVDEC sessions or zombie
+#   processes. stop_event + the producer's try/finally handles both
+#   the cooperative-cancellation poll and the proc.terminate() cleanup.
+#   The error sentinel ("__error__", exc) lets producer-side errors
+#   (NVDEC blowout, codec mismatch, corrupt file) propagate up to the
+#   consumer's main thread instead of dying silently in the background.
+#
+# NVDEC fallback:
+#   If `_nvdec_available()` reported True we try the hardware path
+#   first. If ffmpeg's exit code is non-zero AND we haven't yielded
+#   any frames yet, the producer restarts the same clip with software
+#   decode — covers NVDEC session-limit exhaustion, malformed muxers
+#   (corrupt PPS / missing AV1 sequence header), and codec types the
+#   NVDEC build doesn't support. Mid-stream NVDEC failures (very rare)
+#   are surfaced as a producer error so we don't paper over partial
+#   decodes.
 # ---------------------------------------------------------------------------
 
 # Internal sentinel objects. Module-level so identity comparison works
@@ -978,34 +878,163 @@ _FRAME_END_SENTINEL = object()
 _FRAME_ERROR_TAG = "__frame_producer_error__"
 
 
-def _frame_producer(
-    cache_dir: Path,
+def _spawn_ffmpeg_pipe(
+    video_path: Path,
     fps: float,
+    target_dim: int,
+    meta: dict,
+    *,
+    use_nvdec: bool,
+):
+    """Popen an ffmpeg subprocess that pipes rgb24 frames to stdout.
+
+    Returns the live `subprocess.Popen` handle. The caller owns the
+    process lifecycle — they MUST eventually `.wait()` on it (or
+    `.terminate()` + `.wait()` on early exit) to avoid zombies.
+
+    bufsize is set to one full frame's worth of bytes so Python's
+    BufferedReader pre-allocates a sensibly-sized userspace buffer
+    instead of the default 8 KB, which would force ~200 small reads
+    per 1.7 MB frame. One contiguous read = one syscall = lower
+    overhead and better cache behaviour on the consumer side.
+    """
+    cmd = _build_extract_cmd(
+        video_path, target_dim, fps, meta, use_nvdec=use_nvdec,
+    )
+    frame_bytes = target_dim * target_dim * 3
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=frame_bytes,
+    )
+
+
+def _stream_frames_from_proc(
+    proc: "subprocess.Popen",
+    fps: float,
+    target_dim: int,
+    out_q: "queue.Queue",
+    stop_event: threading.Event,
+) -> tuple[int, str]:
+    """Pump rgb24 chunks from `proc.stdout` onto `out_q` until EOF.
+
+    Returns (n_frames_yielded, stderr_tail). Caller is expected to
+    call proc.wait() afterwards and check returncode for failure.
+
+    Each chunk is exactly `target_dim * target_dim * 3` bytes. A short
+    read means ffmpeg closed stdout (normal EOF) — we exit cleanly.
+    Any in-progress partial frame is discarded: a truncated rgb24 buffer
+    would alias garbage pixels into Florence's input, which is worse
+    than a missing caption at the tail.
+    """
+    import numpy as np
+    frame_bytes = target_dim * target_dim * 3
+    n_frames = 0
+    try:
+        while True:
+            # Cooperative cancellation. Polled between every produced
+            # frame; worst case the consumer waits one frame's worth of
+            # decode (~5 ms NVDEC, ~30 ms software) for the producer
+            # to exit. Cheaper than wedging a thread on a blocked read.
+            if stop_event.is_set():
+                break
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
+                # EOF or short read — ffmpeg is done. Discard partials.
+                break
+            # Wrap the bytes as an (H, W, 3) uint8 numpy view. No copy:
+            # the array shares memory with `buf`, and `buf` stays alive
+            # via the array's `.base` reference. Florence's processor
+            # will copy when it builds the pixel_values tensor anyway.
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(
+                target_dim, target_dim, 3
+            )
+            ts = n_frames / float(fps)
+            # Block on `.put()` — the bounded queue is precisely what
+            # implements backpressure. If Florence is slow we want
+            # the producer to throttle, NOT build an unbounded backlog
+            # of 1.7 MB rgb24 buffers in RAM.
+            out_q.put((ts, arr))
+            n_frames += 1
+    finally:
+        # Drain stderr non-destructively so the caller can include it
+        # in error messages on non-zero exit. We tail the last 12 lines
+        # (~1 KB) which is enough to identify the failure cause.
+        stderr_tail = ""
+        try:
+            if proc.stderr is not None:
+                stderr_tail = proc.stderr.read().decode("utf-8", "replace")
+                stderr_tail = "\n".join(stderr_tail.splitlines()[-12:])
+        except Exception:
+            pass
+    return n_frames, stderr_tail
+
+
+def _frame_producer(
+    video_path: Path,
+    fps: float,
+    target_dim: int,
     out_q: "queue.Queue",
     stop_event: threading.Event,
 ) -> None:
-    """Drain pre-extracted JPEG frames into `out_q` until done or signalled.
+    """Stream rgb24 frames straight from a per-clip ffmpeg subprocess.
 
     Runs in its own thread. Always emits exactly one terminal item
-    (either the sentinel or an ("__error__", exc) tuple) so the consumer's
-    blocking `.get()` never deadlocks. Re-raises nothing — the consumer
-    is responsible for re-raising the captured exception in the main
-    thread so the surrounding `lane_progress` context unwinds cleanly.
+    (either the end sentinel or an (`__error__`, exc) tuple) so the
+    consumer's blocking `.get()` never deadlocks. Re-raises nothing —
+    the consumer is responsible for re-raising the captured exception
+    in the main thread so the surrounding `lane_progress` context
+    unwinds cleanly.
+
+    NVDEC-with-software-fallback: if hardware decode fails BEFORE
+    any frame was yielded, we restart the same clip with software
+    decode. This catches the common failure modes (NVDEC session
+    exhaustion, codec not in the NVDEC build, malformed muxer) without
+    masking real corruption — once we've yielded N frames the consumer
+    has committed to those captions and a mid-stream codec switch
+    would silently produce a discontinuous timeline.
     """
+    meta = _probe_video_meta(video_path)
+    nvdec_first = _nvdec_available()
+    proc: subprocess.Popen | None = None
+    n_yielded_total = 0
     try:
-        for ts, img in _iter_frames_from_dir(cache_dir, fps):
-            # Cooperative cancellation. Polled between every produced
-            # frame; in the worst case the consumer waits one JPEG
-            # decode (~5-10 ms) for the producer to exit.
-            if stop_event.is_set():
-                break
-            # Block on `.put()` — the bounded queue is precisely what
-            # implements backpressure. If the consumer is slow we want
-            # the producer to throttle, NOT build an unbounded backlog
-            # of decoded PIL images in RAM.
-            out_q.put((ts, img))
+        # ── First attempt: NVDEC (if available) ───────────────────────
+        proc = _spawn_ffmpeg_pipe(
+            video_path, fps, target_dim, meta, use_nvdec=nvdec_first,
+        )
+        n_yielded, stderr_tail = _stream_frames_from_proc(
+            proc, fps, target_dim, out_q, stop_event,
+        )
+        rc = proc.wait()
+        n_yielded_total = n_yielded
+
+        # ── Software fallback path ────────────────────────────────────
+        # Only viable if (a) the hardware attempt failed AND (b) we
+        # haven't committed any frames yet. Both conditions matter:
+        # restarting mid-stream would skip frames the consumer has
+        # already received, breaking the (idx -> ts) timeline contract.
+        if rc != 0 and nvdec_first and n_yielded == 0 and not stop_event.is_set():
+            print(f"  visual_lane: NVDEC failed for {video_path.name} "
+                  f"({stderr_tail.strip()[:120] or 'no stderr'}); "
+                  f"retrying software decode")
+            proc = _spawn_ffmpeg_pipe(
+                video_path, fps, target_dim, meta, use_nvdec=False,
+            )
+            n_yielded, stderr_tail = _stream_frames_from_proc(
+                proc, fps, target_dim, out_q, stop_event,
+            )
+            rc = proc.wait()
+            n_yielded_total = n_yielded
+
+        if rc != 0 and not stop_event.is_set():
+            raise RuntimeError(
+                f"ffmpeg streaming decode failed for {video_path.name} "
+                f"(rc={rc}): {stderr_tail.strip()[:500] or 'no stderr'}"
+            )
     except BaseException as exc:  # noqa: BLE001 - we re-raise via sentinel
-        # Any failure (corrupt JPEG, missing file mid-iteration, etc.)
+        # Any failure (codec init, NVDEC blowout, OS pipe error)
         # gets handed off as a tagged error sentinel so the consumer
         # can re-raise it in its own thread context.
         try:
@@ -1013,6 +1042,21 @@ def _frame_producer(
         except Exception:
             pass
     finally:
+        # Belt + suspenders subprocess teardown. If the consumer cancelled
+        # mid-stream the ffmpeg process is probably still alive and
+        # blocked on a stdout write — terminate() + wait() with a short
+        # timeout cleans that up; kill() is the last-resort hammer for
+        # processes that ignored SIGTERM.
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
         # Always emit the end sentinel last — guarantees the consumer's
         # `while True: q.get()` loop terminates regardless of which path
         # we exited through.
@@ -1020,6 +1064,13 @@ def _frame_producer(
             out_q.put(_FRAME_END_SENTINEL)
         except Exception:
             pass
+        # Best-effort completion log so the user sees per-clip extract
+        # stats inline with the inference progress. Mirrors the v2
+        # disk-cache path's "extract: foo -> N frames" line.
+        if n_yielded_total > 0:
+            print(f"  visual_lane: streamed {n_yielded_total} frames from "
+                  f"{video_path.name} (hdr={meta.get('is_hdr')}, "
+                  f"nvdec={nvdec_first})")
 
 
 # ---------------------------------------------------------------------------
@@ -1033,7 +1084,7 @@ def _process_one(
     video_path: Path,
     edit_dir: Path,
     *,
-    cache_dir: Path,
+    target_dim: int,
     model_id: str,
     fps: float,
     batch_size: int,
@@ -1041,13 +1092,14 @@ def _process_one(
     task: str,
     force: bool,
 ) -> Path:
-    """Caption one video with already-built Florence model + processor.
+    """Caption one video by streaming frames straight from ffmpeg into Florence.
 
-    Frame source is the pre-extracted JPEG cache produced by
-    _extract_frames_to_disk — by the time we get here, the prefetch pool
-    has already done all the ffmpeg / NVDEC / tonemap heavy-lifting and
-    we just stream JPEGs off disk. See _prefetch_all_frames for the
-    overlap with model load.
+    The producer thread Popen()'s a single ffmpeg subprocess that pipes
+    rgb24 frames out stdout; we batch them on this side and feed
+    Florence as soon as the queue holds `batch_size` frames. Peak
+    in-flight memory is bounded by the queue size (2 batches), not by
+    clip length — a 1-hour clip uses the same ~50 MB working set as a
+    30-second clip.
 
     Split out from run_visual_lane_batch so the batch entry point can
     amortize the ~3s Florence load + the torch.compile warmup across
@@ -1075,22 +1127,24 @@ def _process_one(
 
     captions: list[dict] = []
     batch_imgs: list = []
-    batch_ts: list[int] = []
+    batch_ts: list[float] = []
     t0 = time.time()
 
     # ------------------------------------------------------------------
-    # Spin up the JPEG-decode producer in a daemon thread. Bounded queue
-    # = 2 batches deep so the producer stays one batch ahead of the
-    # consumer at most. `daemon=True` is the belt + suspenders backup
-    # to the explicit join() in the `finally` block below — if anything
-    # truly catastrophic kills the consumer (segfault, etc.) the daemon
-    # flag prevents the producer thread from blocking interpreter exit.
+    # Spin up the streaming ffmpeg producer in a daemon thread. Bounded
+    # queue = 2 batches deep so the producer stays one batch ahead of
+    # the consumer at most — that's enough to overlap NVDEC decode with
+    # Florence inference without letting RAM grow with clip length.
+    # `daemon=True` is the belt + suspenders backup to the explicit
+    # join() in the `finally` block below — if anything truly
+    # catastrophic kills the consumer (segfault, etc.) the daemon flag
+    # prevents the producer thread from blocking interpreter exit.
     # ------------------------------------------------------------------
     frame_q: "queue.Queue" = queue.Queue(maxsize=max(2, batch_size * 2))
     stop_event = threading.Event()
     producer = threading.Thread(
         target=_frame_producer,
-        args=(cache_dir, fps, frame_q, stop_event),
+        args=(video_path, fps, target_dim, frame_q, stop_event),
         name=f"florence-producer-{video_path.stem}",
         daemon=True,
     )
@@ -1152,13 +1206,15 @@ def _process_one(
     finally:
         # ------------------------------------------------------------------
         # Producer cleanup. Belt + suspenders + a third belt:
-        #   1) stop_event tells the producer to bail at its next poll.
+        #   1) stop_event tells the producer to bail at its next poll AND
+        #      triggers proc.terminate() inside the producer's finally
+        #      block so we don't leak an ffmpeg subprocess.
         #   2) drain remaining queue items so a blocked .put() can return
         #      (the producer thread might be stuck inside .put() waiting
         #       for queue space if we exited mid-iteration).
-        #   3) join with a generous timeout — JPEG decode finishes
-        #      quickly (~5-10 ms in flight) so the join is essentially
-        #      instant in the happy path.
+        #   3) join with a generous timeout — ffmpeg terminate+wait is
+        #      capped at 2s inside the producer, so 10s here is plenty
+        #      of slack.
         # ------------------------------------------------------------------
         stop_event.set()
         try:
@@ -1170,8 +1226,9 @@ def _process_one(
         except Exception:
             pass
         producer.join(timeout=10.0)
-        # Drop any lingering PIL refs early — caption_batch already moved
-        # them to GPU and the producer's queue is now drained.
+        # Drop any lingering numpy frame refs early — caption_batch
+        # already copied them into the pixel_values tensor on GPU and
+        # the producer's queue is now drained.
         batch_imgs.clear()
 
     dt = time.time() - t0
@@ -1306,9 +1363,17 @@ def run_visual_lane_batch(
 ) -> list[Path]:
     """Run the visual lane on N videos with Florence-2 loaded ONCE.
 
+    Streaming pipe architecture: Florence loads first (primed and
+    hungry), then for each clip we spawn ONE ffmpeg subprocess that
+    pipes 768x768 rgb24 frames straight into a bounded queue. Florence
+    drains batches of `batch_size` frames, captions them, drops the
+    references, and waits for the next batch. Peak in-flight memory
+    is ~batch_size×2×1.7 MB regardless of clip length — a 1-hour clip
+    uses the same working set as a 30-second clip.
+
     `fps` is float so callers can pass fractional values (e.g. 0.5 for
     one frame every 2 s) for slow / static content where 1 fps is
-    over-sampling. Both the on-disk extract step and the JSON
+    over-sampling. Both the streaming extract and the JSON
     timestamps honour the fractional value.
     """
     out_dir = (edit_dir / VISUAL_CAPS_SUBDIR).resolve()
@@ -1329,12 +1394,10 @@ def run_visual_lane_batch(
             return [out_dir / f"{v.stem}.json" for v in video_paths]
 
     # ------------------------------------------------------------------
-    # Filter out clips that already have caption JSON. We don't want to
-    # waste prefetch + Florence cycles on cache hits, AND we want to
-    # keep the per-clip cache_dir mapping tight so the prefetch pool
-    # only touches what it'll actually feed. The filtered list is what
-    # we drive Florence with; the original `video_paths` is what we
-    # return at the end so caller order is preserved.
+    # Filter out clips that already have caption JSON. No point spinning
+    # up ffmpeg or invoking Florence for clips whose captions are already
+    # fresher than their source. The filtered list drives Florence; the
+    # original `video_paths` order is preserved in the return value.
     # ------------------------------------------------------------------
     work_videos: list[Path] = []
     for v in video_paths:
@@ -1354,40 +1417,21 @@ def run_visual_lane_batch(
     # or the other regardless of clip count.
     compile_enabled = _resolve_compile_enabled(len(work_videos))
 
-    # ------------------------------------------------------------------
-    # Kick off the bulk frame prefetch BEFORE the model load. This is
-    # the whole point of the disk-cache architecture: while transformers
-    # is downloading + materializing the Florence weights (~3-8s cold,
-    # ~1-2s warm), N parallel ffmpeg / NVDEC processes are already
-    # chewing through 4K HDR source files in the background. By the
-    # time generate() wants its first batch, the JPEGs are usually
-    # already on disk.
-    # ------------------------------------------------------------------
-    cache_root = (out_dir / FRAME_CACHE_SUBDIR).resolve()
-    cache_root.mkdir(parents=True, exist_ok=True)
-
-    extract_workers = _resolve_extract_workers(len(work_videos))
-    extract_pool: ThreadPoolExecutor | None = None
-    extract_futures: dict[Path, "Future[Path]"] = {}
     if work_videos:
-        print(f"  prefetch: starting {extract_workers} ffmpeg workers "
-              f"for {len(work_videos)} clip(s) "
-              f"(nvdec={_nvdec_available()})")
-        extract_pool = ThreadPoolExecutor(
-            max_workers=extract_workers,
-            thread_name_prefix="frame-extract",
-        )
-        for v in work_videos:
-            cache_dir = cache_root / v.stem
-            extract_futures[v] = extract_pool.submit(
-                _extract_frames_to_disk, v, cache_dir, fps,
-            )
+        print(f"  visual_lane: streaming {len(work_videos)} clip(s) "
+              f"(nvdec={_nvdec_available()}, batch={batch_size}, "
+              f"fps={fps:g})")
 
     out_paths: list[Path] = []
 
-    # Build Florence in parallel with the running prefetch pool. The
-    # GIL doesn't block here because both ffmpeg and the model download
-    # release it during their native I/O.
+    # ------------------------------------------------------------------
+    # Build Florence FIRST so it's primed and hungry by the time the
+    # first frame arrives. ffmpeg+NVDEC produces 768² rgb24 frames at
+    # >200 fps — Florence is universally the bottleneck — so there's
+    # nothing to gain by overlapping decode with model load. Better
+    # to know the model is sane (CUDA OOM, dtype mismatch, missing
+    # weights) BEFORE we start burning subprocess time.
+    # ------------------------------------------------------------------
     model = processor = torch_dtype = None
     try:
         if work_videos:
@@ -1409,59 +1453,30 @@ def run_visual_lane_batch(
                 vbar.start_item(v.name)
 
                 # Cache-hit fast path: never made it onto work_videos,
-                # so no prefetch future, no model invocation. Just
-                # return the existing JSON path.
+                # so no ffmpeg, no model invocation. Just return the
+                # existing JSON path.
                 cached_path = out_dir / f"{v.stem}.json"
-                if v not in extract_futures:
+                if v not in work_videos:
                     out_paths.append(cached_path)
                     vbar.update(advance=1, item=v.name)
                     continue
 
-                # Block on the prefetch future for THIS clip. If it's
-                # already done (very likely when the model load took
-                # longer than the extract), this returns instantly. If
-                # not, we wait — but the GPU was idle during model load
-                # anyway, so the wall-clock ceiling is just the longest
-                # single-clip extract.
+                # _process_one spawns the ffmpeg producer thread for
+                # THIS clip and runs the streaming consumer loop. On
+                # producer-side failure (codec init, NVDEC blowout)
+                # the exception propagates here; we log and skip the
+                # clip rather than poisoning the whole batch.
                 try:
-                    cache_dir = extract_futures[v].result()
+                    out_paths.append(_process_one(
+                        model, processor, torch_dtype, v, edit_dir,
+                        target_dim=FLORENCE_INPUT_DIM,
+                        model_id=model_id, fps=fps, batch_size=batch_size,
+                        device=device, task=task, force=force,
+                    ))
                 except Exception as e:
-                    # Prefetch failed for this clip; surface clearly
-                    # and skip it rather than poisoning the whole batch.
-                    print(f"  visual_lane: prefetch failed for {v.name}: {e}")
-                    vbar.update(advance=1, item=v.name)
-                    continue
-
-                out_paths.append(_process_one(
-                    model, processor, torch_dtype, v, edit_dir,
-                    cache_dir=cache_dir,
-                    model_id=model_id, fps=fps, batch_size=batch_size,
-                    device=device, task=task, force=force,
-                ))
+                    print(f"  visual_lane: streaming failed for {v.name}: {e}")
                 vbar.update(advance=1, item=v.name)
     finally:
-        # Tear down the prefetch pool. shutdown(wait=True) lets any
-        # in-flight extractions finish so we don't leave half-written
-        # JPEG dirs behind on early exit.
-        if extract_pool is not None:
-            try:
-                extract_pool.shutdown(wait=True)
-            except Exception:
-                pass
-
-        # Optional disk-cache cleanup. Keeps zero state by default;
-        # set VIDEO_USE_FRAME_CACHE_KEEP=1 to retain JPEGs for debug.
-        keep_raw = os.environ.get("VIDEO_USE_FRAME_CACHE_KEEP", "").strip().lower()
-        if keep_raw not in {"1", "true", "yes", "on", "y", "t"}:
-            for v in work_videos:
-                cache_dir = cache_root / v.stem
-                _safe_rmtree(cache_dir)
-            # Try to remove the parent _frame_cache dir if it ended up empty.
-            try:
-                cache_root.rmdir()
-            except OSError:
-                pass
-
         try:
             import torch
             if model is not None:

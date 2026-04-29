@@ -480,11 +480,15 @@ def test_pack_timelines(R: Results, tmp: Path) -> None:
             return
         R.ok("pack_timelines ran")
 
-        # Verify each output exists and contains the expected markers
+        # Verify each output exists and contains the expected markers.
+        # NOTE: visual_timeline.md is caveman-compressed by default (the spaCy
+        # NLP pass strips determiners / stop words / auxiliaries before pack),
+        # so a literal "a workshop bench" will never appear — assert on the
+        # surviving content word "bench" instead. See helpers/caveman_compress.py.
         for fname, must_contain in [
             ("speech_timeline.md", "Hello world."),
             ("audio_timeline.md", "drill"),
-            ("visual_timeline.md", "a workshop bench"),
+            ("visual_timeline.md", "bench"),
             ("merged_timeline.md", "drill"),
         ]:
             p = edit / fname
