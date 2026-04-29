@@ -3,7 +3,7 @@ name: premiere-agent
 description: Edit any video by conversation. Local two-phase preprocessing — Phase A runs Parakeet ONNX speech + Florence-2 visual captions in parallel; Phase B runs CLAP zero-shot audio events against an agent-curated vocabulary derived from the speech + visual timelines. Reasons over a single interleaved `merged_timeline.md` and exports `cut.fcpxml` + `cut.xml` + `master.srt` to Premiere / Resolve / Final Cut Pro X — XML-only delivery, the cut lives in the NLE. For talking heads, montages, tutorials, travel, interviews, workshop / shop footage. No presets, no menus, no cloud transcription. Ask questions, confirm the plan, execute, iterate, persist. Production-correctness rules are hard; everything else is artistic freedom.
 ---
 
-# Video Use Premiere
+# Premiere Agent
 
 ## Principle
 
