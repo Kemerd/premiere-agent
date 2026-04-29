@@ -94,12 +94,94 @@ AUDIO_ONLY_EXTS = {
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_ONLY_EXTS
 
 
-def _discover_sources(sources_dir: Path) -> tuple[list[Path], list[Path]]:
+# ---------------------------------------------------------------------------
+# Subdirectory pruning policy for recursive media discovery.
+#
+# We recurse by default so that the skill's documented folder conventions
+# (b_roll/, a_roll/, timelapse/, voiceover/, narration/) are picked up
+# automatically — users shouldn't have to enumerate every subdir on the
+# command line just because they organised their footage. But recursion
+# also has to stay clear of dirs that obviously aren't source media:
+#
+#   * the skill's own session output dir (`edit/`) — re-processing our
+#     own caches would loop forever
+#   * the paired-audio aliasing dir (`.paired_audio/`) — these are
+#     hardlinks of files we've already inventoried
+#   * proxy / preview render dirs — `proxies/`, `_proxy/`, `previews/`
+#   * NLE scratch / hidden state — `.cache/`, `.fcpcache/`, `Adobe Premiere Pro Auto-Save/`
+#   * any dotfile / dotdir or leading-underscore dir (the universal
+#     "this is bookkeeping, leave it alone" convention)
+#
+# Anything outside that explicit denylist is fair game. If the user has
+# a weird folder name we shouldn't touch, --no-recurse + an explicit
+# file list via `preprocess.py` is the escape hatch.
+_PRUNE_DIR_NAMES = {
+    "edit",                # this skill's session output dir
+    ".paired_audio",       # paired-audio aliases (already inventoried)
+    "proxies", "_proxy", "_proxies", "previews",
+    ".cache", ".fcpcache",
+    "Adobe Premiere Pro Auto-Save",
+    "node_modules", ".git", "__pycache__",
+}
+
+
+def _is_pruned_dir(p: Path) -> bool:
+    """True if recursion should skip this directory.
+
+    Matches by directory NAME (not full path), case-insensitive on the
+    explicit denylist, and case-sensitive on the dotfile / underscore
+    heuristic (those conventions are themselves case-sensitive in
+    practice). Symlink loops are out of scope — we follow os.walk's
+    default of not following dir symlinks at the call-site below.
+    """
+    name = p.name
+    if not name:
+        return False                       # root drive on Windows
+    if name.startswith(".") or name.startswith("_"):
+        return True                        # dotfiles + bookkeeping
+    return name.lower() in {n.lower() for n in _PRUNE_DIR_NAMES}
+
+
+# Depth ceiling for recursion. Picked at 10 because:
+#   * Real-world video project trees rarely exceed 4-5 levels even on
+#     extravagant orgs (e.g. project/year/shoot/cam/take/file.mp4 = 5).
+#   * Going deeper than 10 almost certainly means the user pointed us
+#     at the wrong root (e.g. their entire `Footage/` drive) and we
+#     should stop rather than walk megabytes of unrelated files.
+#   * The pruning denylist already keeps us out of `edit/` and proxy
+#     dirs, so the cap mostly just bounds pathological symlink-free
+#     trees that happen to be very deep.
+#
+# Override with --max-depth N from the CLI if you genuinely have a
+# deeper tree (set N=0 to disable the cap entirely).
+_DEFAULT_MAX_DEPTH = 10
+
+
+def _discover_sources(
+    sources_dir: Path,
+    *,
+    recurse: bool = True,
+    max_depth: int = _DEFAULT_MAX_DEPTH,
+) -> tuple[list[Path], list[Path]]:
     """Return (videos, audio_only) sorted lists under sources_dir.
 
-    Non-recursive on purpose — recursion picks up B-roll and proxy
-    folders the user may not want preprocessed. Users with a tree can
-    pass `python preprocess.py file1 file2 ...` directly.
+    Recursive by default — the skill's documented folder conventions
+    (b_roll/, a_roll/, timelapse/, voiceover/) are first-class citizens
+    of the editing workflow, so users shouldn't have to manually pass
+    file lists just to include them. Pass `recurse=False` (or the
+    `--no-recurse` CLI flag) for the legacy top-level-only behaviour.
+
+    `max_depth` bounds how far below `sources_dir` we'll descend
+    (sources_dir itself = depth 0). Default is 10 — generous enough
+    for any sane project tree, tight enough that pointing the script
+    at the wrong root (e.g. someone's whole `Footage/` drive) doesn't
+    walk gigabytes of unrelated files. Pass `max_depth=0` to disable
+    the cap entirely.
+
+    Pruning policy lives in `_is_pruned_dir` — we hard-skip the skill's
+    own session output (`edit/`), proxy/preview dirs, dotfiles, and
+    leading-underscore dirs. Symlinks are not followed (os.walk
+    default) so we can't loop on a self-referential tree.
 
     Returns a 2-tuple so the caller can print a clean summary and pass
     them as a single combined list to run_preprocess() (which then
@@ -110,14 +192,62 @@ def _discover_sources(sources_dir: Path) -> tuple[list[Path], list[Path]]:
     """
     videos: list[Path] = []
     audio: list[Path] = []
-    for p in sources_dir.iterdir():
-        if not p.is_file():
-            continue
-        sfx = p.suffix.lower()
-        if sfx in VIDEO_EXTS:
-            videos.append(p.resolve())
-        elif sfx in AUDIO_ONLY_EXTS:
-            audio.append(p.resolve())
+
+    if not recurse:
+        # Legacy top-level-only path. Identical to the original
+        # implementation prior to recursion landing — kept exact so
+        # `--no-recurse` is a true regression-free escape hatch.
+        for p in sources_dir.iterdir():
+            if not p.is_file():
+                continue
+            sfx = p.suffix.lower()
+            if sfx in VIDEO_EXTS:
+                videos.append(p.resolve())
+            elif sfx in AUDIO_ONLY_EXTS:
+                audio.append(p.resolve())
+        videos.sort()
+        audio.sort()
+        return videos, audio
+
+    # Recursive path. Use os.walk so we can mutate `dirnames` in place
+    # to prune subtrees BEFORE descending — Path.rglob has no equivalent
+    # short-circuit and would happily walk into edit/ before we filter
+    # the results, wasting stat() calls on caches that can be huge.
+    #
+    # Depth tracking: we count how many path components separate the
+    # current `dirpath` from `sources_dir` and clear `dirnames` when we
+    # hit the ceiling. Clearing (not pruning) is correct — once we've
+    # walked the files at this depth we want NONE of its children.
+    root = sources_dir.resolve()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        # Compute current depth relative to the root. `relative_to`
+        # raises if dirpath isn't under root, which can't happen during
+        # a non-followlinks walk so we don't bother defending against it.
+        depth = len(Path(dirpath).resolve().relative_to(root).parts)
+
+        # If we're already at the ceiling, walk this dir's files but
+        # then prune all children so we don't descend further. A
+        # max_depth of 0 is the explicit "no cap" sentinel — skip the
+        # check entirely in that case.
+        if max_depth and depth >= max_depth:
+            dirnames.clear()
+        else:
+            # Mutate-in-place is the documented contract of os.walk for
+            # pruning. We rebuild dirnames[:] = [...] rather than
+            # .remove() in a loop so the order is stable and the cost
+            # is one pass through the list.
+            dirnames[:] = [
+                d for d in dirnames
+                if not _is_pruned_dir(Path(dirpath) / d)
+            ]
+
+        for fname in filenames:
+            sfx = Path(fname).suffix.lower()
+            if sfx in VIDEO_EXTS:
+                videos.append(Path(dirpath, fname).resolve())
+            elif sfx in AUDIO_ONLY_EXTS:
+                audio.append(Path(dirpath, fname).resolve())
+
     videos.sort()
     audio.sort()
     return videos, audio
