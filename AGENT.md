@@ -486,6 +486,8 @@ Real recordings contain multiple takes of the same line — the speaker flubs, s
 
 **Mechanics.** Standard inline-cut rules: word-boundary alignment (Hard Rule 2), the frustration marker / curse / *"let me try that again"* **all excluded** from the EDL (connective tissue between takes — nobody wants them in the cut), and the same `combined_pad_ms <= gap_ms - 60` clamp from the silence-removal pass governs the gap between kept earlier audio and kept later audio. Cross-clip retakes emit two adjacent ranges from different sources — the FCPXML exporter handles same-track concatenation natively. Cite the rejection in `reason` (*"Second take of intro; first take C0312 4.1–12.0s rejected — speaker said 'fuck, again' at 11.4s and restarted cleaner."*) and surface every retake call in a dedicated `Retake decisions` block in your strategy / handoff so the user can audit what got dropped.
 
+**Recurring verbal tics across clips** (*"so, yeah"*, *"anyway"*, *"right"*, *"you know"*) — keep the first instance, drop subsequent ones. Same mechanics as retakes.
+
 **Conservative.** Never cut around a frustration marker without confirming a matching restart within 10s (a standalone *"fuck"* may be the speaker's reaction to something on camera — content, not retake noise; that's why filler-word rules don't list curses as default-cut). Cross-clip decisions require temporal evidence — similar speech across two clips isn't proof; require stem ordering, an in-clip note, or a slate / clap event before dropping a whole earlier source.
 
 ## In-clip editor notes — AI guidance baked into the source ("hey editor")
