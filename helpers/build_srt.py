@@ -37,6 +37,11 @@ the editor sub-agent's documentation both expect by default.
 
 from __future__ import annotations
 
+# Re-launch under the skill's optional .venv when one exists (no-op otherwise).
+if __name__ == "__main__":
+    import _venv
+    _venv.ensure()
+
 import argparse
 import json
 import re

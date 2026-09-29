@@ -163,6 +163,20 @@ On macOS the speech lane runs ONNX Runtime against the **CoreML** EP (Neural Eng
 
 You'll also need `ffmpeg` on PATH. The script warns if it's missing with the right install command for your OS (`brew`, `apt`, `dnf`, `pacman`, `winget`).
 
+#### Virtual environment (default) or global install — your call
+
+By default the install scripts create a skill-local virtualenv at `premiere-agent/.venv` and install everything into it. You don't activate it or change how you run anything: every helper calls `helpers/_venv.py` on startup, which re-launches the same command under `.venv`'s interpreter when that venv exists. `python helpers/preprocess_batch.py ...` works the same from any shell, and a stray global package (the classic one is a CPU-only `onnxruntime` sitting next to `onnxruntime-gpu` and quietly dropping the speech lane to CPU) can't get in the way.
+
+Prefer your own environment (conda, a venv you manage, system Python)? Opt out:
+
+```bash
+./install.sh --no-venv                   # Linux / macOS
+.\install.bat --no-venv                  # Windows
+PREMIERE_AGENT_NO_VENV=1 ./install.sh    # same thing, via env var
+```
+
+With no `.venv/` folder, helpers just run on whatever `python` you call them with. If a `.venv/` exists but you want a different interpreter for one run, set `PREMIERE_AGENT_NO_VENV=1` and the re-launch is skipped (or delete `.venv/` to switch back to global for good). `python helpers/health.py --json` shows which environment ran the checks (`env_fingerprint.prefix`), and its cache resets whenever you switch environments.
+
 ### The speech lane in detail (ONNX Parakeet, multi-session pool)
 
 Speech is the most expensive lane and the one most editors want fastest, so it gets the heaviest engineering. The default path runs **NVIDIA Parakeet TDT 0.6B in ONNX Runtime** with a pool of N independent inference sessions executing N clips in parallel. The NeMo Parakeet runtime stays wired in as a fallback for hosts where ONNX Runtime can't load a working execution provider — but it pulls a multi-gigabyte CUDA/PyTorch graph per call so the ONNX path is the day-to-day default. We deliberately do **not** ship a Hugging Face Whisper backend: the encoder-decoder Whisper pipeline has a [known word-timestamp memory regression](https://github.com/huggingface/transformers/issues/27834) that pinned a 5090 at 32 GB on a single 4-minute clip, and Whisper loves to hallucinate text on silence — both dealbreakers for an editor that grinds through hours of footage.
@@ -577,6 +591,8 @@ This emits **three** files from a single timeline build:
 - `edit/master.srt` — captions sidecar (UTF-8, CRLF, sequential cues). Premiere / Resolve / FCP X all import this onto a captions track via `File → Import`.
 
 This is deliberate: Premiere does **not** import `.fcpxml` natively (Adobe's docs route you through the third-party [XtoCC](https://www.intelligentassistance.com/xtocc.html) translator), but it does read FCP7 xmeml out of the box. Emitting both XML dialects lets the recipient pick whichever NLE they live in. Override with `--targets {both,fcpxml,premiere}` if you only want one. Pass `--no-srt` to skip the captions sidecar.
+
+**Proxies.** Pass `--proxies` to file every source's proxy the way Premiere names its own: `<footage_dir>/Proxies/<stem>_Proxy.mp4`. DJI `<stem>.LRF` files get moved and renamed there, and loose `<stem>_Proxy.mp4/.mov` files next to the source get moved there. `cut.fcpxml` gets a `proxy-media` rep per asset. `cut.xml` still links the originals, because Premiere's xmeml has no proxy field. In Premiere, import `cut.xml`, select the clips in the `Footage` bin, right-click → Proxy → Attach Proxies, and pick the first `_Proxy` file with "Relink others automatically" on. Premiere matches the rest by name. Preprocessing skips `_Proxy` files and `Proxies/` folders, so proxies never get transcribed twice.
 
 Either XML file lands clips on V1/A1 with split offsets honoring `audio_lead` (J cut), `video_tail` (L cut), and `transition_in` (cross-dissolve) per range. Ranges with `speed > 1.0` are emitted as native NLE retime: FCPXML gets a `<timeMap>` element, Premiere xmeml gets a `Time Remap` filter, and the audio is silenced or pitch-corrected per `audio_strategy`. The exporter snaps every cut to whole frames at the timeline rate so there's no audio/video drift on import.
 

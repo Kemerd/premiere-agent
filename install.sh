@@ -17,6 +17,12 @@
 #   macOS  any     : PyPI default. On Apple Silicon that's the MPS-enabled
 #                    universal wheel; on Intel Macs it's CPU. There is NO
 #                    CUDA on macOS — Apple dropped NVIDIA support in 2018.
+#
+# Installs into a skill-local virtualenv (.venv) by default. Opt out and
+# install into the python on PATH instead with either of:
+#
+#   ./install.sh --no-venv
+#   PREMIERE_AGENT_NO_VENV=1 ./install.sh
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -41,6 +47,35 @@ echo "[premiere-agent] os:     ${OS_NAME} (${ARCH_NAME})"
 if [ -z "$PYTHON" ]; then
   echo "ERROR: no python interpreter on PATH" >&2
   exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 0. Virtual environment (default on).
+#
+#    Everything installs into .venv so a stray global package (e.g. a CPU
+#    `onnxruntime` shadowing `onnxruntime-gpu`) can't silently demote a
+#    lane to CPU. helpers/_venv.py re-launches every helper under this
+#    interpreter, so the documented `python helpers/<script>.py` keeps
+#    working from any shell. Reused as-is when it already exists.
+#
+#    --no-venv / PREMIERE_AGENT_NO_VENV=1 skips this and installs into
+#    the interpreter picked above (the pre-venv behaviour).
+# ---------------------------------------------------------------------------
+USE_VENV=1
+for arg in "$@"; do
+  [ "$arg" = "--no-venv" ] && USE_VENV=0
+done
+[ "${PREMIERE_AGENT_NO_VENV:-}" = "1" ] && USE_VENV=0
+
+if [ "$USE_VENV" = "1" ]; then
+  if [ ! -x ".venv/bin/python" ]; then
+    echo "[premiere-agent] creating virtualenv: $SCRIPT_DIR/.venv"
+    "$PYTHON" -m venv .venv
+  fi
+  PYTHON="$SCRIPT_DIR/.venv/bin/python"
+  echo "[premiere-agent] using virtualenv: $SCRIPT_DIR/.venv"
+else
+  echo "[premiere-agent] --no-venv: installing into $PYTHON"
 fi
 
 # ---------------------------------------------------------------------------

@@ -41,6 +41,11 @@ CLI:
 
 from __future__ import annotations
 
+# Re-launch under the skill's optional .venv when one exists (no-op otherwise).
+if __name__ == "__main__":
+    import _venv
+    _venv.ensure()
+
 import argparse
 import json
 import os
@@ -100,6 +105,9 @@ def env_fingerprint() -> dict:
     fp = {
         "python": sys.version.split()[0],
         "platform": platform.system().lower(),
+        # Which environment is running (global vs skill .venv) — switching
+        # between them must invalidate the cache even if versions match.
+        "prefix": os.path.normcase(os.path.realpath(sys.prefix)),
     }
     # Versions of the libraries most likely to break on upgrade.
     for mod_name in ("torch", "transformers", "opentimelineio"):

@@ -52,6 +52,11 @@ Public API:
 
 from __future__ import annotations
 
+# Re-launch under the skill's optional .venv when one exists (no-op otherwise).
+if __name__ == "__main__":
+    import _venv
+    _venv.ensure()
+
 import os
 import sys
 from typing import Any
@@ -325,20 +330,29 @@ def _try_import(mod_name: str) -> bool:
 def _wheel_dir(mod_name: str, sub_path: str) -> str | None:
     """Return the on-disk dir for a pip wheel's DLL bundle, or None.
 
-    Uses the package's `__file__` to locate site-packages, then joins
-    `sub_path` (commonly "bin"). Returns None if the wheel isn't
-    installed OR the expected sub_path doesn't exist on disk.
+    Locates the package dir, then joins `sub_path` (commonly "bin").
+    Returns None if the wheel isn't installed OR the expected sub_path
+    doesn't exist on disk.
+
+    Newer NVIDIA wheels (cuDNN 9.2x, CUDA 12.9 runtime / cuBLAS) ship
+    `nvidia.<lib>` as a namespace package with no `__init__.py`, so
+    `__file__` is None there. `__path__` is set for both regular and
+    namespace packages, so it is checked first; `__file__` stays as the
+    fallback for plain modules.
     """
     try:
         mod = __import__(mod_name, fromlist=["__file__"])
     except ImportError:
         return None
+    base_dirs = [str(p) for p in (getattr(mod, "__path__", None) or [])]
     mod_file = getattr(mod, "__file__", None)
-    if not mod_file:
-        return None
-    base_dir = os.path.dirname(mod_file)
-    target = os.path.join(base_dir, sub_path) if sub_path else base_dir
-    return target if os.path.isdir(target) else None
+    if mod_file:
+        base_dirs.append(os.path.dirname(mod_file))
+    for base_dir in base_dirs:
+        target = os.path.join(base_dir, sub_path) if sub_path else base_dir
+        if os.path.isdir(target):
+            return target
+    return None
 
 
 def _system_cuda_roots() -> list[str]:
