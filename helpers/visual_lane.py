@@ -382,10 +382,37 @@ def _probe_video_meta(video_path: Path) -> dict:
             "height": int(s.get("height") or 0),
             "transfer": transfer,
             "is_hdr": is_hdr,
+            "keyframe_interval_s": _keyframe_interval_s(video_path),
         }
     except Exception as e:
         print(f"  extract: probe failed for {video_path.name} ({e}); assuming SDR 1920x1080")
-        return {"width": 1920, "height": 1080, "transfer": "", "is_hdr": False}
+        return {"width": 1920, "height": 1080, "transfer": "", "is_hdr": False,
+                "keyframe_interval_s": None}
+
+
+def _keyframe_interval_s(video_path: Path) -> float | None:
+    """Largest keyframe spacing (seconds) in the first ~10s, or None.
+
+    Reads keyframes only (`-skip_frame nokey`), so it costs a few
+    packets, not a decode. None on any failure or when fewer than two
+    keyframes show up — callers then keep the full-decode path.
+    """
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-skip_frame", "nokey", "-show_entries", "frame=pts_time",
+        "-read_intervals", "%+10", "-of", "csv=p=0", str(video_path),
+    ]
+    try:
+        out = subprocess.run(
+            cmd, check=True, capture_output=True, text=True, timeout=10,
+        ).stdout
+        pts = sorted(float(x) for x in out.split() if x.strip())
+    except Exception:
+        return None
+    if len(pts) < 2:
+        return None
+    gaps = [b - a for a, b in zip(pts, pts[1:]) if b > a]
+    return max(gaps) if gaps else None
 
 
 def _build_extract_cmd(
@@ -476,6 +503,15 @@ def _build_extract_cmd(
         # system RAM after decode keeps the filter graph happy on both
         # SDR and HDR paths with one code path.
         base += ["-hwaccel", "cuda"]
+    # Keyframe-only decode when the sample interval is at least one GOP.
+    # `fps=` still has to see every DECODED frame, so a 0.5 fps pass
+    # over 4K60 otherwise decodes (and, with -hwaccel cuda, downloads
+    # to RAM) 120 frames per kept one. Every sample then lands on the
+    # nearest earlier keyframe, i.e. at most one GOP early. Measured on
+    # DJI 4K60 HEVC (0.5s GOP): 37.7s -> 3.3s for 2 min, same frames.
+    gop = meta.get("keyframe_interval_s")
+    if fps > 0 and gop and gop <= 1.0 / fps:
+        base += ["-skip_frame", "nokey"]
     base += ["-i", str(video_path), "-vf", vf]
     # Raw rgb24 to stdout. `-an` skips any audio stream from being
     # written to the output (we don't want it on the pipe). `-` is

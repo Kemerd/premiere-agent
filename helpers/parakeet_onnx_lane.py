@@ -578,6 +578,344 @@ def _result_text(result, *, uses_vad: bool = False) -> str:
     return ""
 
 
+
+# ---------------------------------------------------------------------------
+# Long-audio chunking
+#
+# The Parakeet TDT ONNX export bakes a fixed relative-position table into
+# the conformer's self-attention (~5000 encoder frames, roughly 6.5 min of
+# audio at the 80 ms subsampled frame rate). Feed it a longer WAV and ORT
+# dies inside `/layers.0/self_attn/Add_2` with a broadcast mismatch — or
+# worse, quietly tries to allocate a quadratic attention map for a 20-min
+# clip and throws "bad allocation". Either way the clip loses its whole
+# transcript.
+#
+# Fix at the source: split anything longer than CHUNK_TRIGGER_S into pieces,
+# cutting each piece at the quietest 20 ms window inside a search band
+# around the nominal boundary so we never slice through a word. Each piece
+# rides through the session pool in parallel (this is actually FASTER than
+# one giant inference on long files), and the resulting word lists are
+# shifted by the chunk's offset and concatenated. Downstream never sees
+# the seam.
+# ---------------------------------------------------------------------------
+
+# Chunk length aimed for — comfortably under the ~390 s positional cap
+# while still long enough that inter-chunk seams are rare.
+CHUNK_TARGET_S = 240.0
+# Only bother chunking clips longer than this; short clips stay whole.
+CHUNK_TRIGGER_S = 300.0
+# +/- band around each nominal boundary to hunt for silence.
+CHUNK_SEARCH_S = 8.0
+# Window used to measure loudness while hunting for the quietest point.
+CHUNK_RMS_WIN_S = 0.02
+
+
+def _wav_duration_s(wav_path: Path) -> float:
+    """Cheap header-only duration read. Returns 0.0 on any failure."""
+    try:
+        import soundfile as sf
+        info = sf.info(str(wav_path))
+        if info.samplerate <= 0:
+            return 0.0
+        return float(info.frames) / float(info.samplerate)
+    except Exception:
+        return 0.0
+
+
+def _find_quiet_split(samples, sr: int, nominal: int) -> int:
+    """Return the sample index of the quietest short window near `nominal`.
+
+    Scans +/- CHUNK_SEARCH_S around the nominal boundary in RMS windows
+    of CHUNK_RMS_WIN_S and picks the minimum-energy one. Falls back to
+    the nominal index if the band is degenerate.
+    """
+    import numpy as np
+
+    if samples is None or len(samples) == 0 or sr <= 0:
+        return nominal
+    band = int(CHUNK_SEARCH_S * sr)
+    win = max(1, int(CHUNK_RMS_WIN_S * sr))
+    lo = max(0, nominal - band)
+    hi = min(len(samples) - win, nominal + band)
+    if hi <= lo:
+        return nominal
+
+    seg = samples[lo:hi].astype(np.float32)
+    # Frame the band into non-overlapping windows and take per-window RMS.
+    n_win = max(1, len(seg) // win)
+    framed = seg[: n_win * win].reshape(n_win, win)
+    rms = np.sqrt(np.mean(framed * framed, axis=1))
+    best = int(np.argmin(rms))
+    # Land in the middle of the quietest window.
+    return lo + best * win + win // 2
+
+
+def _split_wav_for_chunks(wav_path: Path, chunk_dir: Path) -> list:
+    """Split a long WAV into silence-aligned pieces.
+
+    Returns a list of (chunk_wav_path, offset_seconds). Chunks are cached
+    next to the source WAV keyed by the source mtime so repeated runs
+    don't re-split. On any read failure returns a single (wav_path, 0.0)
+    so the caller degrades to the original whole-file path.
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        samples, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+        if samples is None or len(samples) == 0 or sr <= 0:
+            return [(wav_path, 0.0)]
+        if getattr(samples, "ndim", 1) > 1:
+            samples = samples.mean(axis=1)
+
+        total = len(samples)
+        n_chunks = max(1, int(round(total / (CHUNK_TARGET_S * sr))))
+        if n_chunks <= 1:
+            return [(wav_path, 0.0)]
+
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        src_mtime = wav_path.stat().st_mtime
+
+        # Pick every boundary first so chunks tile the file exactly.
+        bounds = [0]
+        for k in range(1, n_chunks):
+            nominal = int(k * total / n_chunks)
+            cut = _find_quiet_split(samples, sr, nominal)
+            # Never let a boundary move backwards past the previous one.
+            cut = max(bounds[-1] + sr, min(cut, total - sr))
+            bounds.append(cut)
+        bounds.append(total)
+
+        out = []
+        for k in range(len(bounds) - 1):
+            a, b = bounds[k], bounds[k + 1]
+            if b <= a:
+                continue
+            chunk_path = chunk_dir / f"{wav_path.stem}.chunk{k:03d}.wav"
+            # Cache hit if the chunk is newer than the source WAV.
+            fresh = False
+            try:
+                fresh = chunk_path.exists() and chunk_path.stat().st_mtime >= src_mtime
+            except OSError:
+                fresh = False
+            if not fresh:
+                sf.write(str(chunk_path), samples[a:b], sr, subtype="PCM_16")
+            out.append((chunk_path, float(a) / float(sr)))
+        return out if out else [(wav_path, 0.0)]
+    except Exception as e:
+        print(
+            f"  [parakeet_onnx] WARN: chunking {wav_path.name} failed "
+            f"({type(e).__name__}: {e}); falling back to whole-file inference.",
+            file=sys.stderr,
+        )
+        return [(wav_path, 0.0)]
+
+
+def _shift_words(words: list, offset_s: float) -> list:
+    """Add `offset_s` to every start/end in a canonical word list."""
+    shifted = []
+    for w in words or []:
+        if not isinstance(w, dict):
+            continue
+        w2 = dict(w)
+        for key in ("start", "end"):
+            if w2.get(key) is not None:
+                try:
+                    w2[key] = float(w2[key]) + offset_s
+                except (TypeError, ValueError):
+                    pass
+        shifted.append(w2)
+    return shifted
+
+
+
+# ---------------------------------------------------------------------------
+# Word-end refinement from the waveform
+#
+# The token-timestamp path only knows where each word STARTS. It fills in
+# `end` with the next word's start, which is fine mid-sentence but turns
+# every pause into part of the preceding word — a 40 s silence becomes a
+# 40 s "okay". Downstream that kills silence detection (no spacing entries),
+# phrase grouping (one phrase per clip) and out-point placement (the cut
+# would ride the whole pause). So after the tokens are grouped we walk the
+# actual audio: from each word's start, track short-window RMS and stop at
+# the first sustained dip below a floor derived from the clip's own noise
+# level. That is the word's real end; anything between it and the next
+# word's start becomes a proper `spacing` entry.
+# ---------------------------------------------------------------------------
+
+# Analysis window and hop for the RMS envelope.
+END_WIN_S = 0.02
+END_HOP_S = 0.01
+# How long the envelope must stay below the floor to count as "speech over".
+END_HOLD_S = 0.12
+# Floor = noise_floor * this ratio (and never above peak * END_PEAK_FRAC).
+END_FLOOR_RATIO = 3.0
+END_PEAK_FRAC = 0.15
+# Minimum word hold so a single-token word never collapses to zero width.
+END_MIN_WORD_S = 0.08
+
+
+def _rms_envelope(samples, sr: int):
+    """Return (envelope, hop_samples) — per-hop RMS over END_WIN_S windows."""
+    import numpy as np
+
+    win = max(1, int(END_WIN_S * sr))
+    hop = max(1, int(END_HOP_S * sr))
+    if len(samples) < win:
+        return np.zeros(1, dtype=np.float32), hop
+    n = 1 + (len(samples) - win) // hop
+    # Strided view: n windows of `win` samples, hop apart. Cheap even on
+    # a 30-minute clip (n ~ 180k rows).
+    idx = np.arange(win)[None, :] + hop * np.arange(n)[:, None]
+    frames = samples[idx].astype(np.float32)
+    env = np.sqrt(np.mean(frames * frames, axis=1))
+    return env, hop
+
+
+def _refine_word_ends(words: list, wav_path: Path) -> list:
+    """Snap each word's `end` to where the audio actually goes quiet.
+
+    Works in place on the canonical list (words + spacings), rebuilding
+    the spacing entries afterwards. Any failure leaves the input untouched
+    so a missing / unreadable WAV can never break the lane.
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        only_words = [w for w in words if isinstance(w, dict) and w.get("type") == "word"]
+        if not only_words:
+            return words
+
+        samples, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+        if samples is None or len(samples) == 0 or sr <= 0:
+            return words
+        if getattr(samples, "ndim", 1) > 1:
+            samples = samples.mean(axis=1)
+
+        env, hop = _rms_envelope(samples, sr)
+        if env.size < 2:
+            return words
+
+        # Noise floor: a low percentile of the envelope over the whole clip.
+        # Speech clips sit well above it; a clip that is all speech still
+        # gets a sane floor because the 10th percentile lands in the
+        # inter-word dips.
+        noise = float(np.percentile(env, 10))
+        peak = float(np.percentile(env, 99))
+        floor = max(noise * END_FLOOR_RATIO, 1e-5)
+        floor = min(floor, peak * END_PEAK_FRAC) if peak > 0 else floor
+
+        hold_hops = max(1, int(END_HOLD_S / END_HOP_S))
+        total_s = len(samples) / float(sr)
+
+        for i, w in enumerate(only_words):
+            try:
+                start = float(w["start"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            # Hard cap: the next word's start (or clip end).
+            if i + 1 < len(only_words):
+                cap = float(only_words[i + 1]["start"])
+            else:
+                cap = total_s
+            if cap - start <= END_MIN_WORD_S:
+                # Words packed tighter than the minimum hold — leave as is.
+                continue
+
+            h0 = int(start * sr / hop)
+            h1 = min(env.size, int(cap * sr / hop))
+            if h1 - h0 <= hold_hops:
+                continue
+
+            # March forward until we see `hold_hops` consecutive quiet hops.
+            quiet_run = 0
+            end_hop = None
+            for h in range(h0, h1):
+                if env[h] < floor:
+                    quiet_run += 1
+                    if quiet_run >= hold_hops:
+                        end_hop = h - hold_hops + 1
+                        break
+                else:
+                    quiet_run = 0
+            if end_hop is None:
+                continue  # never went quiet before the next word — keep cap
+
+            new_end = end_hop * hop / float(sr)
+            new_end = max(start + END_MIN_WORD_S, min(new_end, cap))
+            w["end"] = float(new_end)
+
+        # Rebuild spacing entries from the refined ends.
+        rebuilt = []
+        for i, w in enumerate(only_words):
+            rebuilt.append(w)
+            if i + 1 < len(only_words):
+                nxt = only_words[i + 1]
+                gap = float(nxt["start"]) - float(w["end"])
+                if gap > 0.0:
+                    rebuilt.append({
+                        "type": "spacing",
+                        "text": " ",
+                        "start": float(w["end"]),
+                        "end": float(nxt["start"]),
+                    })
+        return rebuilt
+    except Exception as e:
+        print(
+            f"  [parakeet_onnx] WARN: word-end refinement skipped for "
+            f"{wav_path.name} ({type(e).__name__}: {e})",
+            file=sys.stderr,
+        )
+        return words
+
+def _transcribe_words(pool: OnnxSessionPool, wav_path: Path, edit_dir: Path) -> tuple:
+    """Run a WAV through the pool, chunking if it is too long.
+
+    Returns (canonical_words, plain_text). Long WAVs are split into
+    silence-aligned pieces and recognised in parallel; the word lists are
+    re-based onto the source clip's timeline and concatenated. Short
+    WAVs take the original single-inference path untouched.
+    """
+    uses_vad = getattr(pool, "uses_vad", False)
+    duration = _wav_duration_s(wav_path)
+
+    if duration <= CHUNK_TRIGGER_S:
+        pieces = [(wav_path, 0.0)]
+    else:
+        chunk_dir = (edit_dir / "audio_16k" / "chunks").resolve()
+        pieces = _split_wav_for_chunks(wav_path, chunk_dir)
+        if len(pieces) > 1:
+            print(
+                f"  parakeet_onnx: {wav_path.name} is {duration:.0f}s - "
+                f"split into {len(pieces)} chunks at quiet points"
+            )
+
+    results = pool.transcribe_batch([p for p, _ in pieces])
+    if not results or len(results) != len(pieces):
+        n = len(results) if results else 0
+        raise RuntimeError(f"pool returned {n} results for {len(pieces)} chunks of {wav_path}")
+
+    all_words = []
+    for (piece_path, offset_s), result in zip(pieces, results):
+        # Worker may have stuffed an Exception into the slot rather than
+        # raising it directly. Surface it — the outer retry loop decides.
+        if isinstance(result, BaseException):
+            raise result
+        words = _onnx_to_canonical_words(result, uses_vad=uses_vad)
+        all_words.extend(_shift_words(words, offset_s))
+
+    # Snap word ends to the waveform so pauses become real spacing entries
+    # instead of being glued onto the preceding word (see the refinement
+    # block above for why this matters downstream).
+    all_words = _refine_word_ends(all_words, wav_path)
+
+    # Rebuild plain text from the word list so chunked and whole-file
+    # paths agree byte-for-byte on the "text" field.
+    text = " ".join(w["text"] for w in all_words if w.get("type") == "word")
+    return all_words, text
+
 # ---------------------------------------------------------------------------
 # Per-video processing — wraps cache check, transcribe, diarize, JSON write
 # ---------------------------------------------------------------------------
@@ -626,36 +964,11 @@ def _process_one(
     t0 = time.time()
     print(f"  parakeet_onnx: transcribing {wav_path.name} via pool size {pool.size}")
 
-    # Single-clip dispatch through the pool. We pass [wav_path] because
-    # the pool's transcribe_batch is built to fan out across multiple
-    # WAVs in parallel — when called with N=1 it just runs serially
-    # in one session but still respects the timeout / error semantics.
-    results = pool.transcribe_batch([wav_path])
-    if not results:
-        raise RuntimeError(f"pool returned no results for {wav_path}")
-
-    result = results[0]
-
-    # Worker may have stuffed an Exception into the slot rather than
-    # raising it directly (so one bad clip doesn't abort the batch).
-    # Surface it here as a real exception — the outer retry loop will
-    # decide whether to retry, fall back, or give up.
-    if isinstance(result, BaseException):
-        raise result
-
-    # uses_vad tells the extractor whether to expect a parallel
-    # tokens+timestamps result (False) or a generator of segments
-    # (True). The pool is the source of truth — we always pass its
-    # opinion through rather than re-probing the result shape.
-    uses_vad = getattr(pool, "uses_vad", False)
-    words = _onnx_to_canonical_words(result, uses_vad=uses_vad)
-    if uses_vad:
-        # The VAD-segmented result is a single-pass generator that
-        # the canonical extractor just consumed. Rebuild plain text
-        # from the canonical word list so both code paths agree.
-        text = " ".join(w["text"] for w in words if w.get("type") == "word")
-    else:
-        text = _result_text(result, uses_vad=uses_vad)
+    # Dispatch through the pool. Long clips are chunked at quiet points
+    # so the conformer never sees more audio than its positional table
+    # can address; short clips go through whole. Either way we get back
+    # a canonical word list already on the source clip's timeline.
+    words, text = _transcribe_words(pool, wav_path, edit_dir)
 
     # ── Optional diarization ──────────────────────────────────────────
     # `helpers/diarize.py` is the single source of truth. It reads the
@@ -711,7 +1024,7 @@ def _process_one(
     rtfx = (duration / dt) if dt > 0 else 0.0
     print(
         f"  parakeet_onnx_lane done: {n_words} words, {duration:.1f}s "
-        f"audio, {dt:.1f}s wall ({rtfx:.1f}x RTFx), {kb:.1f} KB → "
+        f"audio, {dt:.1f}s wall ({rtfx:.1f}x RTFx), {kb:.1f} KB -> "
         f"{out_path.name}"
     )
     return out_path
