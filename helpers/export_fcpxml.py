@@ -84,6 +84,12 @@ Usage:
     # Captions out of scope — skip the SRT
     python helpers/export_fcpxml.py <edl.json> -o cut.fcpxml --no-srt
 
+    # Proxy footage — file DJI .LRF / sibling _Proxy files under
+    # <footage>/Proxies/<stem>_Proxy.mp4 (Premiere's naming, so its
+    # "Attach Proxies > Relink others automatically" finds them all)
+    # and add proxy-media reps to cut.fcpxml
+    python helpers/export_fcpxml.py <edl.json> -o cut.fcpxml --proxies
+
 Dependencies (install via `pip install -e .[fcpxml]`):
     opentimelineio>=0.17
     otio-fcpx-xml-adapter>=0.2     # .fcpxml writer (Resolve / FCP X)
@@ -92,7 +98,13 @@ Dependencies (install via `pip install -e .[fcpxml]`):
 
 from __future__ import annotations
 
+# Re-launch under the skill's optional .venv when one exists (no-op otherwise).
+if __name__ == "__main__":
+    import _venv
+    _venv.ensure()
+
 import argparse
+import functools
 import json
 import os
 import re
@@ -688,6 +700,179 @@ def _safe_file_url(path: Path) -> str:
     except ValueError:
         # as_uri() rejects relative paths; resolve and retry.
         return path.resolve().as_uri()
+
+
+# ---------------------------------------------------------------------------
+# Proxy discovery (--proxies).
+#
+# Premiere's xmeml importer has NO proxy field — Adobe lists FCP XML as
+# unsupported for attached proxies, so cut.xml always links the
+# originals. What Premiere DOES do is auto-match proxies by name inside
+# its own "Proxy > Attach Proxies" dialog: point it at ONE proxy with
+# "Relink others automatically" on and it finds the rest, as long as
+# every proxy follows Premiere's own convention:
+#
+#     <footage_dir>/Proxies/<original stem>_Proxy.<ext>
+#
+# So the job here is to normalise whatever proxies the user has into
+# exactly that layout:
+#
+#   1. Proxies/<stem>_Proxy.mp4|.mov already there  -> use as-is
+#   2. <stem>_Proxy.mp4|.mov sitting next to source -> move into Proxies/
+#   3. DJI <stem>.LRF next to source                -> move + rename to
+#                                                      Proxies/<stem>_Proxy.mp4
+#
+# DJI .LRF files are plain low-res MP4 streams with a custom extension —
+# no NLE picks them up as proxies until the extension changes, which is
+# why the rename is part of the move.
+#
+# All matching is case-insensitive (DJI writes .LRF, users write
+# _proxy / _PROXY) so the same footage folder behaves identically on
+# NTFS, APFS and ext4. FCPXML additionally gets a real
+# <media-rep kind="proxy-media"> per asset (see _patch_fcpxml_proxies).
+# ---------------------------------------------------------------------------
+
+PROXY_DIR_NAME = "Proxies"
+PROXY_STEM_SUFFIX = "_Proxy"
+# Proxy containers we recognise, in preference order. Premiere's own
+# "Create Proxies" presets write .mp4 (H.264) or .mov (ProRes/CineForm).
+_PROXY_EXTS = (".mp4", ".mov")
+_LRF_EXT = ".lrf"
+
+
+def _list_dir_lower(d: Path, cache: dict[str, dict[str, Path]]) -> dict[str, Path]:
+    """Return {lowercased filename: Path} for regular files directly in `d`.
+
+    Cached per directory so an EDL pulling 50 clips out of one footage
+    folder costs one scandir, not 50. A missing / unreadable directory
+    maps to an empty dict (callers treat that as "no proxy here").
+    """
+    key = str(d).lower()
+    if key in cache:
+        return cache[key]
+    listing: dict[str, Path] = {}
+    try:
+        # os.scandir hands back is_file() from the directory entry itself
+        # on Windows — no per-file stat round trip on NAS / network drives.
+        with os.scandir(d) as it:
+            for entry in it:
+                try:
+                    if entry.is_file():
+                        listing.setdefault(entry.name.lower(), Path(entry.path))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    cache[key] = listing
+    return listing
+
+
+@functools.lru_cache(maxsize=None)
+def _proxy_dir_for(src_dir: Path) -> Path:
+    """Return the existing Proxies/ subdir (any casing) or the canonical one.
+
+    Reusing a pre-existing `proxies/` folder keeps us from creating a
+    second, differently-cased twin on case-sensitive filesystems.
+    Memoised per footage folder — the answer can't change mid-export
+    except by us creating the canonical dir, which this already returns.
+    """
+    try:
+        with os.scandir(src_dir) as it:
+            for entry in it:
+                if (entry.name.lower() == PROXY_DIR_NAME.lower()
+                        and entry.is_dir()):
+                    return Path(entry.path)
+    except OSError:
+        pass
+    return src_dir / PROXY_DIR_NAME
+
+
+def _find_or_adopt_proxy(
+    src: Path, cache: dict[str, dict[str, Path]],
+) -> Path | None:
+    """Locate (or create, via move/rename) the Premiere-style proxy for `src`.
+
+    Returns the proxy's Path, or None when the source has no proxy of
+    any recognised shape. Moves are same-volume renames (Proxies/ lives
+    beside the source), so they're instant and never copy media.
+    """
+    if src is None or not src.stem:
+        return None
+    src_dir = src.parent
+    proxy_dir = _proxy_dir_for(src_dir)
+    stem_lower = src.stem.lower()
+    proxy_stem_lower = f"{stem_lower}{PROXY_STEM_SUFFIX.lower()}"
+
+    # ── 1. Already filed under Proxies/ — nothing to move ─────────────
+    in_proxy_dir = _list_dir_lower(proxy_dir, cache)
+    for ext in _PROXY_EXTS:
+        hit = in_proxy_dir.get(f"{proxy_stem_lower}{ext}")
+        if hit is not None:
+            return hit
+
+    # ── 2 / 3. Sibling _Proxy file or DJI .LRF — adopt it ─────────────
+    siblings = _list_dir_lower(src_dir, cache)
+    move_from: Path | None = None
+    move_to: Path | None = None
+    for ext in _PROXY_EXTS:
+        hit = siblings.get(f"{proxy_stem_lower}{ext}")
+        if hit is not None:
+            move_from = hit
+            move_to = proxy_dir / f"{src.stem}{PROXY_STEM_SUFFIX}{ext}"
+            break
+    if move_from is None:
+        lrf = siblings.get(f"{stem_lower}{_LRF_EXT}")
+        if lrf is not None:
+            # .LRF is an MP4 in disguise — the rename IS the conversion.
+            move_from = lrf
+            move_to = proxy_dir / f"{src.stem}{PROXY_STEM_SUFFIX}.mp4"
+    if move_from is None or move_to is None:
+        return None
+
+    # Never clobber — a target that appeared since the listing wins.
+    if move_to.exists():
+        return move_to
+    try:
+        proxy_dir.mkdir(parents=True, exist_ok=True)
+        move_from.rename(move_to)
+    except OSError as e:
+        print(f"  warn: could not move {move_from.name} -> "
+              f"{proxy_dir.name}/{move_to.name} ({type(e).__name__}: {e}); "
+              f"{src.name} will import without a proxy.", file=sys.stderr)
+        return None
+
+    # Keep the per-dir caches honest for any later lookup in this run.
+    siblings.pop(move_from.name.lower(), None)
+    in_proxy_dir[move_to.name.lower()] = move_to
+    print(f"  proxy: {move_from.name} -> {proxy_dir.name}/{move_to.name}")
+    return move_to
+
+
+def _resolve_proxies(edl: dict) -> dict[str, Path]:
+    """Map every used source (resolved path string) to its proxy Path.
+
+    Keys match `str(Path(src).resolve())` — the same form build_timeline
+    and the FCPXML patchers use — so lookups line up without re-probing.
+    Sources with no proxy are simply absent from the map.
+    """
+    sources = edl.get("sources") or {}
+    cache: dict[str, dict[str, Path]] = {}
+    out: dict[str, Path] = {}
+    for key in _collect_used_sources(edl):
+        raw = sources.get(key)
+        if not raw:
+            continue
+        try:
+            src = Path(raw).resolve()
+        except (OSError, RuntimeError):
+            continue
+        # Two EDL keys can point at the same file; adopt its proxy once.
+        if str(src) in out:
+            continue
+        proxy = _find_or_adopt_proxy(src, cache)
+        if proxy is not None:
+            out[str(src)] = proxy
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1847,115 @@ def _patch_fcpxml_audio_shape(out_path: Path, sequence_meta: dict | None = None)
         return 0
 
     return patched
+
+
+# ---------------------------------------------------------------------------
+# FCPXML proxy patch (--proxies).
+#
+# FCPXML 1.9+ lets one <asset> carry both media representations:
+#
+#     <asset ...>
+#       <media-rep kind="original-media" src="file://.../A.MP4"/>
+#       <media-rep kind="proxy-media"    src="file://.../Proxies/A_Proxy.mp4"/>
+#     </asset>
+#
+# Final Cut Pro links both on import and flips between them with its
+# own proxy toggle. The OTIO adapter writes FCPXML 1.8, where the path
+# is a bare `src` attribute on <asset> and media-rep doesn't exist yet.
+# So when (and ONLY when) at least one asset has a proxy, we bump the
+# document to 1.9 and move EVERY asset's src into a media-rep — 1.9
+# dropped the attribute form, so a half-converted file would be invalid.
+# Exports without proxies stay byte-identical 1.8.
+#
+# Must run AFTER every other FCPXML patch: _patch_fcpxml_audio_shape
+# keys off <asset src="...">, which this pass removes.
+# ---------------------------------------------------------------------------
+
+_FCPXML_MEDIA_REP_MIN_VERSION = (1, 9)
+
+
+def _patch_fcpxml_proxies(out_path: Path, proxy_map: dict[str, Path] | None) -> int:
+    """Give each matching <asset> a proxy-media rep in a written .fcpxml.
+
+    `proxy_map` is the {resolved source path: proxy Path} dict from
+    _resolve_proxies(). Returns the number of assets that gained a
+    proxy. Idempotent (assets already holding a proxy-media rep are
+    skipped) and non-fatal: any failure leaves the file as the adapter
+    wrote it and prints a warning.
+    """
+    if not proxy_map:
+        return 0
+    try:
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(str(out_path))
+        root = tree.getroot()
+    except Exception as e:
+        print(f"  warn: could not parse {out_path.name} for proxy patch "
+              f"({type(e).__name__}: {e}); leaving as-is.", file=sys.stderr)
+        return 0
+
+    # ── Plan first, mutate second ─────────────────────────────────────
+    # Pair every asset with (src, proxy) before touching anything so a
+    # run where nothing matches leaves the 1.8 document untouched.
+    plan: list[tuple] = []
+    for asset in root.iter("asset"):
+        src = asset.get("src")
+        if not src:
+            # Already media-rep form (future adapter) — read the
+            # original rep's src instead of the attribute.
+            for rep in asset.findall("media-rep"):
+                if rep.get("kind", "original-media") == "original-media":
+                    src = rep.get("src")
+                    break
+        local = _path_from_safe_url(src) if src else None
+        proxy = proxy_map.get(str(local)) if local is not None else None
+        has_proxy_rep = any(rep.get("kind") == "proxy-media"
+                            for rep in asset.findall("media-rep"))
+        plan.append((asset, src, proxy, has_proxy_rep))
+    if not any(p is not None and not had for _, _, p, had in plan):
+        return 0
+
+    # ── Version bump — media-rep needs FCPXML 1.9+ ───────────────────
+    try:
+        cur = tuple(int(x) for x in
+                    (root.get("version") or "0.0").split(".")[:2])
+    except ValueError:
+        cur = (0, 0)
+    if cur < _FCPXML_MEDIA_REP_MIN_VERSION:
+        root.set("version", "%d.%d" % _FCPXML_MEDIA_REP_MIN_VERSION)
+
+    # ── Rewrite assets ────────────────────────────────────────────────
+    # DTD order inside <asset> is (media-rep+, metadata?), so reps are
+    # inserted at the front, original first, proxy second.
+    attached = 0
+    for asset, src, proxy, has_proxy_rep in plan:
+        if not src:
+            continue
+        insert_at = 0
+        if asset.get("src"):
+            # 1.8 attribute form -> 1.9 original-media rep. Applied to
+            # EVERY asset (proxy or not) to keep the document valid.
+            del asset.attrib["src"]
+            asset.insert(0, ET.Element("media-rep", {
+                "kind": "original-media", "src": src,
+            }))
+            insert_at = 1
+        else:
+            insert_at = len(asset.findall("media-rep"))
+        if proxy is not None and not has_proxy_rep:
+            asset.insert(insert_at, ET.Element("media-rep", {
+                "kind": "proxy-media", "src": _safe_file_url(proxy),
+            }))
+            attached += 1
+
+    try:
+        tree.write(str(out_path), encoding="UTF-8", xml_declaration=True)
+    except Exception as e:
+        print(f"  warn: proxy patch built but failed to write back to "
+              f"{out_path.name} ({type(e).__name__}: {e}); the file still "
+              "links the originals, just without proxies.", file=sys.stderr)
+        return 0
+    return attached
 
 
 # ---------------------------------------------------------------------------
@@ -2822,7 +3116,9 @@ def _patch_xmeml_bin_layout(
     return masters_written
 
 
-def write_fcpxml(timeline, out_path: Path) -> None:
+def write_fcpxml(
+    timeline, out_path: Path, proxy_map: dict[str, Path] | None = None,
+) -> None:
     """Write the timeline as FCPXML 1.10+ (.fcpxml) — Resolve / FCP X path.
 
     OTIO discovers the writer via the `otio_fcpx_xml_adapter` package
@@ -2839,6 +3135,9 @@ def write_fcpxml(timeline, out_path: Path) -> None:
         settings the timeline was built against, so the imported
         sequence inherits the source's resolution and color space
         instead of dropping into the NLE's default 1080p / Rec.709.
+
+    `proxy_map` (from --proxies) adds a proxy-media rep to each asset
+    that has one — see _patch_fcpxml_proxies. None / empty = no-op.
     """
     otio = _import_otio()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2862,6 +3161,12 @@ def write_fcpxml(timeline, out_path: Path) -> None:
     n_speed = _patch_fcpxml_speed(out_path, speed_map)
     if n_speed:
         print(f"  retime: patched {n_speed} timeMap element(s) "
+              f"in {out_path.name}")
+    # Proxy media-reps LAST — this pass converts <asset src> into
+    # <media-rep>, which the audio-shape patch above can't read.
+    n_proxy = _patch_fcpxml_proxies(out_path, proxy_map)
+    if n_proxy:
+        print(f"  proxies: attached {n_proxy} proxy-media rep(s) "
               f"in {out_path.name}")
 
 
@@ -2992,6 +3297,18 @@ def main() -> None:
         help="Override SRT path. Default: <edl_dir>/master.srt — the "
              "path subtitles.md and parent_rules.md both reference.",
     )
+    # Proxy wiring — opt-in because it MOVES files in the footage folder
+    # (sibling _Proxy files and DJI .LRF files go into Proxies/).
+    ap.add_argument(
+        "--proxies", action="store_true",
+        help="Detect proxies for every source and file them Premiere-"
+             "style as <footage>/Proxies/<stem>_Proxy.mp4. DJI <stem>.LRF "
+             "files are moved + renamed there; sibling <stem>_Proxy.mp4/"
+             ".mov files are moved there. cut.fcpxml gets proxy-media "
+             "reps; cut.xml keeps the originals (Premiere's xmeml has no "
+             "proxy field) — attach in Premiere via Proxy > Attach "
+             "Proxies with 'Relink others automatically'.",
+    )
     args = ap.parse_args()
 
     edl_path = args.edl.resolve()
@@ -3011,6 +3328,12 @@ def main() -> None:
     edl_text = edl_path.read_text(encoding="utf-8")
     edl_text = edl_text.replace('"timelapse_speed"', '"speed"')
     edl = json.loads(edl_text)
+
+    # ── Proxy discovery (opt-in) ──────────────────────────────────────
+    # Runs before anything is written so every file move is logged up
+    # front. Empty map when the flag is off -> writers behave exactly
+    # as they always have.
+    proxy_map: dict[str, Path] = _resolve_proxies(edl) if args.proxies else {}
 
     # ── Resolve the sequence shape from the EDL's primary source ──────
     # Picks the source with the most runtime in the cut, ffprobes it for
@@ -3049,13 +3372,29 @@ def main() -> None:
     # / audio shape inherit from the runtime-dominant primary source.
     print(f"  fps + res:   max-across-sources (sequence >= every clip)")
     print(f"  color/audio: inherited from primary source: {primary_label}")
+    if args.proxies:
+        # Coverage line + the originals still lacking a proxy, so a
+        # half-proxied cut is obvious before anyone opens the NLE.
+        used_paths: list[Path] = []
+        for key in _collect_used_sources(edl):
+            raw = (edl.get("sources") or {}).get(key)
+            if raw:
+                p = Path(raw).resolve()
+                if p not in used_paths:
+                    used_paths.append(p)
+        missing = [p for p in used_paths if str(p) not in proxy_map]
+        print(f"  proxies:     {len(used_paths) - len(missing)}/"
+              f"{len(used_paths)} source(s) have a {PROXY_DIR_NAME}/"
+              f"<stem>{PROXY_STEM_SUFFIX} proxy")
+        for p in missing:
+            print(f"    no proxy:  {p.name}")
 
     # Emit each requested dialect. Failures in one writer don't prevent
     # the other from running — the user shouldn't lose the Premiere file
     # because, say, the Resolve adapter hit a bug on their OTIO version.
     if fcpx_out is not None:
         try:
-            write_fcpxml(timeline, fcpx_out)
+            write_fcpxml(timeline, fcpx_out, proxy_map=proxy_map)
             kb = fcpx_out.stat().st_size / 1024
             print(f"  [fcpxml]   {fcpx_out}  ({kb:.1f} KB)  "
                   f"-> {_TARGET_INFO['fcpxml']['opens_in']}")
@@ -3079,6 +3418,16 @@ def main() -> None:
             kb = prxml_out.stat().st_size / 1024
             print(f"  [premiere] {prxml_out}  ({kb:.1f} KB)  "
                   f"-> {_TARGET_INFO['premiere']['opens_in']}")
+            if proxy_map:
+                # xmeml can't carry proxies (Adobe: FCP XML unsupported
+                # for attached proxies) — hand the user the 4-click
+                # attach that Premiere's name matching makes automatic.
+                first = next(iter(proxy_map.values()))
+                print(f"  [premiere] proxies: after import, select the "
+                      f"clips in the 'Footage' bin > right-click > Proxy "
+                      f"> Attach Proxies > pick {first.parent.name}/"
+                      f"{first.name} with 'Relink others automatically' "
+                      f"on.")
         except SystemExit:
             raise
         except Exception as e:

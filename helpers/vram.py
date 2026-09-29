@@ -47,6 +47,11 @@ makes the schedule trivially loggable / overridable from the CLI.
 
 from __future__ import annotations
 
+# Re-launch under the skill's optional .venv when one exists (no-op otherwise).
+if __name__ == "__main__":
+    import _venv
+    _venv.ensure()
+
 import enum
 import os
 import shutil

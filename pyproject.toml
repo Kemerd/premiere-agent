@@ -60,7 +60,17 @@ dependencies = [
     # universal CPU EP. The provider ladder in `_onnx_providers.py`
     # picks whichever EP the runtime exposes, so the same code path
     # works either way.
-    "onnxruntime-gpu>=1.22.0;platform_system!='Darwin'",  # Win + Linux
+    #
+    # Pinned to the CUDA 12 line (<1.27). From 1.27 on, PyPI's
+    # onnxruntime-gpu is built against CUDA 13 (cudart64_13 / cudnn-cu13),
+    # which neither torch cu12x nor the cudart64_12 / cublas64_12 probe in
+    # `_onnx_providers.py` can satisfy -> a clean install silently lands
+    # on the CPU EP. The [cuda,cudnn] extras pull ORT's own matching
+    # runtime wheels (cudart, nvrtc, cufft, curand, cuDNN 9 + cuBLAS),
+    # the exact site-packages dirs `_bootstrap_nvidia_dlls()` pins, so
+    # the GPU EP no longer depends on whatever happens to be installed
+    # globally or on a system CUDA Toolkit.
+    "onnxruntime-gpu[cuda,cudnn]>=1.22.0,<1.27;platform_system!='Darwin'",  # Win + Linux
     "onnxruntime>=1.22.0;platform_system=='Darwin'",      # macOS (CoreML/CPU)
     # tensorrt-cu12-libs is OPTIONAL — only needed when the user opts
     # into the TensorRT execution provider via VIDEO_USE_PARAKEET_TRT=1.
@@ -68,7 +78,11 @@ dependencies = [
     # provider ladder in `_onnx_providers.py` falls through to CUDA EP
     # gracefully if the import fails (corporate proxies, custom torch).
     # Skipped on Darwin (no CUDA on Mac) and Linux aarch64 (no wheel).
-    "tensorrt-cu12-libs;platform_system!='Darwin' and platform_machine=='x86_64'",
+    # Windows reports its x64 arch as `AMD64`, not `x86_64` — both are
+    # listed or the wheel is silently skipped on every Windows install.
+    # <11: the CUDA-12 ORT line's TRT EP (and the nvinfer_10.dll probe)
+    # target TensorRT 10; TRT 11 ships nvinfer_11.dll and won't load.
+    "tensorrt-cu12-libs>=10,<11;platform_system!='Darwin' and (platform_machine=='x86_64' or platform_machine=='AMD64')",
 
     # ── transformers (Florence-2 + CLAP processors) ──
     # Kept for the visual lane (Florence-2) and the CLAP processor /

@@ -6,6 +6,11 @@ REM Idempotent. Honors TORCH_INDEX env var so CPU-only / ROCm users can swap:
 REM   set TORCH_INDEX=https://download.pytorch.org/whl/cpu
 REM   install.bat
 REM
+REM Installs into a skill-local virtualenv (.venv) by default. Opt out and
+REM install into the python on PATH instead with either of:
+REM   install.bat --no-venv
+REM   set PREMIERE_AGENT_NO_VENV=1
+REM
 REM Default is CUDA 12.1 wheels which match the cuDNN bundled with the
 REM ONNX Runtime CUDA EP shipped in the onnxruntime-gpu>=1.22 wheel matrix.
 REM ---------------------------------------------------------------------------
@@ -36,6 +41,35 @@ if "%PYTHON%"=="" (
 )
 
 echo [premiere-agent] python: %PYTHON%
+
+REM ---------------------------------------------------------------------------
+REM 0. Virtual environment (default on).
+REM
+REM    Everything installs into .venv so a stray global package (e.g. a CPU
+REM    `onnxruntime` shadowing `onnxruntime-gpu`) can't silently demote a
+REM    lane to CPU. helpers\_venv.py re-launches every helper under this
+REM    interpreter, so the documented `python helpers\<script>.py` keeps
+REM    working from any shell. Reused as-is when it already exists.
+REM
+REM    --no-venv / PREMIERE_AGENT_NO_VENV=1 skips this and installs into
+REM    the interpreter picked above (the pre-venv behaviour).
+REM ---------------------------------------------------------------------------
+set "USE_VENV=1"
+if /I "%~1"=="--no-venv" set "USE_VENV=0"
+if "%PREMIERE_AGENT_NO_VENV%"=="1" set "USE_VENV=0"
+
+if "%USE_VENV%"=="1" (
+    if not exist ".venv\Scripts\python.exe" (
+        echo [premiere-agent] creating virtualenv: %CD%\.venv
+        %PYTHON% -m venv .venv || goto :err
+    )
+    REM Relative on purpose: we're pushd'd into the skill root, and %PYTHON%
+    REM is expanded unquoted below, so an absolute path with spaces would split.
+    set "PYTHON=.venv\Scripts\python.exe"
+    echo [premiere-agent] using virtualenv: %CD%\.venv
+) else (
+    echo [premiere-agent] --no-venv: installing into %PYTHON%
+)
 
 REM ---------------------------------------------------------------------------
 REM 1. Pip itself first.

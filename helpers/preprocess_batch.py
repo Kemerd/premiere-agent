@@ -5,6 +5,7 @@ This is the script the SKILL calls. Difference vs preprocess.py:
   - Takes a DIRECTORY of source media (not an explicit file list)
   - Auto-discovers video AND audio-only files in that directory
   - Detects dual-mic / paired-audio pairs (X.mp4 + X.wav same stem)
+  - Skips proxy files (`X_Proxy.mp4`, any casing) and the Proxies/ dir
   - Skips files whose lane outputs are already cache-fresh
   - Defaults edit-dir to <videos>/edit
 
@@ -37,9 +38,10 @@ interpretations:
      Both should be transcribed; the editor picks whichever
      transcript is higher quality on each cut.
 
-  2. **ignore** — the .wav is a redundant backup of the camera audio
-     (some rigs do this) or a copy the user dragged in by mistake.
-     Drop it from preprocessing entirely.
+  2. **ignore** — the .wav is a redundant copy of the camera audio
+     (DJI routinely writes one next to every .MP4) or a copy the user
+     dragged in by mistake. Drop it from preprocessing entirely —
+     transcribing an identical track is pure wasted compute.
 
 These are mutually exclusive and the wrong choice silently corrupts
 the cut, so this script REFUSES TO PROCEED when pairs are detected
@@ -65,6 +67,11 @@ CLI:
 """
 
 from __future__ import annotations
+
+# Re-launch under the skill's optional .venv when one exists (no-op otherwise).
+if __name__ == "__main__":
+    import _venv
+    _venv.ensure()
 
 import argparse
 import json
@@ -92,6 +99,20 @@ AUDIO_ONLY_EXTS = {
     ".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma",
 }
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_ONLY_EXTS
+
+# Proxy files are low-res stand-ins for a source we already process —
+# transcribing / captioning them would double the work and add a bogus
+# "<stem>_Proxy" clip to every timeline. Premiere names them
+# `<stem>_Proxy.<ext>` and export_fcpxml.py --proxies files DJI .LRF
+# proxies the same way (PROXY_STEM_SUFFIX there). Matched
+# case-insensitively. The Proxies/ folder itself is already pruned
+# via _PRUNE_DIR_NAMES; this catches proxies sitting next to sources.
+PROXY_STEM_SUFFIX = "_proxy"
+
+
+def _is_proxy_file(p: Path) -> bool:
+    """True if the file's stem marks it as a proxy (`<stem>_Proxy.mp4`)."""
+    return p.stem.lower().endswith(PROXY_STEM_SUFFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +242,7 @@ def _discover_sources(
         # implementation prior to recursion landing — kept exact so
         # `--no-recurse` is a true regression-free escape hatch.
         for p in sources_dir.iterdir():
-            if not p.is_file():
+            if not p.is_file() or _is_proxy_file(p):
                 continue
             sfx = p.suffix.lower()
             if sfx in VIDEO_EXTS:
@@ -265,6 +286,9 @@ def _discover_sources(
             ]
 
         for fname in filenames:
+            # Proxies next to their source — same media, lower res.
+            if _is_proxy_file(Path(fname)):
+                continue
             sfx = Path(fname).suffix.lower()
             if sfx in VIDEO_EXTS:
                 videos.append(Path(dirpath, fname).resolve())
@@ -635,8 +659,9 @@ def main() -> None:
             msg_lines.append(f"    - {v.name}  +  {a.name}  (stem: {v.stem})")
         msg_lines += [
             "",
-            "  These look like a camera + external recorder rig where",
-            "  the .wav is a second-mic recording of the same shot.",
+            "  Either an external recorder captured a SECOND mic for",
+            "  the same shot, or the camera wrote a COPY of its own",
+            "  audio next to the video (DJI does this routinely).",
             "  Re-run with one of:",
             "",
             "    --paired-audio-mode dual_mic",
@@ -646,8 +671,9 @@ def main() -> None:
             "        disambiguated stem so the caches don't collide.",
             "",
             "    --paired-audio-mode ignore",
-            "        The .wav is just a BACKUP of the camera audio (or",
-            "        a stray copy). Drop it from preprocessing.",
+            "        The .wav is just a COPY of the camera audio (DJI",
+            "        sidecar, backup, stray copy). Drop it from",
+            "        preprocessing — saves a full speech pass per pair.",
             "",
             "  Tip: parent agents should run with --detect-pairs first,",
             "  then ASK THE USER, then re-invoke with the chosen mode.",

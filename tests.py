@@ -36,6 +36,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT / "helpers"))
 
+# Re-launch under the skill's optional .venv when one exists (no-op otherwise).
+if __name__ == "__main__":
+    import _venv
+    _venv.ensure()
+
 
 # ---------------------------------------------------------------------------
 # Live output: force everything we print to flush IMMEDIATELY.
