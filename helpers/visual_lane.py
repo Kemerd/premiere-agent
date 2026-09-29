@@ -943,12 +943,32 @@ def _spawn_ffmpeg_pipe(
         video_path, target_dim, fps, meta, use_nvdec=use_nvdec,
     )
     frame_bytes = target_dim * target_dim * 3
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=frame_bytes,
     )
+    # Drain stderr continuously on a side thread, keeping only a short
+    # tail for error reports. Reading it only after stdout hits EOF
+    # deadlocks as soon as ffmpeg writes more than the OS pipe buffer
+    # (a few KB on Windows) to stderr: ffmpeg blocks on the stderr
+    # write, stops producing frames, and our stdout read waits forever.
+    # DJI HEVC decoded with -skip_frame nokey logs "PPS changed between
+    # slices" on nearly every keyframe, even at -loglevel error.
+    import collections
+    proc.stderr_tail = collections.deque(maxlen=12)
+
+    def _drain_stderr() -> None:
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                proc.stderr_tail.append(raw.decode("utf-8", "replace").rstrip())
+        except Exception:
+            pass
+
+    proc.stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    proc.stderr_thread.start()
+    return proc
 
 
 def _stream_frames_from_proc(
@@ -999,16 +1019,15 @@ def _stream_frames_from_proc(
             out_q.put((ts, arr))
             n_frames += 1
     finally:
-        # Drain stderr non-destructively so the caller can include it
-        # in error messages on non-zero exit. We tail the last 12 lines
-        # (~1 KB) which is enough to identify the failure cause.
-        stderr_tail = ""
-        try:
-            if proc.stderr is not None:
-                stderr_tail = proc.stderr.read().decode("utf-8", "replace")
-                stderr_tail = "\n".join(stderr_tail.splitlines()[-12:])
-        except Exception:
-            pass
+        # The last 12 stderr lines (~1 KB), collected continuously by the
+        # drain thread `_spawn_ffmpeg_pipe` starts, so the caller can
+        # include them in error messages on non-zero exit. Brief join
+        # first: at stdout EOF ffmpeg is exiting, so stderr closes within
+        # moments and the tail is complete.
+        drain = getattr(proc, "stderr_thread", None)
+        if drain is not None:
+            drain.join(timeout=2.0)
+        stderr_tail = "\n".join(getattr(proc, "stderr_tail", ()) or ())
     return n_frames, stderr_tail
 
 
