@@ -74,7 +74,19 @@ _PER_SESSION_RESIDENT_GB = {
 # Transient peak above resident, hit during a single Run() call's
 # encoder forward. We size the pool with this added so the CUDA
 # allocator doesn't dance up to the device limit on every chunk.
+# It scales with input length, so it depends on which path runs:
+#
+#   * VAD windows (TRT head of ladder, <=30s segments)  -> ~0.4 GB
+#   * full inputs (CUDA / CPU, no VAD)                   -> ~4.2 GB
+#     for ~240s of audio per Run(); longer single inputs need more.
+#
+# The full-input figure is from a 5090 run of an 18-min clip split into
+# four ~240s chunks: pool=2 peaked at 12.6 GB, pool=4 at 23.4 GB
+# (~5.4 GB per session incl. resident weights). Budgeting only 0.4 GB
+# there let the wealthy default of 8 sessions (~43 GB) spill a 32 GB
+# card into the Windows sysmem fallback: 284s wall instead of 7.3s.
 _PER_SESSION_TRANSIENT_GB = 0.4
+_PER_SESSION_TRANSIENT_GB_FULL_CHUNK = 4.2
 
 # Minimum free VRAM we leave after sizing the pool — for the desktop
 # compositor, the audio + visual lanes if they're co-tenanted, and
@@ -83,16 +95,20 @@ _PER_SESSION_TRANSIENT_GB = 0.4
 _VRAM_HEADROOM_GB = 2.0
 
 
-def _per_session_peak_gb(quantization: str | None) -> float:
+def _per_session_peak_gb(quantization: str | None, uses_vad: bool = False) -> float:
     """Return the peak per-session VRAM footprint for sizing decisions.
 
     Adds the transient working set on top of resident weights so we
     don't over-allocate sessions that would be fine in steady state
-    but OOM during the first encoder forward.
+    but OOM during the first encoder forward. `uses_vad` picks the
+    short-window transient; the default is the larger full-chunk one
+    (the safe side when the caller doesn't know).
     """
     key = (quantization or "fp16").lower()
     resident = _PER_SESSION_RESIDENT_GB.get(key, _PER_SESSION_RESIDENT_GB["fp16"])
-    return resident + _PER_SESSION_TRANSIENT_GB
+    transient = (_PER_SESSION_TRANSIENT_GB if uses_vad
+                 else _PER_SESSION_TRANSIENT_GB_FULL_CHUNK)
+    return resident + transient
 
 
 # ---------------------------------------------------------------------------
@@ -158,19 +174,6 @@ class OnnxSessionPool:
         self._model_id = model_id
         self._quantization = quantization
 
-        # Probe VRAM and clamp pool size BEFORE building any sessions —
-        # otherwise we'd OOM mid-construction and leave half a pool
-        # alive in CUDA context limbo.
-        target_n = self._clamp_to_vram(desired_size, quantization)
-        if target_n < desired_size:
-            print(
-                f"  [pool] desired pool size {desired_size} clamped to "
-                f"{target_n} by available VRAM "
-                f"(per-session peak ~{_per_session_peak_gb(quantization):.1f} GB)"
-            )
-
-        self._size = target_n
-
         # Resolve the EP ladder once and reuse for every session. The
         # logging happens inside resolve_providers on first call.
         providers = resolve_providers(prefer_tensorrt=prefer_tensorrt)
@@ -209,6 +212,22 @@ class OnnxSessionPool:
         )
         use_vad = head_name == "TensorrtExecutionProvider"
         self._uses_vad = use_vad  # exposed for the lane's extractor
+
+        # Probe VRAM and clamp pool size BEFORE building any sessions —
+        # otherwise we'd OOM mid-construction and leave half a pool
+        # alive in CUDA context limbo. Done after the VAD decision
+        # because the per-session transient differs ~10x between
+        # short VAD windows and full chunks.
+        target_n = self._clamp_to_vram(desired_size, quantization, use_vad)
+        if target_n < desired_size:
+            peak_gb = _per_session_peak_gb(quantization, use_vad)
+            print(
+                f"  [pool] desired pool size {desired_size} clamped to "
+                f"{target_n} by available VRAM "
+                f"(per-session peak ~{peak_gb:.1f} GB)"
+            )
+
+        self._size = target_n
 
         print(
             f"  [pool] loading {target_n} session(s) of "
@@ -281,8 +300,12 @@ class OnnxSessionPool:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _clamp_to_vram(desired: int, quantization: str | None) -> int:
+    def _clamp_to_vram(desired: int, quantization: str | None,
+                       uses_vad: bool = False) -> int:
         """Clamp `desired` to fit within current free VRAM minus headroom.
+
+        `uses_vad` selects the per-session transient budget (short VAD
+        windows vs full chunks) — see `_per_session_peak_gb`.
 
         Returns at least 1 — even on a CPU-only host we want a usable
         pool. The CUDA EP simply degrades to CPU EP via the ladder
@@ -306,7 +329,7 @@ class OnnxSessionPool:
             # cheap enough on CPU to make a small pool worthwhile.
             return min(desired, 4)
 
-        per_peak = _per_session_peak_gb(quantization)
+        per_peak = _per_session_peak_gb(quantization, uses_vad)
         usable_gb = max(0.0, info.free_gb - _VRAM_HEADROOM_GB)
         max_fitting = max(1, int(usable_gb / per_peak))
         return min(desired, max_fitting)

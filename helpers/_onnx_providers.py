@@ -63,9 +63,8 @@ from typing import Any
 
 # Truthy / falsy values for env-var gating. Same vocabulary as
 # wealthy.py / vram.py so users only have to learn one set of strings.
-# We support BOTH so users can force-disable an EP that's auto-on by
-# default (e.g. set VIDEO_USE_PARAKEET_TRT=0 to skip the engine compile
-# step on a one-shot transcribe even though the host has TRT installed).
+# We support BOTH so an explicit "0" is honoured the same way everywhere
+# (VIDEO_USE_PARAKEET_TRT=0 is also the default now that TRT is opt-in).
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 _FALSY  = {"0", "false", "no", "off", "n", "f"}
 
@@ -170,6 +169,17 @@ def _bootstrap_nvidia_dlls() -> None:
     # it exists. Order matters only for deterministic logging.
     candidate_dirs: list[str] = []
 
+    # A CUDA build of torch bundles the full CUDA 12 runtime set in
+    # torch/lib (cudart, cuBLAS/Lt, every cuDNN 9 split-lib, cuFFT,
+    # cuRAND, nvrtc, nvJitLink). When it's there it becomes the ONLY
+    # source for those families: torch loads them from that dir by
+    # absolute path on `import torch`, so if ORT pinned a different
+    # cuDNN 9.x build first (e.g. the nvidia-cudnn-cu12 wheel), the
+    # later `import torch` fails with WinError 127 on cudnn_cnn64_9.dll
+    # — which silently broke vram.detect_gpu() (and with it the speech
+    # pool's VRAM clamp) inside every lane that imports both.
+    torch_lib = _torch_cuda_lib_dir()
+
     # Pip-wheel sources. Each is `(import_name, optional_subdir)`.
     pip_candidates: list[tuple[str, str]] = [
         ("tensorrt_libs",       ""),    # nvinfer_10.dll + plugins at root
@@ -180,6 +190,11 @@ def _bootstrap_nvidia_dlls() -> None:
         ("nvidia.cuda_nvrtc",   "bin"), # nvrtc64_120_0.dll (when wheel present)
         ("nvidia.nvjitlink",    "bin"), # nvJitLink_120_0.dll (when wheel present)
     ]
+    if torch_lib is not None:
+        # torch/lib first; the nvidia.* runtime wheels are skipped so a
+        # second cuDNN / cuBLAS build can never enter the search path.
+        candidate_dirs.append(torch_lib)
+        pip_candidates = [c for c in pip_candidates if not c[0].startswith("nvidia.")]
     for mod_name, sub_path in pip_candidates:
         d = _wheel_dir(mod_name, sub_path)
         if d is not None and d not in candidate_dirs:
@@ -355,6 +370,29 @@ def _wheel_dir(mod_name: str, sub_path: str) -> str | None:
     return None
 
 
+def _torch_cuda_lib_dir() -> str | None:
+    """Return torch's bundled CUDA DLL dir (torch/lib), or None.
+
+    Located via `find_spec` so torch is NOT imported (that costs seconds
+    and would itself map DLLs). Only counts as a CUDA build when the
+    dispatcher DLLs ORT's CUDA EP needs are all present — a CPU-only
+    torch wheel has none of them and falls through to the nvidia.* wheels.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    for base in spec.submodule_search_locations:
+        lib_dir = os.path.join(str(base), "lib")
+        if all(os.path.isfile(os.path.join(lib_dir, n))
+               for n in ("cudart64_12.dll", "cublas64_12.dll", "cudnn64_9.dll")):
+            return lib_dir
+    return None
+
+
 def _system_cuda_roots() -> list[str]:
     """All plausible system CUDA Toolkit roots, highest-version-first.
 
@@ -475,9 +513,15 @@ def _pin_split_libraries() -> None:
     total_pinned = 0
     total_failed: list[str] = []
 
+    # Same single-source rule as Phase 1: a CUDA torch's lib dir wins
+    # for cuDNN + cuBLAS so torch and ORT share one build of each.
+    torch_lib = _torch_cuda_lib_dir()
+
     for mod_name, sub_path, pattern in pin_targets:
-        wheel_dir = _wheel_dir(mod_name, sub_path)
-        chosen_dir: str | None = wheel_dir
+        if torch_lib is not None and mod_name.startswith("nvidia."):
+            chosen_dir: str | None = torch_lib
+        else:
+            chosen_dir = _wheel_dir(mod_name, sub_path)
 
         # Wheel-less fallback: only cuDNN ships in the CUDA Toolkit
         # installer bin dir (TRT and cuBLAS would mismatch the toolkit's
@@ -713,17 +757,20 @@ def _trt_enabled() -> bool:
         │ "1"/"true"/...          │ capable  │ True                 │
         │ "1"/"true"/...          │ NOT cap. │ False + loud warning │
         │ "0"/"false"/...         │ either   │ False (user override)│
-        │ unset / empty           │ capable  │ True  (NEW default)  │
-        │ unset / empty           │ NOT cap. │ False (silent skip)  │
+        │ unset / empty           │ either   │ False (opt-in only)  │
         └─────────────────────────┴──────────┴──────────────────────┘
 
-    Why TRT-by-default-when-capable:
-        On a machine with the TRT wheels + system CUDA installed, the
-        engine compile happens once and is cached on disk; subsequent
-        runs load the cached engine in <1s and we get the full ~320x
-        RTFx speedup instead of CUDA's ~70x. The user already paid
-        the disk + install cost for `tensorrt-cu12-libs`, so it would
-        be rude not to use it.
+    Why TRT is opt-in (matches README / pyproject docs):
+        The TRT engine is compiled for a <=30s input profile, so the
+        pool must route audio through silero VAD when TRT heads the
+        ladder. That path (a) returns SEGMENT-level results only — word
+        timestamps are lost, which breaks word-boundary cutting — and
+        (b) any VAD segment longer than the profile raises EP_FAIL at
+        Run() and its words are silently dropped. Measured on an RTX
+        5090: an 18-min talking clip came back with 544 words under TRT
+        vs 704 under the CUDA EP (703 on CPU). CUDA with a right-sized
+        pool already runs ~140x RTFx, so the default must be the path
+        that keeps every word and its timing.
 
     Why we still gate on _CAPS["tensorrt"] in cloud:
         Cloud CPU-only / GPU-without-TRT machines can't compile an
@@ -752,10 +799,9 @@ def _trt_enabled() -> bool:
     if raw in _FALSY:
         return False
 
-    # Unset → capability-driven default. No noise either way; the
-    # one-line "[providers] resolved EP ladder: ..." log already tells
-    # the user which tier we picked.
-    return capable
+    # Unset → off. TRT is strictly opt-in; see the docstring for the
+    # dropped-words / lost-timestamps rationale.
+    return False
 
 
 # ---------------------------------------------------------------------------
